@@ -649,16 +649,6 @@ class ApproxPercentileAggregate : public exec::Aggregate {
     auto rowVec = decoded.base()->as<RowVector>();
     if constexpr (checkIntermediateInputs) {
       VELOX_USER_CHECK(rowVec);
-      for (int i = kPercentiles; i <= kAccuracy; ++i) {
-        VELOX_USER_CHECK(rowVec->childAt(i)->isConstantEncoding());
-      }
-      for (int i = kK; i <= kMaxValue; ++i) {
-        VELOX_USER_CHECK(rowVec->childAt(i)->isFlatEncoding());
-      }
-      for (int i = kItems; i <= kLevels; ++i) {
-        VELOX_USER_CHECK(
-            rowVec->childAt(i)->encoding() == VectorEncoding::Simple::ARRAY);
-      }
     } else {
       VELOX_CHECK(rowVec);
     }
