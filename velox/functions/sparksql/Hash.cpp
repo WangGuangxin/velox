@@ -76,6 +76,8 @@ void applyWithType(
       CASE(HUGEINT, hash.hashLongDecimal, int128_t);
       CASE(TIMESTAMP, hash.hashTimestamp, Timestamp);
 #undef CASE
+      case TypeKinkd::UNKNOWN:
+        result.set(row, hashSeed);
       default:
         VELOX_NYI(
             "Unsupported type for HASH(): {}", args[i]->type()->toString());
