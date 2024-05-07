@@ -652,6 +652,9 @@ class ApproxPercentileAggregate : public exec::Aggregate {
     auto rowVec = decoded.base()->as<RowVector>();
     if constexpr (checkIntermediateInputs) {
       VELOX_USER_CHECK(rowVec);
+      for (int i = kPercentilesIsArray; i <= kPercentilesIsArray; ++i) {
+        VELOX_USER_CHECK(isConstantVector(rowVec->childAt(i)));
+      }
       for (int i = kK; i <= kMaxValue; ++i) {
         VELOX_USER_CHECK(rowVec->childAt(i)->isFlatEncoding());
       }
@@ -776,6 +779,16 @@ class ApproxPercentileAggregate : public exec::Aggregate {
     }
   }
 };
+
+bool isConstantVector(const VectorPtr& vector) {
+  if (vector->isConstantEncoding()) return true;
+  auto simpleVector = vector->asUnchecked<SimpleVector<bool>>();
+  auto firstValue = simpleVector->valueAt(0);
+  for (vector_size_t i = 1; i < simpleVector->elementSize(); ++i) {
+    if (simpleVector->valueAt(i) != firstValue) return false;
+  }
+  return true;
+}
 
 bool validPercentileType(const Type& type) {
   if (type.kind() == TypeKind::DOUBLE) {
