@@ -1912,6 +1912,7 @@ class UnnestNode : public PlanNode {
   /// @param unnestNames Names to use for unnested outputs: one name for each
   /// array (element); two names for each map (key and value). The output names
   /// must appear in the same order as unnestVariables.
+  /// @param isOuter
   /// @param ordinalityName Optional name for the ordinality columns. If not
   /// present, ordinality column is not produced.
   UnnestNode(
@@ -1920,7 +1921,17 @@ class UnnestNode : public PlanNode {
       std::vector<FieldAccessTypedExprPtr> unnestVariables,
       const std::vector<std::string>& unnestNames,
       const std::optional<std::string>& ordinalityName,
+      const bool isOuter,
       const PlanNodePtr& source);
+
+  UnnestNode(
+      const PlanNodeId& id,
+      std::vector<FieldAccessTypedExprPtr> replicateVariables,
+      std::vector<FieldAccessTypedExprPtr> unnestVariables,
+      const std::vector<std::string>& unnestNames,
+      const std::optional<std::string>& ordinalityName,
+      const PlanNodePtr& source):
+      UnnestNode(id, replicateVariables, unnestVariables, unnestNames, ordinalityName, false, source) {}
 
   /// The order of columns in the output is: replicated columns (in the order
   /// specified), unnested columns (in the order specified, for maps: key comes
@@ -1945,6 +1956,10 @@ class UnnestNode : public PlanNode {
     return withOrdinality_;
   }
 
+  bool isOuter() const {
+    return isOuter_;
+  }
+
   std::string_view name() const override {
     return "Unnest";
   }
@@ -1959,6 +1974,7 @@ class UnnestNode : public PlanNode {
   const std::vector<FieldAccessTypedExprPtr> replicateVariables_;
   const std::vector<FieldAccessTypedExprPtr> unnestVariables_;
   const bool withOrdinality_;
+  const bool isOuter_;
   const std::vector<PlanNodePtr> sources_;
   RowTypePtr outputType_;
 };
