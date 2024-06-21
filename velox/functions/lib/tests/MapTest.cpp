@@ -16,7 +16,6 @@
 
 #include <optional>
 #include "velox/common/base/tests/GTestUtils.h"
-#include "velox/functions/prestosql/registration/RegistrationFunctions.h"
 #include "velox/functions/prestosql/tests/utils/FunctionBaseTest.h"
 
 using namespace facebook::velox;
@@ -39,10 +38,6 @@ class MapTest : public FunctionBaseTest {
 
       ASSERT_NO_THROW(
           evaluate("try(map(c0, c1))", makeRowVector({keys, values})));
-
-      // Trying the map version with allowing duplicates.
-      functions::prestosql::registerMapAllowingDuplicates("map2");
-      ASSERT_NO_THROW(evaluate("map2(c0, c1)", makeRowVector({keys, values})));
     };
     // Case 1: Check for duplicate NaNs with the same binary representation.
     VectorPtr keysIdenticalNaNs =
@@ -219,10 +214,6 @@ TEST_F(MapTest, duplicateKeys) {
       "Duplicate map keys (10) are not allowed");
 
   ASSERT_NO_THROW(evaluate("try(map(c0, c1))", makeRowVector({keys, values})));
-
-  // Trying the map version with allowing duplicates.
-  functions::prestosql::registerMapAllowingDuplicates("map2");
-  ASSERT_NO_THROW(evaluate("map2(c0, c1)", makeRowVector({keys, values})));
 }
 
 TEST_F(MapTest, floatingPointCornerCases) {

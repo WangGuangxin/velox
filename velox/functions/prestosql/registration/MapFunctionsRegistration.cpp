@@ -121,10 +121,4 @@ void registerMapFunctions(const std::string& prefix) {
       Map<Varchar, double>,
       Map<Varchar, double>>({prefix + "map_normalize"});
 }
-
-void registerMapAllowingDuplicates(
-    const std::string& name,
-    const std::string& prefix) {
-  VELOX_REGISTER_VECTOR_FUNCTION(udf_map_allow_duplicates, prefix + name);
-}
 } // namespace facebook::velox::functions
