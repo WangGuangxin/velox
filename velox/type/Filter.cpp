@@ -196,6 +196,7 @@ void Filter::registerSerDe() {
   registry.Register("NegatedBytesRange", NegatedBytesRange::create);
   registry.Register("BytesValues", BytesValues::create);
   registry.Register("BigintMultiRange", BigintMultiRange::create);
+  registry.Register("HugeintMultiRange", HugeintMultiRange::create);
   registry.Register("NegatedBytesValues", NegatedBytesValues::create);
   registry.Register("MultiRange", MultiRange::create);
   registry.Register("TimestampRange", TimestampRange::create);
@@ -1104,6 +1105,63 @@ bool NegatedBigintValuesUsingHashTable::testInt64Range(
   return (std::distance(lo, hi) != max - min);
 }
 
+folly::dynamic HugeintMultiRange::serialize() const {
+  auto obj = Filter::serializeBase("HugeintMultiRange");
+  folly::dynamic arr = folly::dynamic::array;
+  for (const auto& r : ranges_) {
+    arr.push_back(r->serialize());
+  }
+  obj["ranges"] = arr;
+  return obj;
+}
+
+FilterPtr HugeintMultiRange::create(const folly::dynamic& obj) {
+  auto nullAllowed = deserializeNullAllowed(obj);
+  auto arr = obj["ranges"];
+  std::vector<std::unique_ptr<HugeintRange>> ranges;
+  ranges.reserve(arr.size());
+  for (const auto& r : arr) {
+    ranges.push_back(std::make_unique<HugeintRange>(
+        *ISerializable::deserialize<HugeintRange>(r)));
+  }
+  return std::make_unique<HugeintMultiRange>(std::move(ranges), nullAllowed);
+}
+
+bool HugeintMultiRange::testingEquals(const Filter& other) const {
+  auto otherHugeintMultiRange = dynamic_cast<const HugeintMultiRange*>(&other);
+  auto res = otherHugeintMultiRange != nullptr &&
+      Filter::testingBaseEquals(other) &&
+      ranges_.size() == otherHugeintMultiRange->ranges_.size();
+
+  if (!res) {
+    return false;
+  }
+
+  for (size_t i = 0; i < ranges_.size(); ++i) {
+    if (!(ranges_.at(i)->testingEquals(
+            *(otherHugeintMultiRange->ranges_.at(i))))) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+std::unique_ptr<Filter> HugeintMultiRange::clone(
+    std::optional<bool> nullAllowed) const {
+  std::vector<std::unique_ptr<HugeintRange>> ranges;
+  ranges.reserve(ranges_.size());
+  for (auto& range : ranges_) {
+    ranges.emplace_back(std::make_unique<HugeintRange>(*range));
+  }
+  if (nullAllowed) {
+    return std::make_unique<HugeintMultiRange>(
+        std::move(ranges), nullAllowed.value());
+  } else {
+    return std::make_unique<HugeintMultiRange>(std::move(ranges), nullAllowed_);
+  }
+}
+
 namespace {
 std::unique_ptr<Filter> nullOrFalse(bool nullAllowed) {
   if (nullAllowed) {
@@ -1372,7 +1430,8 @@ bool NegatedBytesValues::testBytesRange(
 }
 
 namespace {
-int32_t binarySearch(const std::vector<int64_t>& values, int64_t value) {
+template<typename T>
+int32_t binarySearch(const std::vector<T>& values, T value) {
   auto it = std::lower_bound(values.begin(), values.end(), value);
   if (it == values.end() || *it != value) {
     return -std::distance(values.begin(), it) - 1;
@@ -1398,7 +1457,7 @@ std::unique_ptr<Filter> BigintMultiRange::clone(
 }
 
 bool BigintMultiRange::testInt64(int64_t value) const {
-  int32_t i = binarySearch(lowerBounds_, value);
+  int32_t i = binarySearch<int64_t>(lowerBounds_, value);
   if (i >= 0) {
     return true;
   }
@@ -1420,6 +1479,37 @@ bool BigintMultiRange::testInt64Range(int64_t min, int64_t max, bool hasNull)
 
   for (const auto& range : ranges_) {
     if (range->testInt64Range(min, max, hasNull)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+
+bool HugeintMultiRange::testInt128(int128_t value) const {
+  int32_t i = binarySearch<int128_t>(lowerBounds_, value);
+  if (i >= 0) {
+    return true;
+  }
+  int place = (-i) - 1;
+  if (place == 0) {
+    // Below first
+    return false;
+  }
+  // When value did not hit a lower bound of a filter, test with the filter
+  // before the place where value would be inserted.
+  return ranges_[place - 1]->testInt128(value);
+}
+
+bool HugeintMultiRange::testInt128Range(int128_t min, int128_t max, bool hasNull)
+    const {
+  if (hasNull && nullAllowed_) {
+    return true;
+  }
+
+  for (const auto& range : ranges_) {
+    if (range->testInt128Range(min, max, hasNull)) {
       return true;
     }
   }
@@ -2308,6 +2398,10 @@ std::unique_ptr<Filter> BigintMultiRange::mergeWith(const Filter* other) const {
     default:
       VELOX_UNREACHABLE();
   }
+}
+
+std::unique_ptr<Filter> HugeintMultiRange::mergeWith(const Filter* other) const {
+  VELOX_UNREACHABLE();
 }
 
 namespace {

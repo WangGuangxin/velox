@@ -1980,6 +1980,54 @@ class BigintMultiRange final : public Filter {
   std::vector<int64_t> lowerBounds_;
 };
 
+/// Represents a combination of two of more range filters on huge int types with
+/// OR semantics. The filter passes if at least one of the contained filters
+/// passes.
+class HugeintMultiRange final : public Filter {
+ public:
+  /// @param ranges List of range filters. Must contain at least two entries.
+  /// @param nullAllowed Null values are passing the filter if true. nullAllowed
+  /// flags in the 'ranges' filters are ignored.
+  HugeintMultiRange(
+      std::vector<std::unique_ptr<HugeintRange>> ranges,
+      bool nullAllowed);
+
+  HugeintMultiRange(const HugeintMultiRange& other, bool nullAllowed);
+
+  folly::dynamic serialize() const override;
+
+  static FilterPtr create(const folly::dynamic& obj);
+
+  std::unique_ptr<Filter> clone(
+      std::optional<bool> nullAllowed = std::nullopt) const final;
+
+  bool testInt128(int128_t value) const final;
+
+  bool testInt128Range(int128_t min, int128_t max, bool hasNull) const final;
+
+  std::unique_ptr<Filter> mergeWith(const Filter* other) const final;
+
+  const std::vector<std::unique_ptr<HugeintRange>>& ranges() const {
+    return ranges_;
+  }
+
+  std::string toString() const override {
+    std::ostringstream out;
+    out << "HugeintMultiRange: [";
+    for (const auto& range : ranges_) {
+      out << " " << range->toString();
+    }
+    out << " ]" << (nullAllowed_ ? "with nulls" : "no nulls");
+    return out.str();
+  }
+
+  bool testingEquals(const Filter& other) const final;
+
+ private:
+  const std::vector<std::unique_ptr<HugeintRange>> ranges_;
+  std::vector<int128_t> lowerBounds_;
+};
+
 /// NOT IN-list filter for string data type.
 class NegatedBytesValues final : public Filter {
  public:
