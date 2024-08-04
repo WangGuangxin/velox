@@ -42,6 +42,10 @@ extern void registerMinMaxByAggregates(
     const std::string& prefix,
     bool withCompanionFunctions,
     bool overwrite);
+extern void registerApproxPercentileAggregate(
+    const std::string& prefix,
+    bool withCompanionFunctions,
+    bool overwrite);
 
 void registerAggregateFunctions(
     const std::string& prefix,
@@ -59,5 +63,6 @@ void registerAggregateFunctions(
   registerCollectSetAggAggregate(prefix, withCompanionFunctions, overwrite);
   registerCollectListAggregate(prefix, withCompanionFunctions, overwrite);
   registerRegrReplacementAggregate(prefix, withCompanionFunctions, overwrite);
+  registerApproxPercentileAggregate(prefix, withCompanionFunctions, overwrite);
 }
 } // namespace facebook::velox::functions::aggregate::sparksql
