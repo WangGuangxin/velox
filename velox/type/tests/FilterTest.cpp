@@ -1881,3 +1881,25 @@ TEST(FilterTest, timestampRange) {
   EXPECT_TRUE(filter->testTimestampRange(
       Timestamp(5, 123000000), Timestamp(30, 123000000), true));
 }
+
+TEST(FilterTest, hugeIntMultiRange) {
+  // x > 100 or x < 10
+  std::vector<std::unique_ptr<common::HugeintRange>> filters;
+  filters.emplace_back(lessThanHugeint(10));
+  filters.emplace_back(greaterThanHugeint(100));
+  auto filter = std::make_unique<common::HugeintMultiRange>(std::move(filters), false);
+  ASSERT_TRUE(dynamic_cast<HugeintMultiRange*>(filter.get()));
+
+  EXPECT_TRUE(filter->testInt128(1));
+  EXPECT_TRUE(filter->testInt128(9));
+  EXPECT_TRUE(filter->testInt128(101));
+  EXPECT_TRUE(filter->testInt128(1000));
+
+  EXPECT_FALSE(filter->testNull());
+  EXPECT_FALSE(filter->testInt128(11));
+  EXPECT_FALSE(filter->testInt128(99));
+
+  EXPECT_TRUE(filter->testInt128Range(8, 11, false));
+  EXPECT_TRUE(filter->testInt128Range(99, 105, true));
+  EXPECT_FALSE(filter->testInt128Range(12, 15, false));
+}
