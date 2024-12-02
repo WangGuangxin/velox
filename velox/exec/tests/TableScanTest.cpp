@@ -1865,7 +1865,7 @@ TEST_F(TableScanTest, shortDecimalFilter) {
 
   auto filePath = facebook::velox::test::getDataFilePath(
       "velox/exec/tests", "data/short_decimal.orc");
-  auto split = HiveConnectorSplitBuilder(filePath)
+  auto split = exec::test::HiveConnectorSplitBuilder(filePath)
                    .start(0)
                    .length(fs::file_size(filePath))
                    .fileFormat(dwio::common::FileFormat::ORC)
@@ -1932,7 +1932,7 @@ TEST_F(TableScanTest, longDecimalFilter) {
 
   auto filePath = facebook::velox::test::getDataFilePath(
       "velox/exec/tests", "data/long_decimal.orc");
-  auto split = HiveConnectorSplitBuilder(filePath)
+  auto split = exec::test::HiveConnectorSplitBuilder(filePath)
                    .start(0)
                    .length(fs::file_size(filePath))
                    .fileFormat(dwio::common::FileFormat::ORC)
