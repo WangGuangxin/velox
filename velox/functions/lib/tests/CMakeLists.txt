@@ -21,7 +21,6 @@ add_executable(
   KllSketchTest.cpp
   LambdaFunctionUtilTest.cpp
   MapConcatTest.cpp
-  MapTest.cpp
   Re2FunctionsTest.cpp
   RepeatTest.cpp
   TDigestTest.cpp
