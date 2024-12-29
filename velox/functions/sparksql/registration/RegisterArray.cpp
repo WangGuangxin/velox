@@ -43,6 +43,7 @@ void registerSparkArrayFunctions(const std::string& prefix) {
   VELOX_REGISTER_VECTOR_FUNCTION(udf_array_filter, prefix + "filter");
   VELOX_REGISTER_VECTOR_FUNCTION(udf_all_match, prefix + "forall");
   VELOX_REGISTER_VECTOR_FUNCTION(udf_zip_with, prefix + "zip_with");
+  VELOX_REGISTER_VECTOR_FUNCTION(udf_sequence, prefix + "sequence");
 }
 
 namespace sparksql {
