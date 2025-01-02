@@ -90,7 +90,7 @@ TEST_F(MapFromArraysTest, DuplicateKeysThrowException) {
     {"c", "d", "e"}
   });
 
-  auto errorMsg = "";
+  auto errorMsg = "Duplicate map keys (1) are not allowed";
 
   testMapFromArraysFails("map_from_arrays(c0, c1)", {inputVector1, inputVector2}, errorMsg);
 }
