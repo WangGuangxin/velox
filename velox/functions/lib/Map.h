@@ -15,12 +15,12 @@
  */
 #include "velox/expression/Expr.h"
 #include "velox/expression/VectorFunction.h"
-#include "velox/functions/lib/Map.h"
+#include "velox/functions/lib/CheckDuplicateKeys.h"
+#include "velox/functions/lib/DeduplicateKeys.h"
 
 namespace facebook::velox::functions {
 
-namespace {
-  static const char* kNullKeyErrorMessage = "map key cannot be null";
+static const char* kNullKeyErrorMessage = "map key cannot be null";
 static const char* kIndeterminateKeyErrorMessage =
     "map key cannot be indeterminate";
 
@@ -374,23 +374,5 @@ class MapFunction : public exec::VectorFunction {
     }
   }
 };
-}
 
-VELOX_DECLARE_VECTOR_FUNCTION(
-    udf_map,
-    MapFunction</*AllowDuplicateKeys=*/false, /*DeduplicateKeys=*/false>::signatures(),
-    std::make_unique<MapFunction</*AllowDuplicateKeys=*/false, /*DeduplicateKeys=*/false>>());
-
-VELOX_DECLARE_VECTOR_FUNCTION(
-    udf_map_allow_duplicates,
-    MapFunction</*AllowDuplicateKeys=*/true, /*DeduplicateKeys=*/false>::signatures(),
-    std::make_unique<MapFunction</*AllowDuplicateKeys=*/true, /*DeduplicateKeys=*/false>>()); // 修正模板参数语法
-
-void registerMapFunction(const std::string& name, bool allowDuplicateKeys) {
-  if (allowDuplicateKeys) {
-    VELOX_REGISTER_VECTOR_FUNCTION(udf_map_allow_duplicates, name);
-  } else {
-    VELOX_REGISTER_VECTOR_FUNCTION(udf_map, name);
-  }
-}
 } // namespace facebook::velox::functions
