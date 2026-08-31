@@ -33,6 +33,17 @@ class BitwiseAggregateBase : public SimpleNumericAggregate<T, T, T> {
     return sizeof(T);
   }
 
+  bool supportsToIntermediate() const override {
+    return true;
+  }
+
+  void toIntermediate(
+      const SelectivityVector& rows,
+      std::vector<VectorPtr>& args,
+      VectorPtr& result) const override {
+    this->singleInputAsIntermediate(rows, args, result);
+  }
+
   void extractValues(char** groups, int32_t numGroups, VectorPtr* result)
       override {
     BaseAggregate::doExtractValues(groups, numGroups, result, [&](char* group) {
