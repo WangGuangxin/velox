@@ -15,10 +15,13 @@
  */
 
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/functions/lib/aggregates/tests/utils/AggregationTestBase.h"
 #include "velox/functions/sparksql/aggregates/Register.h"
 
+using facebook::velox::exec::test::AssertQueryBuilder;
+using facebook::velox::exec::test::PlanBuilder;
 using namespace facebook::velox::functions::aggregate::test;
 
 namespace facebook::velox::functions::aggregate::sparksql::test {
@@ -57,6 +60,29 @@ TEST_F(MinMaxByAggregateTest, minBy) {
   })};
 
   testAggregations(vectors, {}, {"spark_min_by(c0, c1)"}, expected);
+}
+
+TEST_F(MinMaxByAggregateTest, intermediateAggregation) {
+  auto data = makeRowVector({
+      makeFlatVector<int32_t>({10, 20, 30, 40, 50}),
+      makeNullableFlatVector<int32_t>({5, std::nullopt, 5, 7, 7}),
+  });
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .partialAggregation(
+                      {},
+                      {"spark_min_by(c0, c1)", "spark_max_by(c0, c1)"})
+                  .intermediateAggregation()
+                  .finalAggregation()
+                  .planNode();
+
+  auto expected = makeRowVector({
+      makeFlatVector<int32_t>(std::vector<int32_t>{30}),
+      makeFlatVector<int32_t>(std::vector<int32_t>{50}),
+  });
+
+  AssertQueryBuilder(plan).assertResults(expected);
 }
 
 TEST_F(MinMaxByAggregateTest, arrayCompare) {

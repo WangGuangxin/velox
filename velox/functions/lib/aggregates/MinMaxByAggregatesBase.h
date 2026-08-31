@@ -123,6 +123,74 @@ class MinMaxByAggregateBase : public exec::Aggregate {
         sizeof(bool);
   }
 
+  bool supportsToIntermediate() const override {
+    return true;
+  }
+
+  void toIntermediate(
+      const SelectivityVector& rows,
+      std::vector<VectorPtr>& args,
+      VectorPtr& result) const override {
+    VELOX_CHECK_EQ(args.size(), 2);
+
+    auto* pool = allocator_->pool();
+    const auto numRows = rows.size();
+
+    BufferPtr nulls = allocateNulls(numRows, pool);
+    auto* rawNulls = nulls->asMutable<uint64_t>();
+    memcpy(rawNulls, rows.asRange().bits(), bits::nbytes(numRows));
+
+    DecodedVector decodedValue(*args[0], rows);
+    DecodedVector decodedComparison(*args[1], rows);
+
+    const auto* comparisonIndices = decodedComparison.indices();
+    if (throwOnNestedNulls_) {
+      rows.applyToSelected([&](vector_size_t row) {
+        if (!decodedComparison.isNullAt(row)) {
+          checkNestedNulls(
+              decodedComparison,
+              row,
+              comparisonIndices[row],
+              throwOnNestedNulls_);
+        }
+      });
+    }
+
+    const auto& rowType = resultType_->asRow();
+    auto valueResult = BaseVector::create(rowType.childAt(0), numRows, pool);
+    auto comparisonResult =
+        BaseVector::create(rowType.childAt(1), numRows, pool);
+
+    rows.applyToSelected([&](vector_size_t row) {
+      if (decodedComparison.isNullAt(row)) {
+        bits::setNull(rawNulls, row);
+        return;
+      }
+
+      comparisonResult->copy(
+          decodedComparison.base(),
+          row,
+          decodedComparison.index(row),
+          1);
+      if (!decodedValue.isNullAt(row)) {
+        valueResult->copy(
+            decodedValue.base(),
+            row,
+            decodedValue.index(row),
+            1);
+      } else {
+        valueResult->setNull(row, true);
+      }
+    });
+
+    result = std::make_shared<RowVector>(
+        pool,
+        resultType_,
+        nulls,
+        numRows,
+        std::vector<VectorPtr>{valueResult, comparisonResult});
+  }
+
   void addRawInput(
       char** groups,
       const SelectivityVector& rows,
