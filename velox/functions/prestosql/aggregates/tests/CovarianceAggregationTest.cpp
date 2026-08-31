@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/functions/lib/aggregates/tests/utils/AggregationTestBase.h"
 
@@ -88,6 +89,25 @@ TEST_P(CovarianceAggregationTest, doubleNoNulls) {
 
   testDistinctGlobalAgg(aggName, data);
   testDistinctGroupBy(aggName, data);
+}
+
+TEST_F(CovarianceAggregationTest, toIntermediateFastPath) {
+  auto data = makeRowVector({
+      makeFlatVector<int32_t>(300, [](auto row) { return row % 7; }),
+      makeFlatVector<double>(300, [](auto row) { return row * 0.1; }),
+      makeFlatVector<double>(300, [](auto row) { return row * 0.2 + 1; }),
+  });
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .partialAggregation({"c0"}, {"covar_samp(c1, c2)"})
+                  .intermediateAggregation()
+                  .finalAggregation()
+                  .planNode();
+  AssertQueryBuilder(plan, duckDbQueryRunner_)
+      .maxDrivers(1)
+      .assertResults("SELECT c0, covar_samp(c1, c2) FROM tmp GROUP BY 1");
 }
 
 TEST_P(CovarianceAggregationTest, doubleSomeNulls) {

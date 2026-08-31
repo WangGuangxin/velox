@@ -221,6 +221,71 @@ class CentralMomentsAggregatesBase : public exec::Aggregate {
     return sizeof(CentralMomentsAccumulator);
   }
 
+  bool supportsToIntermediate() const override {
+    return true;
+  }
+
+  void toIntermediate(
+      const SelectivityVector& rows,
+      std::vector<VectorPtr>& args,
+      VectorPtr& result) const override {
+    VELOX_CHECK_EQ(args.size(), 1);
+
+    const auto numRows = rows.size();
+    auto* pool = allocator_->pool();
+
+    BufferPtr nulls = allocateNulls(numRows, pool);
+    auto* rawNulls = nulls->asMutable<uint64_t>();
+    memcpy(rawNulls, rows.asRange().bits(), bits::nbytes(numRows));
+
+    DecodedVector decodedInput(*args[0], rows);
+    const auto& rowType = resultType_->asRow();
+
+    auto countResult = BaseVector::create(rowType.childAt(0), numRows, pool);
+    auto m1Result = BaseVector::create(rowType.childAt(1), numRows, pool);
+    auto m2Result = BaseVector::create(rowType.childAt(2), numRows, pool);
+    auto m3Result = BaseVector::create(rowType.childAt(3), numRows, pool);
+    auto m4Result = BaseVector::create(rowType.childAt(4), numRows, pool);
+
+    auto* countVector = countResult->asFlatVector<int64_t>();
+    auto* m1Vector = m1Result->asFlatVector<double>();
+    auto* m2Vector = m2Result->asFlatVector<double>();
+    auto* m3Vector = m3Result->asFlatVector<double>();
+    auto* m4Vector = m4Result->asFlatVector<double>();
+    VELOX_CHECK_NOT_NULL(countVector);
+    VELOX_CHECK_NOT_NULL(m1Vector);
+    VELOX_CHECK_NOT_NULL(m2Vector);
+    VELOX_CHECK_NOT_NULL(m3Vector);
+    VELOX_CHECK_NOT_NULL(m4Vector);
+
+    auto* rawCounts = countVector->mutableRawValues();
+    auto* rawM1 = m1Vector->mutableRawValues();
+    auto* rawM2 = m2Vector->mutableRawValues();
+    auto* rawM3 = m3Vector->mutableRawValues();
+    auto* rawM4 = m4Vector->mutableRawValues();
+
+    rows.applyToSelected([&](vector_size_t row) {
+      if (decodedInput.isNullAt(row)) {
+        bits::setNull(rawNulls, row);
+        return;
+      }
+
+      rawCounts[row] = 1;
+      rawM1[row] = static_cast<double>(decodedInput.template valueAt<T>(row));
+      rawM2[row] = 0;
+      rawM3[row] = 0;
+      rawM4[row] = 0;
+    });
+
+    result = std::make_shared<RowVector>(
+        pool,
+        resultType_,
+        nulls,
+        numRows,
+        std::vector<VectorPtr>{
+            countResult, m1Result, m2Result, m3Result, m4Result});
+  }
+
   void addRawInput(
       char** groups,
       const SelectivityVector& rows,

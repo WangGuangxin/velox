@@ -79,6 +79,59 @@ class VarianceAggregate : public exec::Aggregate {
     return sizeof(VarianceAccumulator);
   }
 
+  bool supportsToIntermediate() const override {
+    return true;
+  }
+
+  void toIntermediate(
+      const SelectivityVector& rows,
+      std::vector<VectorPtr>& args,
+      VectorPtr& result) const override {
+    VELOX_CHECK_EQ(args.size(), 1);
+
+    const auto numRows = rows.size();
+    auto* pool = allocator_->pool();
+
+    BufferPtr nulls = allocateNulls(numRows, pool);
+    auto* rawNulls = nulls->asMutable<uint64_t>();
+    memcpy(rawNulls, rows.asRange().bits(), bits::nbytes(numRows));
+
+    DecodedVector decodedInput(*args[0], rows);
+    const auto& rowType = resultType_->asRow();
+
+    auto countResult = BaseVector::create(rowType.childAt(kCountIdx), numRows, pool);
+    auto meanResult = BaseVector::create(rowType.childAt(kMeanIdx), numRows, pool);
+    auto m2Result = BaseVector::create(rowType.childAt(kM2Idx), numRows, pool);
+
+    auto* countVector = countResult->asFlatVector<int64_t>();
+    auto* meanVector = meanResult->asFlatVector<double>();
+    auto* m2Vector = m2Result->asFlatVector<double>();
+    VELOX_CHECK_NOT_NULL(countVector);
+    VELOX_CHECK_NOT_NULL(meanVector);
+    VELOX_CHECK_NOT_NULL(m2Vector);
+
+    auto* rawCounts = countVector->mutableRawValues();
+    auto* rawMeans = meanVector->mutableRawValues();
+    auto* rawM2s = m2Vector->mutableRawValues();
+
+    rows.applyToSelected([&](vector_size_t row) {
+      if (decodedInput.isNullAt(row)) {
+        bits::setNull(rawNulls, row);
+        return;
+      }
+      rawCounts[row] = 1;
+      rawMeans[row] = static_cast<double>(decodedInput.template valueAt<T>(row));
+      rawM2s[row] = 0;
+    });
+
+    result = std::make_shared<RowVector>(
+        pool,
+        resultType_,
+        nulls,
+        numRows,
+        std::vector<VectorPtr>{countResult, meanResult, m2Result});
+  }
+
   void extractAccumulators(char** groups, int32_t numGroups, VectorPtr* result)
       override {
     auto rowVector = (*result)->as<RowVector>();

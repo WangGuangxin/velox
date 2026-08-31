@@ -223,6 +223,104 @@ class CovarianceAggregate : public exec::Aggregate {
     return sizeof(TAccumulator);
   }
 
+  bool supportsToIntermediate() const override {
+    return true;
+  }
+
+  void toIntermediate(
+      const SelectivityVector& rows,
+      std::vector<VectorPtr>& args,
+      VectorPtr& result) const override {
+    VELOX_CHECK_EQ(args.size(), 2);
+
+    const auto numRows = rows.size();
+    auto* pool = allocator_->pool();
+
+    BufferPtr nulls = allocateNulls(numRows, pool);
+    auto* rawNulls = nulls->asMutable<uint64_t>();
+    memcpy(rawNulls, rows.asRange().bits(), bits::nbytes(numRows));
+
+    DecodedVector decodedX;
+    DecodedVector decodedY;
+    if constexpr (
+        std::is_same_v<TAccumulator, RegrAccumulator> ||
+        std::is_same_v<TAccumulator, ExtendedRegrAccumulator>) {
+      decodedX.decode(*args[1], rows);
+      decodedY.decode(*args[0], rows);
+    } else {
+      decodedX.decode(*args[0], rows);
+      decodedY.decode(*args[1], rows);
+    }
+
+    const auto& rowType = resultType_->asRow();
+
+    auto childAt = [&](int32_t index) {
+      return BaseVector::create(rowType.childAt(index), numRows, pool);
+    };
+
+    auto c2Result = childAt(kCovarIndices.c2);
+    auto countResult = childAt(kCovarIndices.count);
+    auto meanXResult = childAt(kCovarIndices.meanX);
+    auto meanYResult = childAt(kCovarIndices.meanY);
+
+    auto* c2Vector = c2Result->template asFlatVector<double>();
+    auto* countVector = countResult->template asFlatVector<int64_t>();
+    auto* meanXVector = meanXResult->template asFlatVector<double>();
+    auto* meanYVector = meanYResult->template asFlatVector<double>();
+    VELOX_CHECK_NOT_NULL(c2Vector);
+    VELOX_CHECK_NOT_NULL(countVector);
+    VELOX_CHECK_NOT_NULL(meanXVector);
+    VELOX_CHECK_NOT_NULL(meanYVector);
+
+    auto* rawC2 = c2Vector->mutableRawValues();
+    auto* rawCounts = countVector->mutableRawValues();
+    auto* rawMeanX = meanXVector->mutableRawValues();
+    auto* rawMeanY = meanYVector->mutableRawValues();
+
+    FlatVector<double>* m2XVector{nullptr};
+    FlatVector<double>* m2YVector{nullptr};
+    double* rawM2X{nullptr};
+    double* rawM2Y{nullptr};
+    std::vector<VectorPtr> children{
+        c2Result, countResult, meanXResult, meanYResult};
+
+    if constexpr (std::is_same_v<TIntermediateResult, CorrIntermediateResult>) {
+      auto m2XResult = childAt(kCorrIndices.m2X);
+      auto m2YResult = childAt(kCorrIndices.m2Y);
+      m2XVector = m2XResult->template asFlatVector<double>();
+      m2YVector = m2YResult->template asFlatVector<double>();
+      VELOX_CHECK_NOT_NULL(m2XVector);
+      VELOX_CHECK_NOT_NULL(m2YVector);
+      rawM2X = m2XVector->mutableRawValues();
+      rawM2Y = m2YVector->mutableRawValues();
+      children.push_back(m2XResult);
+      children.push_back(m2YResult);
+    }
+
+    rows.applyToSelected([&](vector_size_t row) {
+      if (decodedX.isNullAt(row) || decodedY.isNullAt(row)) {
+        bits::setNull(rawNulls, row);
+        return;
+      }
+
+      const auto x = static_cast<double>(decodedX.template valueAt<T>(row));
+      const auto y = static_cast<double>(decodedY.template valueAt<T>(row));
+
+      rawC2[row] = 0;
+      rawCounts[row] = 1;
+      rawMeanX[row] = x;
+      rawMeanY[row] = y;
+
+      if constexpr (std::is_same_v<TIntermediateResult, CorrIntermediateResult>) {
+        rawM2X[row] = 0;
+        rawM2Y[row] = 0;
+      }
+    });
+
+    result = std::make_shared<RowVector>(
+        pool, resultType_, nulls, numRows, std::move(children));
+  }
+
   void addRawInput(
       char** groups,
       const SelectivityVector& rows,

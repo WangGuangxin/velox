@@ -15,6 +15,7 @@
  */
 #include <random>
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/functions/lib/aggregates/tests/utils/AggregationTestBase.h"
 
@@ -111,6 +112,37 @@ TEST_P(CentralMomentsAggregationTest, doubleNoNulls) {
   auto aggName = GetParam();
   testGlobalAgg(aggName, data, size);
   testGroupBy(aggName, data, groupSize);
+}
+
+TEST_F(CentralMomentsAggregationTest, toIntermediateFastPath) {
+  std::vector<RowVectorPtr> data;
+  for (auto batch = 0; batch < 3; ++batch) {
+    data.push_back(makeRowVector(
+        {"k", "v"},
+        {makeFlatVector<int32_t>(
+             100, [&](auto row) { return (batch * 100 + row) % 8; }),
+         makeFlatVector<double>(
+             100, [&](auto row) { return 100.0 + (batch * 100 + row) * 0.1; })}));
+  }
+  createDuckDbTable(data);
+
+  core::PlanNodeId partialNodeId;
+  auto plan = PlanBuilder()
+                  .values(data)
+                  .partialAggregation({"k"}, {"skewness(v)"})
+                  .capturePlanNodeId(partialNodeId)
+                  .finalAggregation()
+                  .planNode();
+  auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                  .maxDrivers(1)
+                  .config(core::QueryConfig::kAbandonPartialAggregationMinRows, "1")
+                  .config(core::QueryConfig::kAbandonPartialAggregationMinPct, "0")
+                  .assertResults("SELECT k, ((count(v) - 2) / sqrt(count(v) * (count(v) - 1))) * skewness(v) FROM tmp GROUP BY 1");
+
+  const auto stats = exec::toPlanStats(task->taskStats());
+  EXPECT_GT(
+      stats.at(partialNodeId).customStats.at("toIntermediateFastPathCalls").sum,
+      0);
 }
 
 TEST_P(CentralMomentsAggregationTest, doubleSomeNulls) {

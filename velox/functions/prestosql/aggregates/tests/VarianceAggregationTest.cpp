@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
 #include "velox/functions/lib/aggregates/tests/utils/AggregationTestBase.h"
 
@@ -98,6 +99,37 @@ TEST_F(VarianceAggregationTest, varianceConst) {
         {GEN_AGG("c0")},
         sql);
   }
+}
+
+TEST_F(VarianceAggregationTest, toIntermediateFastPath) {
+  std::vector<RowVectorPtr> data;
+  for (auto batch = 0; batch < 3; ++batch) {
+    data.push_back(makeRowVector(
+        {"k", "v"},
+        {makeFlatVector<int64_t>(
+             100, [&](auto row) { return (batch * 100 + row) % 9; }),
+         makeFlatVector<double>(
+             100, [&](auto row) { return (batch * 100 + row) * 0.25; })}));
+  }
+  createDuckDbTable(data);
+
+  core::PlanNodeId partialNodeId;
+  auto plan = PlanBuilder()
+                  .values(data)
+                  .partialAggregation({"k"}, {"variance(v)"})
+                  .capturePlanNodeId(partialNodeId)
+                  .finalAggregation()
+                  .planNode();
+  auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                  .maxDrivers(1)
+                  .config(core::QueryConfig::kAbandonPartialAggregationMinRows, "1")
+                  .config(core::QueryConfig::kAbandonPartialAggregationMinPct, "0")
+                  .assertResults("SELECT k, variance(v) FROM tmp GROUP BY k");
+
+  const auto stats = exec::toPlanStats(task->taskStats());
+  EXPECT_GT(
+      stats.at(partialNodeId).customStats.at("toIntermediateFastPathCalls").sum,
+      0);
 }
 
 TEST_F(VarianceAggregationTest, varianceConstNull) {
