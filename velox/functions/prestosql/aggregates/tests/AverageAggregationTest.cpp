@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/exec/PlanNodeStats.h"
 #include "velox/exec/tests/SimpleAggregateFunctionsRegistration.h"
 #include "velox/exec/tests/utils/AssertQueryBuilder.h"
 #include "velox/exec/tests/utils/PlanBuilder.h"
@@ -636,6 +637,37 @@ TEST_F(AverageAggregationTest, constantVectorOverflow) {
                   .singleAggregation({}, {"avg(c0)"})
                   .planNode();
   assertQuery(plan, "SELECT 1073741824");
+}
+
+TEST_F(AverageAggregationTest, toIntermediateFastPath) {
+  std::vector<RowVectorPtr> data;
+  for (auto batch = 0; batch < 3; ++batch) {
+    data.push_back(makeRowVector(
+        {"k", "v"},
+        {makeFlatVector<int64_t>(
+             100, [&](auto row) { return (batch * 100 + row) % 11; }),
+         makeFlatVector<int64_t>(
+             100, [&](auto row) { return batch * 100 + row; })}));
+  }
+  createDuckDbTable(data);
+
+  core::PlanNodeId partialNodeId;
+  auto plan = PlanBuilder()
+                  .values(data)
+                  .partialAggregation({"k"}, {"avg(v)"})
+                  .capturePlanNodeId(partialNodeId)
+                  .finalAggregation()
+                  .planNode();
+  auto task = AssertQueryBuilder(plan, duckDbQueryRunner_)
+                  .maxDrivers(1)
+                  .config(core::QueryConfig::kAbandonPartialAggregationMinRows, "1")
+                  .config(core::QueryConfig::kAbandonPartialAggregationMinPct, "0")
+                  .assertResults("SELECT k, avg(v) FROM tmp GROUP BY k");
+
+  const auto stats = exec::toPlanStats(task->taskStats());
+  EXPECT_GT(
+      stats.at(partialNodeId).customStats.at("toIntermediateFastPathCalls").sum,
+      0);
 }
 
 TEST_F(AverageAggregationTest, companionFunctionsWithNonFlatAndLazyInputs) {

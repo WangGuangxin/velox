@@ -83,6 +83,51 @@ class AverageAggregateBase : public exec::Aggregate {
     return sizeof(SumCount<TAccumulator>);
   }
 
+  bool supportsToIntermediate() const override {
+    return true;
+  }
+
+  void toIntermediate(
+      const SelectivityVector& rows,
+      std::vector<VectorPtr>& args,
+      VectorPtr& result) const override {
+    VELOX_CHECK_EQ(args.size(), 1);
+
+    const auto numRows = rows.size();
+    auto* pool = allocator_->pool();
+
+    BufferPtr nulls = allocateNulls(numRows, pool);
+    auto* rawNulls = nulls->asMutable<uint64_t>();
+    memcpy(rawNulls, rows.asRange().bits(), bits::nbytes(numRows));
+
+    DecodedVector decodedInput(*args[0], rows);
+    auto sumResult = BaseVector::create(resultType_->childAt(0), numRows, pool);
+    auto countResult = BaseVector::create(BIGINT(), numRows, pool);
+
+    auto* sumVector = sumResult->template asFlatVector<TAccumulator>();
+    VELOX_CHECK_NOT_NULL(sumVector);
+    auto* countVector = countResult->template asFlatVector<int64_t>();
+    VELOX_CHECK_NOT_NULL(countVector);
+    auto* rawSumValues = sumVector->mutableRawValues();
+    auto* rawCountValues = countVector->mutableRawValues();
+
+    rows.applyToSelected([&](vector_size_t row) {
+      if (decodedInput.isNullAt(row)) {
+        bits::setNull(rawNulls, row);
+        return;
+      }
+      rawSumValues[row] = TAccumulator(decodedInput.template valueAt<TInput>(row));
+      rawCountValues[row] = 1;
+    });
+
+    result = std::make_shared<RowVector>(
+        pool,
+        resultType_,
+        nulls,
+        numRows,
+        std::vector<VectorPtr>{sumResult, countResult});
+  }
+
   void extractValues(char** groups, int32_t numGroups, VectorPtr* result)
       override {
     auto vector = (*result)->as<FlatVector<TResult>>();
