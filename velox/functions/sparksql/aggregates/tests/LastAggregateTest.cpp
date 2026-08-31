@@ -18,6 +18,8 @@
 #include "velox/functions/lib/aggregates/tests/utils/AggregationTestBase.h"
 #include "velox/functions/sparksql/aggregates/Register.h"
 
+using facebook::velox::exec::test::PlanBuilder;
+
 namespace facebook::velox::functions::aggregate::sparksql::test {
 
 namespace {
@@ -27,9 +29,6 @@ class LastAggregateTest : public aggregate::test::AggregationTestBase {
   void SetUp() override {
     aggregate::test::AggregationTestBase::SetUp();
     registerAggregateFunctions("spark_");
-    // Disable incremental aggregation tests because the boolean field in
-    // intermediate result of spark_last is unset and has undefined value.
-    AggregationTestBase::disableTestIncremental();
   }
 
   template <typename T>
@@ -136,6 +135,22 @@ TEST_F(LastAggregateTest, smallInt) {
 
 TEST_F(LastAggregateTest, integer) {
   testAggregate<int32_t>();
+}
+
+TEST_F(LastAggregateTest, intermediateAggregation) {
+  auto data = makeRowVector({
+      makeFlatVector<int32_t>({0, 0, 1, 1}),
+      makeNullableFlatVector<int32_t>({10, std::nullopt, 20, std::nullopt}),
+  });
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .partialAggregation({"c0"}, {"spark_last(c1)"})
+                  .intermediateAggregation()
+                  .finalAggregation()
+                  .planNode();
+  assertQuery(plan, "SELECT c0, last(c1) FROM tmp GROUP BY 1");
 }
 
 TEST_F(LastAggregateTest, bigint) {

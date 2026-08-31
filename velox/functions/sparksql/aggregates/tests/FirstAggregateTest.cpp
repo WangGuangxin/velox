@@ -34,9 +34,6 @@ class FirstAggregateTest : public AggregationTestBase {
   void SetUp() override {
     AggregationTestBase::SetUp();
     registerAggregateFunctions("spark_");
-    // Disable incremental aggregation tests because the boolean field in
-    // intermediate result of spark_first is unset and has undefined value.
-    AggregationTestBase::disableTestIncremental();
   }
 
   template <typename T>
@@ -143,6 +140,22 @@ TEST_F(FirstAggregateTest, smallInt) {
 
 TEST_F(FirstAggregateTest, integer) {
   testAggregate<int32_t>();
+}
+
+TEST_F(FirstAggregateTest, intermediateAggregation) {
+  auto data = makeRowVector({
+      makeFlatVector<int32_t>({0, 0, 1, 1}),
+      makeNullableFlatVector<int32_t>({std::nullopt, 10, std::nullopt, 20}),
+  });
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .partialAggregation({"c0"}, {"spark_first(c1)"})
+                  .intermediateAggregation()
+                  .finalAggregation()
+                  .planNode();
+  assertQuery(plan, "SELECT c0, first(c1) FROM tmp GROUP BY 1");
 }
 
 TEST_F(FirstAggregateTest, bigint) {

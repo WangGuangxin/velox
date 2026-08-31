@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <cstring>
 #include <string>
 
 #include "velox/expression/FunctionSignature.h"
@@ -55,6 +56,53 @@ class FirstLastAggregateBase
     return 1;
   }
 
+  bool supportsToIntermediate() const override {
+    return true;
+  }
+
+  void toIntermediate(
+      const SelectivityVector& rows,
+      std::vector<VectorPtr>& args,
+      VectorPtr& result) const override {
+    VELOX_CHECK_EQ(args.size(), 1);
+
+    const auto numRows = rows.size();
+    auto* pool = Aggregate::allocator_->pool();
+
+    BufferPtr rowNulls = allocateNulls(numRows, pool);
+    auto* rawRowNulls = rowNulls->asMutable<uint64_t>();
+    memcpy(rawRowNulls, rows.asRange().bits(), bits::nbytes(numRows));
+
+    const auto& rowType = this->resultType_->asRow();
+    auto valueResult = BaseVector::create(rowType.childAt(0), numRows, pool);
+    auto seenResult = BaseVector::create(rowType.childAt(1), numRows, pool);
+    auto* seenVector = seenResult->template asFlatVector<bool>();
+    VELOX_CHECK_NOT_NULL(seenVector);
+
+    auto seenNulls = seenResult->mutableNulls(numRows);
+    bits::fillBits(seenNulls->template asMutable<uint64_t>(), 0, numRows, false);
+    auto* rawSeenValues = seenVector->template mutableRawValues<uint64_t>();
+    bits::fillBits(rawSeenValues, 0, numRows, false);
+
+    DecodedVector decodedValue(*args[0], rows);
+    rows.applyToSelected([&](vector_size_t row) {
+      if (decodedValue.isNullAt(row)) {
+        bits::setNull(rawRowNulls, row);
+        return;
+      }
+
+      bits::setBit(rawSeenValues, row, true);
+      valueResult->copy(decodedValue.base(), row, decodedValue.index(row), 1);
+    });
+
+    std::vector<VectorPtr> children;
+    children.reserve(2);
+    children.push_back(valueResult);
+    children.push_back(seenResult);
+    result = std::make_shared<RowVector>(
+        pool, this->resultType_, rowNulls, numRows, std::move(children));
+  }
+
   void extractValues(char** groups, int32_t numGroups, VectorPtr* result)
       override {
     if constexpr (numeric) {
@@ -90,14 +138,22 @@ class FirstLastAggregateBase
         2,
         "intermediate results must have 2 children");
 
-    auto ignoreNullVector = rowVector->childAt(1)->asFlatVector<bool>();
+    auto ignoreNullVector = rowVector->childAt(1)->template asFlatVector<bool>();
     rowVector->resize(numGroups);
     ignoreNullVector->resize(numGroups);
+    auto ignoreNulls = ignoreNullVector->mutableNulls(numGroups);
+    bits::fillBits(
+        ignoreNulls->template asMutable<uint64_t>(), 0, numGroups, false);
+    auto* rawIgnoreNulls =
+        ignoreNullVector->template mutableRawValues<uint64_t>();
+    bits::fillBits(rawIgnoreNulls, 0, numGroups, false);
 
     extractValues(groups, numGroups, &(rowVector->childAt(0)));
     for (auto i = 0; i < numGroups; i++) {
       if (Aggregate::isNull(groups[i])) {
         rowVector->setNull(i, true);
+      } else {
+        bits::setBit(rawIgnoreNulls, i, true);
       }
     }
   }
