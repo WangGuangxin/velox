@@ -120,7 +120,11 @@ class RowsStreamingWindowBuild : public WindowBuild {
   // null output.
   bool hasRowsToDrain() const;
 
-  // Sets to true if this window node has range frames.
+  // True if this window node has at least one RANGE frame. Used in 'addInput()'
+  // to gate intermediate flushes on peer-group boundaries rather than arbitrary
+  // row positions, since RANGE functions require all rows in the same peer group
+  // to be processed together. Throttling via 'needsInput()' still applies across
+  // completed peer groups.
   const bool hasRangeFrame_;
 
   // Upper bound on the estimated bytes of input retained (by reference) for a
@@ -159,8 +163,9 @@ class RowsStreamingWindowBuild : public WindowBuild {
   // so the per-row check in 'addInput()' is an integer compare rather than a
   // walk of 'windowPartitions_'. Valid there only because that flush also
   // requires '!hasRowsToDrain()', i.e. every partition holds zero rows, which
-  // makes 'pendingRowCount_' the whole retained-row count. Left at the maximum
-  // for RANGE frames, which are never throttled on bytes.
+  // makes 'pendingRowCount_' the whole retained-row count. For RANGE frames the
+  // trigger in 'addInput()' only flushes at peer-group boundaries, so
+  // 'pendingRowCount_' may exceed this value while waiting for the next boundary.
   vector_size_t maxPendingRows_{std::numeric_limits<vector_size_t>::max()};
 
   // The output gets next partition from the head of 'windowPartitions_' and

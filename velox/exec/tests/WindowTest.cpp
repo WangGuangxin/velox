@@ -133,9 +133,9 @@ class WindowTest : public OperatorTestBase {
   tsan_atomic<bool> nonReclaimableSection_{false};
 };
 
-// Wraps 'call' in the default ROWS frame. An omitted frame clause parses to
-// RANGE, and 'hasRangeFrame_' is node-wide, so a single unframed function
-// exempts the whole build from the byte budget.
+// Wraps 'call' in an explicit ROWS frame. An omitted frame clause parses to
+// RANGE; tests that check ROWS-specific throttle behavior use this helper to
+// prevent the implicit RANGE frame from exercising RANGE code paths instead.
 std::string rowsFrameFunction(const std::string& call) {
   return fmt::format(
       "{} over (partition by p order by s rows between unbounded preceding "
@@ -843,9 +843,10 @@ TEST_F(WindowTest, rowsStreamingWindowBuildBudgetPreservesResults) {
   // rank/dense_rank would break if a partial partition were mistaken for a
   // complete one.
   //
-  // Every function needs an explicit ROWS frame. An omitted frame clause parses
-  // to RANGE, and 'hasRangeFrame_' is node-wide, so a single unframed function
-  // exempts the whole build from the budget and makes this comparison vacuous.
+  // Uses explicit ROWS frames to keep this test on the ROWS throttle path.
+  // Peer groups span flush boundaries (heavy ties on the sort key), which is
+  // where rank/dense_rank would break if a partial partition were mistaken for a
+  // complete one.
   const vector_size_t size = 500;
   auto data = makeSinglePartitionData(size, 7, 4'096, 0);
   createDuckDbTable({data});
@@ -858,7 +859,7 @@ TEST_F(WindowTest, rowsStreamingWindowBuildBudgetPreservesResults) {
        rowsFrameFunction("sum(s)")});
   for (const auto& function : windowNode->windowFunctions()) {
     ASSERT_EQ(function.frame.type, core::WindowNode::WindowType::kRows)
-        << "a RANGE function would exempt the build from the byte budget";
+        << "test expects explicit ROWS frames; check rowsFrameFunction() usage";
   }
 
   auto tiny = AssertQueryBuilder(windowNode)
@@ -902,7 +903,8 @@ DEBUG_ONLY_TEST_F(
   // including one that extends past the current row. They ignore the frame -
   // both Rank::apply() and RowNumber::apply() discard frameStarts/frameEnds -
   // but the byte budget must not change their results either way. The RANGE
-  // case additionally covers the path where the budget is disabled outright.
+  // case additionally covers the path where throttling fires at peer-group
+  // boundaries instead of arbitrary row positions.
   const vector_size_t size = 500;
   auto data = makeSinglePartitionData(size, 7, 4'096, 0);
   createDuckDbTable({data});
@@ -945,6 +947,66 @@ DEBUG_ONLY_TEST_F(
           << "row " << row << ": tiny=" << tiny->toString(row)
           << " unbounded=" << unbounded->toString(row);
     }
+  }
+}
+
+TEST_F(WindowTest, rowsStreamingWindowBuildRangeFrameThrottlesBetweenPeerGroups) {
+  // RANGE frames previously exempted the build from byte throttling entirely,
+  // allowing a single large partition to accumulate unbounded memory. After the
+  // fix, throttling fires between completed peer groups: once the byte budget is
+  // exceeded and at least one peer group has closed, needsInput() returns false
+  // so the driver drains output before feeding more input.
+  //
+  // Uses wide rows so the budget is reached well before the first peer-group
+  // boundary, confirming that the build waits for the boundary before flushing
+  // rather than splitting mid-peer-group, and that it exposes a drainable
+  // partition afterward.
+  const vector_size_t size = 200;
+  // 20 rows per peer group gives 10 peer groups; budget covers 8 rows.
+  auto data = makeSinglePartitionData(size, 20, 4'096, 0);
+  auto windowNode = makeStreamingWindowNode(
+      {data}, {"rank() over (partition by p order by s)"});
+  // Confirm the implicit frame is RANGE (the premise of this test).
+  ASSERT_EQ(
+      windowNode->windowFunctions()[0].frame.type,
+      core::WindowNode::WindowType::kRange);
+
+  const uint64_t budget = budgetForRows(data, 8);
+
+  {
+    TestingRowsStreamingWindowBuild windowBuild(
+        windowNode, pool(), nullptr, &nonReclaimableSection_, budget);
+    // High row-count target so only the byte budget drives flushing.
+    windowBuild.setNumRowsPerOutput(size * 2);
+
+    EXPECT_TRUE(windowBuild.needsInput());
+
+    windowBuild.addInput(data);
+    // Budget exceeded and the first peer-group boundary was crossed, so the
+    // build must refuse more input until the driver drains.
+    EXPECT_FALSE(windowBuild.needsInput());
+    EXPECT_TRUE(windowBuild.hasNextPartition());
+  }
+
+  // End-to-end: tiny vs. unbounded budget must produce the same rank values.
+  createDuckDbTable({data});
+  auto tiny = AssertQueryBuilder(windowNode)
+                  .config(core::QueryConfig::kPreferredOutputBatchBytes, "1024")
+                  .config(core::QueryConfig::kPreferredOutputBatchRows, "10000")
+                  .copyResults(pool());
+  auto unbounded =
+      AssertQueryBuilder(windowNode)
+          .config(
+              core::QueryConfig::kPreferredOutputBatchBytes, "1000000000")
+          .config(core::QueryConfig::kPreferredOutputBatchRows, "10000")
+          .copyResults(pool());
+
+  ASSERT_EQ(tiny->size(), size);
+  ASSERT_EQ(unbounded->size(), size);
+  for (auto row = 0; row < size; ++row) {
+    ASSERT_TRUE(tiny->equalValueAt(unbounded.get(), row, row))
+        << "row " << row << ": tiny=" << tiny->toString(row)
+        << " unbounded=" << unbounded->toString(row);
   }
 }
 
