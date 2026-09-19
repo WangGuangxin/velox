@@ -102,9 +102,7 @@ int64_t RowsStreamingWindowBuild::numRetainedRows() const {
 }
 
 bool RowsStreamingWindowBuild::reachedRetainedBytesBudget() const {
-  // RANGE frames must retain the whole incomplete peer group, so they are never
-  // throttled on bytes.
-  if (hasRangeFrame_ || !estimatedRowSize_.has_value()) {
+  if (!estimatedRowSize_.has_value()) {
     return false;
   }
   const uint64_t retainedBytes =
@@ -193,9 +191,7 @@ void RowsStreamingWindowBuild::addPartitionInputs(bool finished) {
 void RowsStreamingWindowBuild::addInput(RowVectorPtr input) {
   loadBoundaryColumns(input);
 
-  // Skipped for RANGE frames, which are never throttled on bytes and so have no
-  // use for the estimate: 'estimateFlatSize()' walks the vector on every batch.
-  if (!hasRangeFrame_ && input->size() > 0) {
+  if (input->size() > 0) {
     // Floored at one byte: an encoded input can estimate to fewer bytes than
     // rows, and a zero row size would make the retained-byte total zero and
     // silently disable throttling.
