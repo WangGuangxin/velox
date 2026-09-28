@@ -177,6 +177,30 @@ void VectorWindowPartition::extractColumn(
   }
 }
 
+bool VectorWindowPartition::tryExtractColumnsAsSlices(
+    vector_size_t partitionOffset,
+    vector_size_t numRows,
+    int32_t numInputColumns,
+    const RowVectorPtr& result) const {
+  VELOX_CHECK_GE(partitionOffset, startRow_);
+  if (numRows == 0) {
+    return true;
+  }
+
+  const auto [rangeIndex, localRow] = findRange(partitionOffset - startRow_);
+  const auto& range = ranges_[rangeIndex];
+
+  // All requested rows must lie within a single retained RowRange.
+  if (localRow + numRows > range.endRow) {
+    return false;
+  }
+
+  for (auto i = 0; i < numInputColumns; ++i) {
+    result->childAt(i) = range.input->childAt(i)->slice(localRow, numRows);
+  }
+  return true;
+}
+
 void VectorWindowPartition::extractNulls(
     int32_t columnIndex,
     vector_size_t partitionOffset,

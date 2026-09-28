@@ -17,6 +17,7 @@
 
 #include "velox/exec/RowContainer.h"
 #include "velox/vector/BaseVector.h"
+#include "velox/vector/ComplexVector.h"
 
 /// Simple WindowPartition that builds over the RowContainer used for storing
 /// the input rows in the Window Operator. This works completely in-memory.
@@ -108,6 +109,20 @@ class WindowPartition {
       vector_size_t numRows,
       vector_size_t resultOffset,
       const VectorPtr& result) const;
+
+  /// Assigns zero-copy slices of the underlying retained input to
+  /// result->childAt(i) for each i in [0, numInputColumns) when
+  /// [partitionOffset, partitionOffset+numRows) lies entirely within a
+  /// single retained input vector. Returns true on success; returns false
+  /// when the range spans more than one retained vector (caller falls back
+  /// to extractColumn). The default implementation always returns false.
+  virtual bool tryExtractColumnsAsSlices(
+      vector_size_t /*partitionOffset*/,
+      vector_size_t /*numRows*/,
+      int32_t /*numInputColumns*/,
+      const RowVectorPtr& /*result*/) const {
+    return false;
+  }
 
   /// Extracts null positions at 'columnIndex' into 'nullsBuffer' for
   /// 'numRows' starting at positions 'partitionOffset' in the partition

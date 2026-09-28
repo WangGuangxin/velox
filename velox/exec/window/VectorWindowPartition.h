@@ -74,6 +74,14 @@ class VectorWindowPartition : public WindowPartition {
       vector_size_t resultOffset,
       const VectorPtr& result) const override;
 
+  /// Assigns zero-copy slices when the range lies within a single retained
+  /// input vector. See WindowPartition::tryExtractColumnsAsSlices.
+  bool tryExtractColumnsAsSlices(
+      vector_size_t partitionOffset,
+      vector_size_t numRows,
+      int32_t numInputColumns,
+      const RowVectorPtr& result) const override;
+
   /// Extracts null positions from a retained input vector column.
   void extractNulls(
       int32_t columnIndex,

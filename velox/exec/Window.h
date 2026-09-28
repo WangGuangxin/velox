@@ -128,15 +128,20 @@ class Window : public Operator {
       vector_size_t startRow,
       vector_size_t endRow,
       vector_size_t resultOffset,
-      const RowVectorPtr& result);
+      const RowVectorPtr& result,
+      bool allowFastPath = false);
 
   // Gets the input columns of the current window partition
   // between startRow and endRow in result at resultOffset.
+  // When 'allowFastPath' is true and the range lies within a single retained
+  // input vector, the input column children of 'result' are replaced with
+  // zero-copy slices instead of being copied.
   void getInputColumns(
       vector_size_t startRow,
       vector_size_t endRow,
       vector_size_t resultOffset,
-      const RowVectorPtr& result);
+      const RowVectorPtr& result,
+      bool allowFastPath = false);
 
   // Computes the result vector for a single output block. The result
   // consists of all the input columns followed by the results of the

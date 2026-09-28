@@ -639,8 +639,14 @@ void Window::getInputColumns(
     vector_size_t startRow,
     vector_size_t endRow,
     vector_size_t resultOffset,
-    const RowVectorPtr& result) {
+    const RowVectorPtr& result,
+    bool allowFastPath) {
   const auto numRows = endRow - startRow;
+  if (allowFastPath &&
+      currentPartition_->tryExtractColumnsAsSlices(
+          partitionOffset_, numRows, numInputColumns_, result)) {
+    return;
+  }
   for (int i = 0; i < numInputColumns_; ++i) {
     currentPartition_->extractColumn(
         i, partitionOffset_, numRows, resultOffset, result->childAt(i));
@@ -651,14 +657,15 @@ void Window::callApplyForPartitionRows(
     vector_size_t startRow,
     vector_size_t endRow,
     vector_size_t resultOffset,
-    const RowVectorPtr& result) {
+    const RowVectorPtr& result,
+    bool allowFastPath) {
   // NOTE: for a partial window partition, the last row of the previously
   // processed rows (used for peer group comparison) will be deleted by
   // computePeerAndFrameBuffers after peer group comparison. Hence we need to
   // call getInputColumns after computePeerAndFrameBuffers.
   computePeerAndFrameBuffers(startRow, endRow);
 
-  getInputColumns(startRow, endRow, resultOffset, result);
+  getInputColumns(startRow, endRow, resultOffset, result, allowFastPath);
   vector_size_t numFuncs = windowFunctions_.size();
   for (auto i = 0; i < numFuncs; ++i) {
     windowFunctions_[i]->apply(
@@ -719,12 +726,14 @@ vector_size_t Window::callApplyLoop(
     } else {
       // Current partition can fit only partially in the output buffer.
       // Call apply for the rows that can fit in the buffer and break from
-      // outputting.
+      // outputting. This is the only call for this output batch when
+      // resultIndex is 0, so input columns can be zero-copy sliced.
       callApplyForPartitionRows(
           partitionOffset_,
           partitionOffset_ + numOutputRowsLeft,
           resultIndex,
-          result);
+          result,
+          /*allowFastPath=*/resultIndex == 0);
       numOutputRowsLeft = 0;
       break;
     }

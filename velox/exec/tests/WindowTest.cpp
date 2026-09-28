@@ -2139,5 +2139,41 @@ DEBUG_ONLY_TEST_F(WindowTest, releaseWindowBuildInTime) {
               "ORDER BY d");
 }
 
+// Validates that wide-table output from RowsStreamingWindowBuild is correct
+// when the zero-copy fast path slices input columns directly. The large
+// partition (1000 rows) ensures each output batch (small batch size) is
+// served entirely from a single retained RowRange, exercising the fast path.
+TEST_F(WindowTest, sliceFastPathInputColumns) {
+  constexpr int32_t kNumRows = 1'000;
+
+  // Build a wide table with many columns to amplify the savings from zero-copy.
+  auto data = makeRowVector(
+      {"p", "s", "c0", "c1", "c2", "c3", "c4"},
+      {
+          makeFlatVector<int32_t>(kNumRows, [](auto /*row*/) { return 0; }),
+          makeFlatVector<int32_t>(kNumRows, [](auto row) { return row; }),
+          makeFlatVector<int64_t>(kNumRows, [](auto row) { return row * 2; }),
+          makeFlatVector<double>(kNumRows, [](auto row) { return row * 0.5; }),
+          makeFlatVector<int32_t>(kNumRows, [](auto row) { return row % 100; }),
+          makeFlatVector<int64_t>(
+              kNumRows, [](auto row) { return row; }, nullEvery(7)),
+          makeFlatVector<std::string>(
+              kNumRows, [](auto row) { return std::to_string(row); }),
+      });
+
+  createDuckDbTable({data});
+
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .orderBy({"p", "s"}, false)
+                  .streamingWindow({"row_number() over (partition by p order by s)"})
+                  .planNode();
+
+  AssertQueryBuilder(plan, duckDbQueryRunner_)
+      .config(core::QueryConfig::kPreferredOutputBatchBytes, "512")
+      .assertResults(
+          "SELECT *, row_number() over (partition by p order by s) FROM tmp");
+}
+
 } // namespace
 } // namespace facebook::velox::exec
