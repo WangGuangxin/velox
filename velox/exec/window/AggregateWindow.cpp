@@ -512,13 +512,15 @@ class AggregateWindowFunction : public exec::WindowFunction {
 
     // Sliding window applies when both bounds are non-decreasing, but the
     // start is not fixed (otherwise the incremental path is preferred).
-    // Aggregates that use external memory (e.g. array_agg) store all input in
-    // every prefix/suffix accumulator, making total memory O(W²) for a window
-    // of width W. Disable the two-stack path for those and fall back to the
-    // O(N²)-time but O(1)-space simpleAggregation.
+    // Restrict the two-stack path to aggregates with fixed-size accumulators.
+    // For variable-size aggregates (e.g. array_agg, map_agg, histogram) the
+    // prefix accumulator at back stack position i holds O(i) data, so W
+    // prefixes together consume O(W²) space — worse than the O(W) state kept
+    // by simpleAggregation. accumulatorUsesExternalMemory() is insufficient
+    // because it only covers memory outside Velox's allocator; isFixedSize()
+    // is the correct predicate for "accumulator size does not grow with input".
     bool slidingWindow = startNonDecreasing && endNonDecreasing &&
-        !incrementalAggregation &&
-        !aggregate_->accumulatorUsesExternalMemory();
+        !incrementalAggregation && aggregate_->isFixedSize();
 
     bool usePreviousAggregate = false;
     if (previousFrameMetadata_.has_value()) {
