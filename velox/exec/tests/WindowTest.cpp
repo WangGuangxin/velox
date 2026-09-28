@@ -837,8 +837,8 @@ TEST_F(WindowTest, rowsStreamingWindowBuildBudgetPreservesResults) {
   //
   // Uses explicit ROWS frames to keep this test on the ROWS throttle path.
   // Peer groups span flush boundaries (heavy ties on the sort key), which is
-  // where rank/dense_rank would break if a partial partition were mistaken for a
-  // complete one.
+  // where rank/dense_rank would break if a partial partition were mistaken for
+  // a complete one.
   const vector_size_t size = 500;
   auto data = makeSinglePartitionData(size, 7, 4'096, 0);
   createDuckDbTable({data});
@@ -943,12 +943,14 @@ DEBUG_ONLY_TEST_F(
   }
 }
 
-TEST_F(WindowTest, rowsStreamingWindowBuildRangeFrameThrottlesBetweenPeerGroups) {
+TEST_F(
+    WindowTest,
+    rowsStreamingWindowBuildRangeFrameThrottlesBetweenPeerGroups) {
   // RANGE frames previously exempted the build from byte throttling entirely,
   // allowing a single large partition to accumulate unbounded memory. After the
-  // fix, throttling fires between completed peer groups: once the byte budget is
-  // exceeded and at least one peer group has closed, needsInput() returns false
-  // so the driver drains output before feeding more input.
+  // fix, throttling fires between completed peer groups: once the byte budget
+  // is exceeded and at least one peer group has closed, needsInput() returns
+  // false so the driver drains output before feeding more input.
   //
   // Uses wide rows so the budget is reached well before the first peer-group
   // boundary, confirming that the build waits for the boundary before flushing
@@ -989,8 +991,7 @@ TEST_F(WindowTest, rowsStreamingWindowBuildRangeFrameThrottlesBetweenPeerGroups)
                   .copyResults(pool());
   auto unbounded =
       AssertQueryBuilder(windowNode)
-          .config(
-              core::QueryConfig::kPreferredOutputBatchBytes, "1000000000")
+          .config(core::QueryConfig::kPreferredOutputBatchBytes, "1000000000")
           .config(core::QueryConfig::kPreferredOutputBatchRows, "10000")
           .copyResults(pool());
 
@@ -1705,6 +1706,85 @@ TEST_F(WindowTest, aggregateReceivesConstantInputs) {
   AssertQueryBuilder(plan).assertResults(expected);
 }
 
+TEST_F(WindowTest, slidingFrameAggregates) {
+  // Frames whose start and end both advance with the current row take the
+  // sliding window path once they are wide enough: 32 rows on average for
+  // aggregates with a primitive intermediate type such as sum, and 1'024 rows
+  // for ones with a ROW intermediate type such as avg. Narrower frames, and
+  // batches of frames clipped at the start of a partition, recompute each
+  // frame instead. Frames wider than 1'024 rows cross the chunks that
+  // arguments are loaded in, and small output batches carry the sliding state
+  // across batches.
+  const vector_size_t size{6'000};
+  auto data = makeRowVector(
+      {"p", "s", "v"},
+      {
+          makeFlatVector<int32_t>(size, [](auto row) { return row % 2; }),
+          makeFlatVector<int32_t>(size, [](auto row) { return row; }),
+          makeFlatVector<int64_t>(
+              size,
+              [](auto row) { return (row * 7) % 101 - 50; },
+              [](auto row) { return row % 13 == 0; }),
+      });
+  createDuckDbTable({data});
+
+  const std::vector<std::string> frames{
+      "rows between 3 preceding and 2 following",
+      "rows between 40 preceding and current row",
+      "rows between 1500 preceding and current row",
+      "rows between 5 following and 50 following",
+      "rows between 1200 preceding and 1100 preceding",
+      "rows between 2000 preceding and 1 preceding",
+  };
+  for (const auto& frame : frames) {
+    for (const auto* aggregate : {"sum", "avg", "min", "max", "count"}) {
+      const auto window = fmt::format(
+          "{}(v) over (partition by p order by s {})", aggregate, frame);
+      SCOPED_TRACE(window);
+      auto plan = PlanBuilder().values({data}).window({window}).planNode();
+      // DuckDB returns null for count over an empty frame. Velox returns 0,
+      // like Presto.
+      const auto expected = std::string_view(aggregate) == "count"
+          ? fmt::format("coalesce({}, 0)", window)
+          : window;
+      for (const auto batchRows : {3, 1'000}) {
+        SCOPED_TRACE(fmt::format("batchRows: {}", batchRows));
+        AssertQueryBuilder(plan, duckDbQueryRunner_)
+            .config(core::QueryConfig::kPreferredOutputBatchRows, batchRows)
+            .config(core::QueryConfig::kMaxOutputBatchRows, batchRows)
+            .assertResults(fmt::format("SELECT *, {} FROM tmp", expected));
+      }
+    }
+  }
+}
+
+TEST_F(WindowTest, slidingFrameGrowingAccumulator) {
+  // The accumulator of max_by(x, y, n) grows up to n entries. The sliding
+  // window path would keep one such accumulator per row of the frame, taking
+  // O(W^2) memory for frames of W rows, so these frames must recompute each
+  // frame instead.
+  const vector_size_t size{3'000};
+  auto data = makeRowVector(
+      {"s", "v"},
+      {
+          makeFlatVector<int32_t>(size, [](auto row) { return row; }),
+          makeFlatVector<int64_t>(size, [](auto row) { return row % 101; }),
+      });
+
+  core::PlanNodeId windowId;
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .window({"max_by(v, s, 3000) over (order by s rows between "
+                           "current row and unbounded following)"})
+                  .capturePlanNodeId(windowId)
+                  .planNode();
+  std::shared_ptr<Task> task;
+  AssertQueryBuilder(plan).copyResults(pool(), task);
+  const auto peakMemory =
+      PlanNodeStats::extract(task->taskStats(), windowId).peakMemoryBytes;
+  EXPECT_LT(peakMemory, 64 << 20);
+}
+
 TEST_F(WindowTest, missingFunctionSignature) {
   auto input = {makeRowVector({
       makeFlatVector<int64_t>({1, 2, 3}),
@@ -2212,11 +2292,12 @@ TEST_F(WindowTest, sliceFastPathInputColumns) {
 
   createDuckDbTable({data});
 
-  auto plan = PlanBuilder()
-                  .values({data})
-                  .orderBy({"p", "s"}, false)
-                  .streamingWindow({"row_number() over (partition by p order by s)"})
-                  .planNode();
+  auto plan =
+      PlanBuilder()
+          .values({data})
+          .orderBy({"p", "s"}, false)
+          .streamingWindow({"row_number() over (partition by p order by s)"})
+          .planNode();
 
   AssertQueryBuilder(plan, duckDbQueryRunner_)
       .config(core::QueryConfig::kPreferredOutputBatchBytes, "512")
