@@ -74,15 +74,13 @@ class SlidingWindowAgg {
     return front_.empty() && back_.empty();
   }
 
-  /// Adds the row at position argRow within argVectors to the right end of the
-  /// window.
-  void pushBack(const std::vector<VectorPtr>& argVectors, vector_size_t argRow) {
-    SelectivityVector rows(argRow + 1, false);
-    rows.setValid(argRow, true);
-    rows.updateBounds();
+  /// Adds row 0 of argVectors to the right end of the window.
+  /// The caller is responsible for loading exactly one row at position 0.
+  void pushBack(const std::vector<VectorPtr>& argVectors) {
+    static const SelectivityVector kRow0(1);
 
     char* raw = obtainSlot();
-    rawAgg_->addSingleGroupRawInput(raw, rows, argVectors, false);
+    rawAgg_->addSingleGroupRawInput(raw, kRow0, argVectors, false);
 
     char* prefix = obtainSlot();
     if (back_.empty()) {
@@ -514,8 +512,13 @@ class AggregateWindowFunction : public exec::WindowFunction {
 
     // Sliding window applies when both bounds are non-decreasing, but the
     // start is not fixed (otherwise the incremental path is preferred).
-    bool slidingWindow =
-        startNonDecreasing && endNonDecreasing && !incrementalAggregation;
+    // Aggregates that use external memory (e.g. array_agg) store all input in
+    // every prefix/suffix accumulator, making total memory O(W²) for a window
+    // of width W. Disable the two-stack path for those and fall back to the
+    // O(N²)-time but O(1)-space simpleAggregation.
+    bool slidingWindow = startNonDecreasing && endNonDecreasing &&
+        !incrementalAggregation &&
+        !aggregate_->accumulatorUsesExternalMemory();
 
     bool usePreviousAggregate = false;
     if (previousFrameMetadata_.has_value()) {
@@ -640,19 +643,17 @@ class AggregateWindowFunction : public exec::WindowFunction {
       rightPtr_ = leftPtr_;
     }
 
-    // Load the argument vectors for the rows we still need to push.
-    auto argLoadBase = rightPtr_;
-    if (rightPtr_ <= frameMetadata.lastRow) {
-      fillArgVectors(rightPtr_, frameMetadata.lastRow);
-    }
-
     validRows.applyToSelected([&](auto i) {
       auto frameStart = rawFrameStarts[i];
       auto frameEnd = rawFrameEnds[i];
 
       // Advance right: push rows into the back stack up to frameEnd.
+      // Load one row at a time into position 0 of argVectors_ so pushBack
+      // can always use a fixed size-1 SelectivityVector instead of a bitmap
+      // that grows with each row's absolute position in the batch (O(B²)).
       while (rightPtr_ <= frameEnd) {
-        slidingWindowAgg_->pushBack(argVectors_, rightPtr_ - argLoadBase);
+        fillArgVectors(rightPtr_, rightPtr_);
+        slidingWindowAgg_->pushBack(argVectors_);
         ++rightPtr_;
       }
 
