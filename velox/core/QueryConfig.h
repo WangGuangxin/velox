@@ -109,6 +109,30 @@ class QueryConfig {
       true,
       "Prefetch row data and next pointers during duplicate-key enumeration.")
 
+  VELOX_QUERY_CONFIG(
+      kHashJoinAdaptiveValueIdsEnabled,
+      hashJoinAdaptiveValueIdsEnabled,
+      "hash_join_adaptive_value_ids_enabled",
+      bool,
+      false,
+      "Enable build-only cardinality sampling and early distinct dictionary abandonment.")
+
+  VELOX_QUERY_CONFIG(
+      kHashJoinAdaptiveValueIdsMinRows,
+      hashJoinAdaptiveValueIdsMinRows,
+      "hash_join_adaptive_value_ids_min_rows",
+      uint32_t,
+      32'768,
+      "Minimum selected build rows before considering distinct dictionary abandonment.")
+
+  VELOX_QUERY_CONFIG(
+      kHashJoinAdaptiveValueIdsMinDistinctPct,
+      hashJoinAdaptiveValueIdsMinDistinctPct,
+      "hash_join_adaptive_value_ids_min_distinct_pct",
+      uint32_t,
+      80,
+      "Minimum distinct/build-row percentage for abandonment, between 1 and 100.")
+
   /// Maximum memory that a query can use on a single host.
   VELOX_QUERY_CONFIG_PROPERTY(
       kQueryMaxMemoryPerNode,

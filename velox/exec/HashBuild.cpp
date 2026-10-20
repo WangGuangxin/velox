@@ -70,6 +70,13 @@ HashBuild::HashBuild(
       dropDuplicates_(joinNode_->canDropDuplicates()),
       vectorHasherMaxNumDistinct_(
           driverCtx->queryConfig().joinBuildVectorHasherMaxNumDistinct()),
+      adaptiveValueIdsEnabled_(
+          driverCtx->queryConfig().hashJoinAdaptiveValueIdsEnabled() &&
+          !dropDuplicates_ && !joinNode_->isCountingJoin()),
+      adaptiveValueIdsMinRows_(
+          driverCtx->queryConfig().hashJoinAdaptiveValueIdsMinRows()),
+      adaptiveValueIdsMinDistinctPct_(
+          driverCtx->queryConfig().hashJoinAdaptiveValueIdsMinDistinctPct()),
       abandonHashBuildDedupMinRows_(
           driverCtx->queryConfig().abandonHashBuildDedupMinRows()),
       abandonHashBuildDedupMinPct_(
@@ -238,6 +245,7 @@ bool HashBuild::receivedCachedHashTable() {
 
 void HashBuild::setupTable() {
   VELOX_CHECK_NULL(table_);
+  valueIdInputRows_ = 0;
 
   const auto numKeys = keyChannels_.size();
   std::vector<std::unique_ptr<VectorHasher>> keyHashers;
@@ -549,8 +557,12 @@ void HashBuild::addInput(RowVectorPtr input) {
     abandonHashBuildDedup();
   }
 
-  if (analyzeKeys_ && hashes_.size() < activeRows_.end()) {
+  if (analyzeKeys_ && !adaptiveValueIdsEnabled_ &&
+      hashes_.size() < activeRows_.end()) {
     hashes_.resize(activeRows_.end());
+  }
+  if (analyzeKeys_ && adaptiveValueIdsEnabled_) {
+    valueIdInputRows_ += activeRows_.countSelected();
   }
 
   // As long as analyzeKeys is true, we keep running the keys through
@@ -562,7 +574,44 @@ void HashBuild::addInput(RowVectorPtr input) {
   for (auto& hasher : hashers) {
     // TODO: Load only for active rows, except if right/full outer join.
     if (analyzeKeys_) {
-      hasher->computeValueIds(activeRows_, hashes_);
+      if (adaptiveValueIdsEnabled_) {
+        const auto analysis = hasher->analyzeForHashJoin(
+            activeRows_,
+            valueIdInputRows_,
+            adaptiveValueIdsMinRows_,
+            adaptiveValueIdsMinDistinctPct_);
+        auto stats = stats_.wlock();
+        stats->addRuntimeStat(
+            "valueIdAnalysisRows", RuntimeCounter(activeRows_.countSelected()));
+        if (analysis.dictionaryLookups ==
+            VectorHasher::HashJoinAnalysis::kUnknownLookupCount) {
+          stats->addRuntimeStat(
+              "valueIdLegacyAnalysisRows",
+              RuntimeCounter(activeRows_.countSelected()));
+        } else {
+          stats->addRuntimeStat(
+              "valueIdDictionaryLookups",
+              RuntimeCounter(analysis.dictionaryLookups));
+        }
+        if (analysis.distinctValues > 0) {
+          stats->addRuntimeStat(
+              "valueIdObservedDistincts",
+              RuntimeCounter(analysis.distinctValues));
+        }
+        if (analysis.dictionaryGrew) {
+          stats->addRuntimeStat(
+              "valueIdDictionaryGrowthBatches", RuntimeCounter(1));
+        }
+        if (analysis.abandonedDistincts) {
+          stats->addRuntimeStat(
+              "valueIdAbandonedDictionaries", RuntimeCounter(1));
+        }
+        if (analysis.rangeOnly) {
+          stats->addRuntimeStat("valueIdRangeOnlyBatches", RuntimeCounter(1));
+        }
+      } else {
+        hasher->computeValueIds(activeRows_, hashes_);
+      }
       analyzeKeys_ = hasher->mayUseValueIds();
     }
   }
@@ -1104,6 +1153,11 @@ void HashBuild::addRuntimeStats() {
   uint64_t asRange{0};
   uint64_t asDistinct{0};
   auto lockedStats = stats_.wlock();
+  if (adaptiveValueIdsEnabled_) {
+    lockedStats->addRuntimeStat(
+        "valueIdFinalHashMode",
+        RuntimeCounter(static_cast<int64_t>(table_->hashMode())));
+  }
 
   for (const auto& timing : table_->parallelJoinBuildStats().partitionTimings) {
     lockedStats->getOutputTiming.add(timing);

@@ -68,6 +68,30 @@ TEST_F(QueryConfigTest, joinEnumerationTuning) {
   }
 }
 
+TEST_F(QueryConfigTest, adaptiveJoinValueIds) {
+  const QueryConfig defaults{{}};
+  EXPECT_FALSE(defaults.hashJoinAdaptiveValueIdsEnabled());
+  EXPECT_EQ(defaults.hashJoinAdaptiveValueIdsMinRows(), 32768);
+  EXPECT_EQ(defaults.hashJoinAdaptiveValueIdsMinDistinctPct(), 80);
+  const QueryConfig configured({
+      {QueryConfig::kHashJoinAdaptiveValueIdsEnabled, "true"},
+      {QueryConfig::kHashJoinAdaptiveValueIdsMinRows, "1024"},
+      {QueryConfig::kHashJoinAdaptiveValueIdsMinDistinctPct, "90"},
+  });
+  EXPECT_TRUE(configured.hashJoinAdaptiveValueIdsEnabled());
+  EXPECT_EQ(configured.hashJoinAdaptiveValueIdsMinRows(), 1024);
+  EXPECT_EQ(configured.hashJoinAdaptiveValueIdsMinDistinctPct(), 90);
+  EXPECT_THROW(
+      (QueryConfig{{{QueryConfig::kHashJoinAdaptiveValueIdsMinRows, "0"}}}),
+      VeloxUserError);
+  for (const auto* value : {"0", "101"}) {
+    EXPECT_THROW(
+        (QueryConfig{
+            {{QueryConfig::kHashJoinAdaptiveValueIdsMinDistinctPct, value}}}),
+        VeloxUserError);
+  }
+}
+
 TEST_F(QueryConfigTest, emptyConfig) {
   auto queryCtx = QueryCtx::create(nullptr, QueryConfig{{}});
   const QueryConfig& config = queryCtx->queryConfig();

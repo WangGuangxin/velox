@@ -244,6 +244,30 @@ class VectorHasher {
       const SelectivityVector& rows,
       raw_vector<uint64_t>& result);
 
+  struct HashJoinAnalysis {
+    static constexpr uint64_t kUnknownLookupCount = ~0ULL;
+    // Observed at the end of this batch, before any adaptive abandonment.
+    uint64_t distinctValues;
+    // Dictionary capacity increased between batch boundaries.
+    bool dictionaryGrew;
+    bool abandonedDistincts;
+    bool rangeOnly;
+    // Exact calls on the new paths; kUnknownLookupCount for legacy analysis.
+    uint64_t dictionaryLookups;
+  };
+
+  // Collect build-side statistics using an encoding-aware analysis path.
+  // Temporary value IDs are avoided except in the retained flat string loop.
+  // This is only for an append-only join build, before enabling a hash mode.
+  // 'numInputRows' includes this batch and counts selected logical rows,
+  // including nulls and dictionary repetitions. High distinct ratios permit
+  // discarding the dictionary; exact range statistics continue to be updated.
+  HashJoinAnalysis analyzeForHashJoin(
+      const SelectivityVector& rows,
+      uint64_t numInputRows,
+      uint32_t minRows,
+      uint32_t minDistinctPct);
+
   // Same as computeValueIds, but takes input stored row-wise.
   bool computeValueIdsForRows(
       char** groups,
@@ -519,6 +543,9 @@ class VectorHasher {
       analyzeValue(valueAt<T>(group, offset));
     }
   }
+
+  template <TypeKind Kind>
+  uint64_t analyzeDecodedForHashJoin(const SelectivityVector& rows);
 
   template <typename T>
   void analyzeValue(T value) {

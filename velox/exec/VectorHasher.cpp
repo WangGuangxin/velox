@@ -367,6 +367,200 @@ bool VectorHasher::computeValueIds(
   return VALUE_ID_TYPE_DISPATCH(makeValueIds, typeKind_, rows, result.data());
 }
 
+template <TypeKind Kind>
+uint64_t VectorHasher::analyzeDecodedForHashJoin(
+    const SelectivityVector& rows) {
+  using T = typename TypeTraits<Kind>::NativeType;
+  if constexpr (Kind == TypeKind::BOOLEAN) {
+    return 0;
+  }
+  if constexpr (
+      std::is_integral_v<T> && sizeof(T) <= sizeof(int64_t) &&
+      Kind != TypeKind::BOOLEAN) {
+    if (distinctOverflow_ && !rangeOverflow_ && decoded_.isIdentityMapping() &&
+        !decoded_.mayHaveNulls() && rows.isAllSelected()) {
+      // Range-only integer batches need no per-row dictionary bookkeeping.
+      const auto* values = decoded_.data<T>();
+      T min = values[rows.begin()];
+      T max = min;
+      for (auto i = rows.begin() + 1; i < rows.end(); ++i) {
+        min = std::min(min, values[i]);
+        max = std::max(max, values[i]);
+      }
+      updateRange(min);
+      updateRange(max);
+      return 0;
+    }
+  }
+
+  // Avoid an extra comparison on every low-cardinality, unordered key. This
+  // sample selects only a local fast path; it never omits distinct values.
+  bool useRuns = false;
+  if (decoded_.isIdentityMapping()) {
+    T previous{};
+    bool hasPrevious = false;
+    int32_t samples = 0;
+    int32_t repeats = 0;
+    rows.testSelected([&](vector_size_t row) {
+      if (!decoded_.isNullAt(row)) {
+        auto value = decoded_.valueAt<T>(row);
+        repeats += hasPrevious && value == previous;
+        previous = value;
+        hasPrevious = true;
+      }
+      return ++samples < 32 && repeats < 2;
+    });
+    useRuns = repeats >= 2;
+  }
+
+  if constexpr (Kind == TypeKind::VARCHAR || Kind == TypeKind::VARBINARY) {
+    if (!useRuns && !distinctOverflow_ && decoded_.isIdentityMapping() &&
+        !decoded_.mayHaveNulls()) {
+      // Unordered low-cardinality strings already have an efficient legacy
+      // lookup loop. Retain it rather than charging extra per-row branches.
+      // Identity mapping does not use cachedHashes_ internally, so it is safe
+      // to reuse this buffer for its otherwise-discarded temporary IDs.
+      cachedHashes_.resize(rows.end());
+      makeValueIds<Kind>(rows, cachedHashes_.data());
+      return HashJoinAnalysis::kUnknownLookupCount;
+    }
+  }
+
+  if constexpr (
+      std::is_integral_v<T> && sizeof(T) <= sizeof(int64_t) &&
+      Kind != TypeKind::BOOLEAN) {
+    if (!useRuns && !distinctOverflow_ && decoded_.isIdentityMapping() &&
+        !decoded_.mayHaveNulls() &&
+        numDistinct() + rows.countSelected() <= kMaxDistinct) {
+      // The whole batch fits even if every selected key is new. Hoist the
+      // overflow checks rather than charging them to each low-cardinality
+      // lookup. Unlike computeValueIds, no temporary ID array is written.
+      const auto* values = decoded_.data<T>();
+      rows.applyToSelected([&](vector_size_t row) { valueId(values[row]); });
+      if (rangeOverflow_) {
+        setRangeOverflow();
+      }
+      return rows.countSelected();
+    }
+  }
+
+  auto analyzeRows = [&]<bool useRuns>() -> uint64_t {
+    uint64_t dictionaryLookups = 0;
+    T previous{};
+    bool hasPrevious = false;
+    auto analyzeValueForJoin = [&](T value) {
+      if constexpr (useRuns) {
+        if (hasPrevious && value == previous) {
+          return;
+        }
+        previous = value;
+        hasPrevious = true;
+      }
+      if constexpr (Kind == TypeKind::TIMESTAMP) {
+        if (value.getNanos() % Timestamp::kNanosecondsInMillisecond != 0) {
+          setRangeOverflow();
+          setDistinctOverflow();
+          return;
+        }
+      }
+      if (!distinctOverflow_) {
+        ++dictionaryLookups;
+        // valueId updates bounds and copies strings only for newly inserted
+        // values. The temporary ID itself is intentionally discarded.
+        if (valueId(value) == kUnmappable) {
+          if (rangeOverflow_) {
+            // Numeric valueId must not revive an overflowed range.
+            setRangeOverflow();
+          }
+          if (numDistinct() > kMaxDistinct) {
+            setDistinctOverflow();
+          }
+        }
+      } else {
+        analyzeValue(value);
+      }
+    };
+    if (decoded_.isConstantMapping()) {
+      if (!decoded_.isNullAt(rows.begin())) {
+        analyzeValueForJoin(decoded_.valueAt<T>(rows.begin()));
+      }
+    } else if (decoded_.isIdentityMapping()) {
+      if constexpr (Kind != TypeKind::BOOLEAN) {
+        const auto* values = decoded_.data<T>();
+        if (decoded_.mayHaveNulls()) {
+          const auto* nulls = decoded_.nulls(&rows);
+          rows.applyToSelected([&](vector_size_t row) {
+            if (!bits::isBitNull(nulls, row)) {
+              analyzeValueForJoin(values[row]);
+            }
+          });
+        } else {
+          rows.applyToSelected(
+              [&](vector_size_t row) { analyzeValueForJoin(values[row]); });
+        }
+      }
+    } else if (rows.countSelected() <= decoded_.base()->size()) {
+      rows.applyToSelected([&](vector_size_t row) {
+        if (!decoded_.isNullAt(row)) {
+          analyzeValueForJoin(decoded_.valueAt<T>(row));
+        }
+      });
+    } else {
+      // Outer nulls must not hide a later valid reference to the same entry.
+      cachedHashes_.resize(decoded_.base()->size());
+      std::fill(cachedHashes_.begin(), cachedHashes_.end(), 0);
+      const auto* indices = decoded_.indices();
+      rows.applyToSelected([&](vector_size_t row) {
+        if (!decoded_.isNullAt(row) && cachedHashes_[indices[row]] == 0) {
+          cachedHashes_[indices[row]] = 1;
+          analyzeValueForJoin(decoded_.valueAt<T>(row));
+        }
+      });
+    }
+    return dictionaryLookups;
+  };
+  return useRuns ? analyzeRows.template operator()<true>()
+                 : analyzeRows.template operator()<false>();
+}
+
+VectorHasher::HashJoinAnalysis VectorHasher::analyzeForHashJoin(
+    const SelectivityVector& rows,
+    uint64_t numInputRows,
+    uint32_t minRows,
+    uint32_t minDistinctPct) {
+  checkTypeSupportsValueIds();
+  VELOX_DCHECK_GE(minRows, 1);
+  VELOX_DCHECK_GE(minDistinctPct, 1);
+  VELOX_DCHECK_LE(minDistinctPct, 100);
+  VELOX_DCHECK(!isRange_);
+  const auto capacity = [&]() {
+    return typeKind_ == TypeKind::HUGEINT ? uniqueHugeintValues_.bucket_count()
+                                          : uniqueValues_.bucket_count();
+  };
+  const auto before = capacity();
+  const auto dictionaryLookups = rows.hasSelections()
+      ? VALUE_ID_TYPE_DISPATCH(analyzeDecodedForHashJoin, typeKind_, rows)
+      : 0;
+  const auto distincts = numDistinct();
+  const bool grew = capacity() > before;
+  const bool abandon = !distinctOverflow_ && numInputRows >= minRows &&
+      distincts * 100 / numInputRows >= minDistinctPct;
+  if (abandon) {
+    setDistinctOverflow();
+  }
+  // Validate bounds even before the final hash-mode decision. This lets a
+  // wide sparse domain stop analysis once neither representation is viable.
+  uint64_t asRange;
+  uint64_t asDistinct;
+  cardinality(0, asRange, asDistinct);
+  return {
+      distincts,
+      grew,
+      abandon,
+      distinctOverflow_ && mayUseValueIds(),
+      dictionaryLookups};
+}
+
 bool VectorHasher::computeValueIdsForRows(
     char** groups,
     int32_t numGroups,

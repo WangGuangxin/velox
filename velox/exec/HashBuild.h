@@ -291,6 +291,12 @@ class HashBuild final : public Operator {
   // Maximum number of distinct values to keep when merging vector hashers
   const size_t vectorHasherMaxNumDistinct_;
 
+  // Only append-only builds can abandon value-ID dictionaries. Deduplicating
+  // and counting builds retain their existing group-probe analysis.
+  const bool adaptiveValueIdsEnabled_;
+  const uint32_t adaptiveValueIdsMinRows_;
+  const uint32_t adaptiveValueIdsMinDistinctPct_;
+
   // Minimum number of rows to see before deciding to give up build no
   // duplicates hash table.
   const int32_t abandonHashBuildDedupMinRows_;
@@ -354,6 +360,9 @@ class HashBuild final : public Operator {
   // True if we are considering use of normalized keys or array hash tables. Set
   // to false when the dataset is no longer suitable.
   bool analyzeKeys_;
+
+  // Reset with each new table, including spill restoration.
+  uint64_t valueIdInputRows_{0};
 
   // Temporary space for hash numbers.
   raw_vector<uint64_t> hashes_;

@@ -53,6 +53,9 @@ const std::vector<config::ConfigProperty>& QueryConfig::registeredProperties() {
     VELOX_REGISTER_QUERY_CONFIG(kHashJoinNumParallelChains);
     VELOX_REGISTER_QUERY_CONFIG(kHashJoinAheadWindow);
     VELOX_REGISTER_QUERY_CONFIG(kHashJoinPrefetchEnabled);
+    VELOX_REGISTER_QUERY_CONFIG(kHashJoinAdaptiveValueIdsEnabled);
+    VELOX_REGISTER_QUERY_CONFIG(kHashJoinAdaptiveValueIdsMinRows);
+    VELOX_REGISTER_QUERY_CONFIG(kHashJoinAdaptiveValueIdsMinDistinctPct);
 
     // Cast.
     VELOX_REGISTER_QUERY_CONFIG(kLegacyCast);
@@ -299,6 +302,9 @@ void QueryConfig::validateConfig() {
   VELOX_USER_CHECK_LE(hashJoinNumParallelChains(), 32);
   VELOX_USER_CHECK_GE(hashJoinAheadWindow(), 1);
   VELOX_USER_CHECK_LE(hashJoinAheadWindow(), 32);
+  VELOX_USER_CHECK_GE(hashJoinAdaptiveValueIdsMinRows(), 1);
+  VELOX_USER_CHECK_GE(hashJoinAdaptiveValueIdsMinDistinctPct(), 1);
+  VELOX_USER_CHECK_LE(hashJoinAdaptiveValueIdsMinDistinctPct(), 100);
   // Validate if timezone name can be recognized.
   if (auto tz = config_->get<std::string>(QueryConfig::kSessionTimezone)) {
     VELOX_USER_CHECK(

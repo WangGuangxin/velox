@@ -141,6 +141,7 @@ set(
   HashTableSerializationTest.cpp
   SortBufferTest.cpp
   VectorHasherTest.cpp
+  VectorHasherAdaptiveTest.cpp
   # group7 (~449s): IndexLookupJoinTestExtra 188
   # + MergeJoin 111 + ScaleWriter 96 + Exchange 54
   IndexLookupJoinTestExtra.cpp
