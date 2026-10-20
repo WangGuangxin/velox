@@ -103,9 +103,27 @@ void VectorHasher::hashValues(
     rows.applyToSelected([&](vector_size_t row) {
       result[row] = mix ? bits::hashMix(result[row], hash) : hash;
     });
+  } else if (groupingSetHashCacheActive_) {
+    rows.applyToSelected([&](vector_size_t row) {
+      uint64_t hash;
+      if (groupingSetHashValid_[row]) {
+        hash = groupingSetHashes_[row];
+        ++batchReuseStats_.encodedHashReusedRows;
+      } else {
+        hash = decoded_.isNullAt(row)
+            ? kNullHash
+            : hashOne<typeProvidesCustomComparison, Kind>(decoded_, row);
+        groupingSetHashes_[row] = hash;
+        groupingSetHashValid_[row] = 1;
+        ++batchReuseStats_.encodedHashComputations;
+      }
+      ++batchReuseStats_.encodedHashRows;
+      result[row] = mix ? bits::hashMix(result[row], hash) : hash;
+    });
   } else if (
       !decoded_.isIdentityMapping() &&
-      rows.countSelected() > decoded_.base()->size()) {
+      (rows.countSelected() > decoded_.base()->size() ||
+       (batchReuseEnabled_ && hasRepeatedBaseIndices(rows)))) {
     cachedHashes_.resize(decoded_.base()->size());
     std::fill(cachedHashes_.begin(), cachedHashes_.end(), kNullHash);
     rows.applyToSelected([&](vector_size_t row) {
@@ -118,6 +136,14 @@ void VectorHasher::hashValues(
       if (hash == kNullHash) {
         hash = hashOne<typeProvidesCustomComparison, Kind>(decoded_, row);
         cachedHashes_[baseIndex] = hash;
+        if (batchReuseEnabled_) {
+          ++batchReuseStats_.encodedHashComputations;
+        }
+      } else if (batchReuseEnabled_) {
+        ++batchReuseStats_.encodedHashReusedRows;
+      }
+      if (batchReuseEnabled_) {
+        ++batchReuseStats_.encodedHashRows;
       }
       result[row] = mix ? bits::hashMix(result[row], hash) : hash;
     });
@@ -364,7 +390,162 @@ bool VectorHasher::computeValueIds(
     raw_vector<uint64_t>& result) {
   checkTypeSupportsValueIds();
 
+  if (batchReuseEnabled_ && rows.hasSelections()) {
+    batchReuseStats_.valueIdRows += rows.countSelected();
+    return VALUE_ID_TYPE_DISPATCH(
+        makeValueIdsWithReuse, typeKind_, rows, result.data());
+  }
+
   return VALUE_ID_TYPE_DISPATCH(makeValueIds, typeKind_, rows, result.data());
+}
+
+void VectorHasher::setGroupingSetHashInput(
+    uint64_t epoch,
+    const VectorPtr& values,
+    memory::MemoryPool* pool) {
+  groupingSetHashCacheActive_ = false;
+  if (groupingSetHashEpoch_ != epoch) {
+    groupingSetHashEpoch_ = epoch;
+    groupingSetHashInput_.reset();
+    groupingSetHashValid_.resize(0);
+  }
+  if (values->isConstantEncoding()) {
+    return;
+  }
+  if (!groupingSetHashPool_) {
+    groupingSetHashPool_ = pool ? pool : values->pool();
+    groupingSetHashes_ = raw_vector<uint64_t>(groupingSetHashPool_);
+    groupingSetHashValid_ = raw_vector<uint8_t>(groupingSetHashPool_);
+  }
+  if (groupingSetHashInput_.get() != values.get() ||
+      groupingSetHashes_.size() != values->size()) {
+    groupingSetHashInput_ = values;
+    groupingSetHashes_.resize(values->size());
+    groupingSetHashValid_.resize(values->size());
+    std::fill(groupingSetHashValid_.begin(), groupingSetHashValid_.end(), 0);
+  }
+  groupingSetHashCacheActive_ = true;
+}
+
+bool VectorHasher::hasRepeatedBaseIndices(const SelectivityVector& rows) const {
+  int samples = 0;
+  int repeats = 0;
+  vector_size_t previous = -1;
+  rows.testSelected([&](vector_size_t row) {
+    if (!decoded_.isNullAt(row)) {
+      const auto index = decoded_.index(row);
+      repeats += index == previous;
+      previous = index;
+    }
+    return ++samples < 32 && repeats < 2;
+  });
+  return repeats >= 2;
+}
+
+template <TypeKind Kind>
+bool VectorHasher::makeValueIdsWithReuse(
+    const SelectivityVector& rows,
+    uint64_t* result) {
+  using T = typename TypeTraits<Kind>::NativeType;
+  auto legacy = [&]() {
+    batchReuseStats_.valueIdLegacyRows += rows.countSelected();
+    return makeValueIds<Kind>(rows, result);
+  };
+  if constexpr (Kind == TypeKind::BOOLEAN) {
+    return legacy();
+  }
+  if (decoded_.isConstantMapping() || isRange_ || rows.countSelected() < 32) {
+    return legacy();
+  }
+  if (!decoded_.isIdentityMapping()) {
+    if (!hasRepeatedBaseIndices(rows)) {
+      return legacy();
+    }
+    cachedHashes_.resize(decoded_.base()->size());
+    std::fill(cachedHashes_.begin(), cachedHashes_.end(), 0);
+    bool success = true;
+    rows.applyToSelected([&](vector_size_t row) {
+      if (decoded_.isNullAt(row)) {
+        if (multiplier_ == 1) {
+          result[row] = 0;
+        }
+        return;
+      }
+      auto& id = cachedHashes_[decoded_.index(row)];
+      if (!success) {
+        if (id == 0) {
+          id = kUnmappable;
+          analyzeValue(decoded_.valueAt<T>(row));
+        }
+        return;
+      }
+      if (id == 0) {
+        const auto value = decoded_.valueAt<T>(row);
+        id = valueId(value);
+        if (id == kUnmappable) {
+          analyzeValue(value);
+          success = false;
+          return;
+        }
+      } else {
+        ++batchReuseStats_.valueIdReusedRows;
+      }
+      result[row] = multiplier_ == 1 ? id : result[row] + multiplier_ * id;
+    });
+    return success;
+  }
+
+  // Only select the run loop when local repetition amortizes its comparison.
+  T previous{};
+  bool havePrevious = false;
+  int samples = 0;
+  int repeats = 0;
+  rows.testSelected([&](vector_size_t row) {
+    if (!decoded_.isNullAt(row)) {
+      auto value = decoded_.valueAt<T>(row);
+      repeats += havePrevious && value == previous;
+      previous = value;
+      havePrevious = true;
+    }
+    return ++samples < 32 && repeats < 2;
+  });
+  if (repeats < 2) {
+    return legacy();
+  }
+  havePrevious = false;
+  uint64_t previousId = 0;
+  bool success = true;
+  rows.applyToSelected([&](vector_size_t row) {
+    if (decoded_.isNullAt(row)) {
+      if (multiplier_ == 1) {
+        result[row] = 0;
+      }
+      return;
+    }
+    const auto value = decoded_.valueAt<T>(row);
+    if (havePrevious && value == previous) {
+      if (success) {
+        ++batchReuseStats_.valueIdReusedRows;
+      }
+    } else {
+      previous = value;
+      havePrevious = true;
+      if (success) {
+        previousId = valueId(value);
+        if (previousId == kUnmappable) {
+          success = false;
+          analyzeValue(value);
+        }
+      } else {
+        analyzeValue(value);
+      }
+    }
+    if (success) {
+      result[row] = multiplier_ == 1 ? previousId
+                                     : result[row] + multiplier_ * previousId;
+    }
+  });
+  return success;
 }
 
 template <TypeKind Kind>

@@ -31,6 +31,11 @@ class Expand : public Operator {
 
   void addInput(RowVectorPtr input) override;
 
+  // Changes for every incoming batch, even if upstream reuses a vector object.
+  uint64_t inputEpoch() const {
+    return inputEpoch_;
+  }
+
   RowVectorPtr getOutput() override;
 
   BlockingReason isBlocked(ContinueFuture* /*future*/) override {
@@ -53,5 +58,6 @@ class Expand : public Operator {
 
   // Used to indicate the index of fieldProjections_.
   int32_t rowIndex_{0};
+  uint64_t inputEpoch_{0};
 };
 } // namespace facebook::velox::exec

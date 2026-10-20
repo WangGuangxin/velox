@@ -188,6 +188,10 @@ class GroupingSet {
     return table_.get();
   }
 
+  void setGroupingSetHashEpoch(uint64_t epoch) {
+    groupingSetHashEpoch_ = epoch;
+  }
+
   /// Frees hash tables and other state when giving up partial aggregation as
   /// non-productive. Must be called before toIntermediate() is used.
   void abandonPartialAggregation();
@@ -211,6 +215,7 @@ class GroupingSet {
   std::optional<int64_t> estimateOutputRowSize() const;
 
  private:
+  std::optional<uint64_t> groupingSetHashEpoch_;
   bool isDistinct() const {
     return aggregates_.empty();
   }

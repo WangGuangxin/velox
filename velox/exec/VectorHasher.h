@@ -21,6 +21,7 @@
 #include <string_view>
 
 #include <type_traits>
+#include <utility>
 
 #include <velox/type/Filter.h>
 #include "velox/common/memory/RawVector.h"
@@ -208,6 +209,9 @@ class VectorHasher {
         type_->toString(),
         vector.type()->toString());
     decoded_.decode(vector, rows);
+    if (groupingSetHashCacheActive_ && groupingSetHashInput_.get() != &vector) {
+      groupingSetHashCacheActive_ = false;
+    }
   }
 
   DecodedVector& decodedVector() {
@@ -243,6 +247,36 @@ class VectorHasher {
   bool computeValueIds(
       const SelectivityVector& rows,
       raw_vector<uint64_t>& result);
+
+  // Query-local, per-hasher reuse. Unlike analysis-only join adaptation,
+  // this produces every selected row's ID and is safe for group probing.
+  void setBatchReuseEnabled(bool enabled) {
+    batchReuseEnabled_ = enabled;
+  }
+
+  struct BatchReuseStats {
+    uint64_t valueIdRows{0};
+    uint64_t valueIdReusedRows{0};
+    uint64_t valueIdLegacyRows{0};
+    uint64_t encodedHashRows{0};
+    uint64_t encodedHashComputations{0};
+    uint64_t encodedHashReusedRows{0};
+  };
+
+  BatchReuseStats takeBatchReuseStats() {
+    return std::exchange(batchReuseStats_, BatchReuseStats{});
+  }
+
+  // The epoch identifies one Expand input batch, not an arbitrary pointer's
+  // lifetime. Null constant projections do not evict cached source hashes.
+  void setGroupingSetHashInput(
+      uint64_t epoch,
+      const VectorPtr& values,
+      memory::MemoryPool* pool = nullptr);
+
+  void finishGroupingSetHashInput() {
+    groupingSetHashCacheActive_ = false;
+  }
 
   struct HashJoinAnalysis {
     static constexpr uint64_t kUnknownLookupCount = ~0ULL;
@@ -547,6 +581,11 @@ class VectorHasher {
   template <TypeKind Kind>
   uint64_t analyzeDecodedForHashJoin(const SelectivityVector& rows);
 
+  bool hasRepeatedBaseIndices(const SelectivityVector& rows) const;
+
+  template <TypeKind Kind>
+  bool makeValueIdsWithReuse(const SelectivityVector& rows, uint64_t* result);
+
   template <typename T>
   void analyzeValue(T value) {
     auto normalized = toInt64(value);
@@ -742,6 +781,16 @@ class VectorHasher {
   uint64_t distinctStringsBytes_ = 0;
 
   common::FilterPtr bloomFilter_;
+
+  // Keep optional experiment state after the existing hot hash-table fields.
+  bool batchReuseEnabled_{false};
+  BatchReuseStats batchReuseStats_;
+  std::optional<uint64_t> groupingSetHashEpoch_;
+  VectorPtr groupingSetHashInput_;
+  memory::MemoryPool* groupingSetHashPool_{nullptr};
+  raw_vector<uint64_t> groupingSetHashes_;
+  raw_vector<uint8_t> groupingSetHashValid_;
+  bool groupingSetHashCacheActive_{false};
 };
 
 template <>

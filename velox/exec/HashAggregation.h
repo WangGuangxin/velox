@@ -23,6 +23,8 @@
 
 namespace facebook::velox::exec {
 
+class Expand;
+
 class HashAggregation : public Operator {
  public:
   /// Runtime stat keys for hash aggregation.
@@ -159,6 +161,7 @@ class HashAggregation : public Operator {
   // concurrently with that driver.
   std::mutex mutex_;
   std::unique_ptr<GroupingSet> groupingSet_;
+  Expand* groupingSetSource_{nullptr};
 
   // Cached from groupingSet_->hasCompactableAggregates() during initialize().
   // Stored separately to allow safe access from the arbitration thread without

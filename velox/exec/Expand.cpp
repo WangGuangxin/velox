@@ -91,6 +91,7 @@ void Expand::addInput(RowVectorPtr input) {
     child->loadedVector();
   }
 
+  ++inputEpoch_;
   input_ = std::move(input);
 }
 

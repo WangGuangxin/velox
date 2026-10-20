@@ -73,6 +73,8 @@ HashBuild::HashBuild(
       adaptiveValueIdsEnabled_(
           driverCtx->queryConfig().hashJoinAdaptiveValueIdsEnabled() &&
           !dropDuplicates_ && !joinNode_->isCountingJoin()),
+      batchValueIdsEnabled_(
+          driverCtx->queryConfig().hashJoinBatchValueIdsEnabled()),
       adaptiveValueIdsMinRows_(
           driverCtx->queryConfig().hashJoinAdaptiveValueIdsMinRows()),
       adaptiveValueIdsMinDistinctPct_(
@@ -253,6 +255,7 @@ void HashBuild::setupTable() {
   for (vector_size_t i = 0; i < numKeys; ++i) {
     keyHashers.emplace_back(
         VectorHasher::create(tableType_->childAt(i), keyChannels_[i]));
+    keyHashers.back()->setBatchReuseEnabled(batchValueIdsEnabled_);
   }
 
   const auto numDependents = tableType_->size() - numKeys;
@@ -533,6 +536,23 @@ void HashBuild::addInput(RowVectorPtr input) {
           input,
           activeRows_,
           BaseHashTable::kNoSpillInputStartPartitionBit);
+      if (batchValueIdsEnabled_) {
+        auto stats = stats_.wlock();
+        stats->addRuntimeStat(
+            "hashBuildDedupInputRows",
+            RuntimeCounter(activeRows_.countSelected()));
+        for (auto& hasher : table_->hashers()) {
+          const auto reuse = hasher->takeBatchReuseStats();
+          stats->addRuntimeStat(
+              "hashBuildValueIdRows", RuntimeCounter(reuse.valueIdRows));
+          stats->addRuntimeStat(
+              "hashBuildValueIdReusedRows",
+              RuntimeCounter(reuse.valueIdReusedRows));
+          stats->addRuntimeStat(
+              "hashBuildValueIdLegacyRows",
+              RuntimeCounter(reuse.valueIdLegacyRows));
+        }
+      }
       if (lookup_->rows.empty()) {
         return;
       }
@@ -557,6 +577,12 @@ void HashBuild::addInput(RowVectorPtr input) {
     abandonHashBuildDedup();
   }
 
+  if (batchValueIdsEnabled_) {
+    auto stats = stats_.wlock();
+    stats->addRuntimeStat(
+        "hashBuildAppendInputRows",
+        RuntimeCounter(activeRows_.countSelected()));
+  }
   if (analyzeKeys_ && !adaptiveValueIdsEnabled_ &&
       hashes_.size() < activeRows_.end()) {
     hashes_.resize(activeRows_.end());
@@ -611,6 +637,18 @@ void HashBuild::addInput(RowVectorPtr input) {
         }
       } else {
         hasher->computeValueIds(activeRows_, hashes_);
+        if (batchValueIdsEnabled_) {
+          const auto reuse = hasher->takeBatchReuseStats();
+          auto stats = stats_.wlock();
+          stats->addRuntimeStat(
+              "hashBuildValueIdRows", RuntimeCounter(reuse.valueIdRows));
+          stats->addRuntimeStat(
+              "hashBuildValueIdReusedRows",
+              RuntimeCounter(reuse.valueIdReusedRows));
+          stats->addRuntimeStat(
+              "hashBuildValueIdLegacyRows",
+              RuntimeCounter(reuse.valueIdLegacyRows));
+        }
       }
       analyzeKeys_ = hasher->mayUseValueIds();
     }

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/exec/HashAggregation.h"
+#include "velox/exec/Expand.h"
 
 #include <algorithm>
 #include <optional>
@@ -76,6 +77,38 @@ void HashAggregation::initialize() {
       groupingKeyInputChannels, groupingKeyOutputChannels);
 
   auto hashers = createVectorHashers(inputType, groupingKeyInputChannels);
+  if (operatorCtx_->driverCtx()->queryConfig().groupingSetsBatchingEnabled() &&
+      aggregationNode_->preGroupedKeys().empty()) {
+    auto source = aggregationNode_->sources()[0];
+    auto channels = groupingKeyInputChannels;
+    bool passthroughKeys = true;
+    while (const auto* project =
+               dynamic_cast<const core::ProjectNode*>(source.get())) {
+      for (auto& channel : channels) {
+        const auto* field = dynamic_cast<const core::FieldAccessTypedExpr*>(
+            project->projections()[channel].get());
+        if (!field || !field->isInputColumn()) {
+          passthroughKeys = false;
+          break;
+        }
+        channel =
+            project->sources()[0]->outputType()->getChildIdx(field->name());
+      }
+      if (!passthroughKeys) {
+        break;
+      }
+      source = project->sources()[0];
+    }
+    if (passthroughKeys &&
+        dynamic_cast<const core::ExpandNode*>(source.get())) {
+      for (auto* op : operatorCtx_->driver()->operators()) {
+        if (op->planNodeId() == source->id()) {
+          groupingSetSource_ = dynamic_cast<Expand*>(op);
+          break;
+        }
+      }
+    }
+  }
   const auto numHashers = hashers.size();
 
   std::vector<column_index_t> preGroupedChannels;
@@ -211,6 +244,9 @@ void HashAggregation::addInput(RowVectorPtr input) {
     numInputRows_ += input->size();
     return;
   }
+  if (groupingSetSource_) {
+    groupingSet_->setGroupingSetHashEpoch(groupingSetSource_->inputEpoch());
+  }
   groupingSet_->addInput(input, mayPushdown_);
   numInputRows_ += input->size();
 
@@ -221,10 +257,21 @@ void HashAggregation::addInput(RowVectorPtr input) {
   // partial aggregator. Hence, we have to use more memory anyway.
   const bool abandonPartialEarly = isPartialOutput_ && !isGlobal_ &&
       abandonPartialAggregationEarly(groupingSet_->numDistinct());
+  const bool partialMemoryFull = !abandonPartialEarly && isPartialOutput_ &&
+      !isGlobal_ &&
+      groupingSet_->isPartialFull(maxPartialAggregationMemoryUsage_);
   if (isPartialOutput_ && !isGlobal_ &&
-      (abandonPartialEarly ||
-       groupingSet_->isPartialFull(maxPartialAggregationMemoryUsage_))) {
+      (abandonPartialEarly || partialMemoryFull)) {
     partialFull_ = true;
+    if (operatorCtx_->driverCtx()
+            ->queryConfig()
+            .groupingSetsBatchingEnabled()) {
+      auto stats = stats_.wlock();
+      stats->addRuntimeStat(
+          "partialFullLowReduction", RuntimeCounter(abandonPartialEarly));
+      stats->addRuntimeStat(
+          "partialFullMemory", RuntimeCounter(partialMemoryFull));
+    }
   }
 
   if (isDistinct_) {
@@ -273,6 +320,21 @@ void HashAggregation::updateRuntimeStats() {
   auto& runtimeStats = lockedStats->runtimeStats;
 
   for (auto i = 0; i < hashers.size(); i++) {
+    if (operatorCtx_->driverCtx()
+            ->queryConfig()
+            .groupingSetsBatchingEnabled()) {
+      const auto reuse = hashers[i]->takeBatchReuseStats();
+      if (reuse.encodedHashRows) {
+        lockedStats->addRuntimeStat(
+            "aggregationKeyHashRows", RuntimeCounter(reuse.encodedHashRows));
+        lockedStats->addRuntimeStat(
+            "aggregationKeyHashComputations",
+            RuntimeCounter(reuse.encodedHashComputations));
+        lockedStats->addRuntimeStat(
+            "aggregationKeyHashReusedRows",
+            RuntimeCounter(reuse.encodedHashReusedRows));
+      }
+    }
     hashers[i]->cardinality(0, asRange, asDistinct);
     if (asRange != VectorHasher::kRangeTooLarge) {
       runtimeStats[fmt::format("rangeKey{}", i)] = RuntimeMetric(asRange);

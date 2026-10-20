@@ -133,6 +133,22 @@ class QueryConfig {
       80,
       "Minimum distinct/build-row percentage for abandonment, between 1 and 100.")
 
+  VELOX_QUERY_CONFIG(
+      kHashJoinBatchValueIdsEnabled,
+      hashJoinBatchValueIdsEnabled,
+      "hash_join_batch_value_ids_enabled",
+      bool,
+      false,
+      "Reuse repeated key value IDs during hash build, including deduplicating builds.")
+
+  VELOX_QUERY_CONFIG(
+      kGroupingSetsBatchingEnabled,
+      groupingSetsBatchingEnabled,
+      "grouping_sets_batching_enabled",
+      bool,
+      false,
+      "Reuse raw column hashes across projections of the same Expand input batch.")
+
   /// Maximum memory that a query can use on a single host.
   VELOX_QUERY_CONFIG_PROPERTY(
       kQueryMaxMemoryPerNode,

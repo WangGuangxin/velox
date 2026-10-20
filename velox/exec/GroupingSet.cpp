@@ -300,11 +300,26 @@ void GroupingSet::addInputForActiveRows(
   TestValue::adjust(
       "facebook::velox::exec::GroupingSet::addInputForActiveRows", this);
 
+  const bool reuseHashes = groupingSetHashEpoch_.has_value();
+  if (reuseHashes) {
+    const auto epoch = *groupingSetHashEpoch_;
+    groupingSetHashEpoch_.reset();
+    for (auto& hasher : table_->hashers()) {
+      hasher->setGroupingSetHashInput(
+          epoch, input->childAt(hasher->channel()), pool_);
+    }
+  }
+
   table_->prepareForGroupProbe(
       *lookup_,
       input,
       activeRows_,
       BaseHashTable::kNoSpillInputStartPartitionBit);
+  if (reuseHashes) {
+    for (auto& hasher : table_->hashers()) {
+      hasher->finishGroupingSetHashInput();
+    }
+  }
   if (lookup_->rows.empty()) {
     // No rows to probe. Can happen when ignoreNullKeys_ is true and all rows
     // have null keys.
@@ -1740,9 +1755,8 @@ void GroupingSet::toIntermediate(
         &aggregateVector);
   }
   if (intermediateRows_) {
-    intermediateRows_->eraseRows(
-        folly::Range<char**>(
-            intermediateGroups_.data(), intermediateGroups_.size()));
+    intermediateRows_->eraseRows(folly::Range<char**>(
+        intermediateGroups_.data(), intermediateGroups_.size()));
   }
 
   // It's unnecessary to call function->clear() to reset the internal states of
