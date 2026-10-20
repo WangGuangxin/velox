@@ -23,7 +23,10 @@
 #include "velox/vector/FlatVector.h"
 #include "velox/vector/VectorTypeUtils.h"
 
+#include <folly/portability/GFlags.h>
 #include <string_view>
+
+DECLARE_bool(velox_row_container_batch_string_extraction_enabled);
 
 namespace facebook::velox::exec {
 namespace test {
@@ -1203,6 +1206,21 @@ class RowContainer {
       uint8_t nullMask,
       int32_t resultOffset,
       FlatVector<T>* result) {
+    if constexpr (std::is_same_v<T, StringView>) {
+      if (FLAGS_velox_row_container_batch_string_extraction_enabled &&
+          numRows >= 32) {
+        extractStringsBatch(
+            rows,
+            rowNumbers,
+            numRows,
+            offset,
+            nullByte,
+            nullMask,
+            resultOffset,
+            result);
+        return;
+      }
+    }
     auto maxRows = numRows + resultOffset;
     VELOX_DCHECK_LE(maxRows, result->size());
 
@@ -1240,6 +1258,14 @@ class RowContainer {
       int32_t offset,
       int32_t resultOffset,
       FlatVector<T>* result) {
+    if constexpr (std::is_same_v<T, StringView>) {
+      if (FLAGS_velox_row_container_batch_string_extraction_enabled &&
+          numRows >= 32) {
+        extractStringsBatch(
+            rows, rowNumbers, numRows, offset, 0, 0, resultOffset, result);
+        return;
+      }
+    }
     [[maybe_unused]] auto maxRows = numRows + resultOffset;
     VELOX_DCHECK_LE(maxRows, result->size());
     BufferPtr valuesBuffer = result->mutableValues();
@@ -1265,6 +1291,18 @@ class RowContainer {
       }
     }
   }
+
+  // Reserve output-owned string storage once per bounded block. No source
+  // string memory is borrowed by the result.
+  static void extractStringsBatch(
+      const char* const* rows,
+      folly::Range<const vector_size_t*> rowNumbers,
+      int32_t numRows,
+      int32_t offset,
+      int32_t nullByte,
+      uint8_t nullMask,
+      int32_t resultOffset,
+      FlatVector<StringView>* result);
 
   static HashStringAllocator::InputStream prepareRead(
       const char* row,

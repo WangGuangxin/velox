@@ -122,6 +122,7 @@ set(
   StreamingAggregationTest.cpp
   ContainerRowSerdeTest.cpp
   RowContainerTest.cpp
+  RowContainerBatchStringTest.cpp
   TopNTest.cpp
   WriterFuzzerUtilTest.cpp
   PlanNodeStatsTest.cpp

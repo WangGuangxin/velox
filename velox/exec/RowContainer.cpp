@@ -16,6 +16,9 @@
 
 #include "velox/exec/RowContainer.h"
 
+#include <array>
+#include <cstring>
+
 #include "velox/common/memory/RawVector.h"
 #include "velox/exec/Aggregate.h"
 #include "velox/exec/ContainerRowSerde.h"
@@ -798,6 +801,79 @@ void RowContainer::storeSerializedRow(std::string_view serialized, char* row) {
       offset,
       serialized.size(),
       "Serialized row size mismatch while storing RowContainer row");
+}
+
+void RowContainer::extractStringsBatch(
+    const char* const* rows,
+    folly::Range<const vector_size_t*> rowNumbers,
+    int32_t numRows,
+    int32_t offset,
+    int32_t nullByte,
+    uint8_t nullMask,
+    int32_t resultOffset,
+    FlatVector<StringView>* result) {
+  constexpr int32_t kBlockRows = 128;
+  constexpr size_t kBlockBytes = 64 * 1024;
+  std::array<StringView, kBlockRows> strings;
+  std::array<vector_size_t, kBlockRows> outputRows;
+  const auto maxRows = resultOffset + numRows;
+  VELOX_DCHECK_LE(maxRows, result->size());
+  auto* values = result->mutableRawValues();
+  uint64_t* nulls = nullptr;
+  if (nullMask != 0 || result->nulls()) {
+    nulls = result->mutableNulls(maxRows, true)->asMutable<uint64_t>();
+  }
+  const bool useRowNumbers = !rowNumbers.empty();
+  for (int32_t begin = 0; begin < numRows;) {
+    int32_t count = 0;
+    int32_t numStrings = 0;
+    size_t bytes = 0;
+    do {
+      const auto input = begin + count;
+      const auto number = useRowNumbers ? rowNumbers[input] : input;
+      const auto* row = number >= 0 ? rows[number] : nullptr;
+      const auto output = resultOffset + input;
+      if (row != nullptr &&
+          (nullMask == 0 || !isNullAt(row, nullByte, nullMask))) {
+        if (nulls != nullptr) {
+          bits::setNull(nulls, output, false);
+        }
+        const auto value = valueAt<StringView>(row, offset);
+        if (value.isInline()) {
+          values[output] = value;
+        } else {
+          strings[numStrings] = value;
+          outputRows[numStrings++] = output;
+          bytes += value.size();
+        }
+      } else {
+        if (nulls == nullptr) {
+          nulls = result->mutableNulls(maxRows, true)->asMutable<uint64_t>();
+        }
+        bits::setNull(nulls, output, true);
+      }
+      ++count;
+    } while (count < kBlockRows && begin + count < numRows &&
+             bytes < kBlockBytes);
+
+    // Reserve only non-inline payload bytes. An individual large value may
+    // exceed the block byte target. Inline values need no second pass.
+    auto* cursor =
+        bytes == 0 ? nullptr : result->getRawStringBufferWithSpace(bytes);
+    for (int32_t i = 0; i < numStrings; ++i) {
+      const auto value = strings[i];
+      auto* header = HashStringAllocator::headerOf(value.data());
+      if (header->size() >= value.size()) {
+        std::memcpy(cursor, value.data(), value.size());
+      } else {
+        HashStringAllocator::InputStream stream(header);
+        stream.ByteInputStream::readBytes(cursor, value.size());
+      }
+      values[outputRows[i]] = StringView(cursor, value.size());
+      cursor += value.size();
+    }
+    begin += count;
+  }
 }
 
 void RowContainer::extractString(
