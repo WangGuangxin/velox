@@ -64,9 +64,7 @@ namespace facebook::velox::core {
 #define VELOX_QUERY_CONFIG(                                                 \
     constName, accessorName, keyStr, CppType, defaultVal, desc)             \
   VELOX_QUERY_CONFIG_PROPERTY(constName, keyStr, CppType, defaultVal, desc) \
-  CppType accessorName() const {                                            \
-    return get<CppType>(constName, defaultVal);                             \
-  }
+  CppType accessorName() const { return get<CppType>(constName, defaultVal); }
 
 /// A simple wrapper around velox::IConfig. Defines constants for query
 /// config properties and accessor methods.
@@ -86,6 +84,30 @@ class QueryConfig {
 
   /// Returns all registered query config properties.
   static const std::vector<config::ConfigProperty>& registeredProperties();
+
+  VELOX_QUERY_CONFIG(
+      kHashJoinNumParallelChains,
+      hashJoinNumParallelChains,
+      "hash_join_num_parallel_chains",
+      int32_t,
+      8,
+      "Number of interleaved duplicate-key join chains, between 1 and 32.")
+
+  VELOX_QUERY_CONFIG(
+      kHashJoinAheadWindow,
+      hashJoinAheadWindow,
+      "hash_join_ahead_window",
+      int32_t,
+      8,
+      "Maximum buffered results per interleaved join chain, between 1 and 32.")
+
+  VELOX_QUERY_CONFIG(
+      kHashJoinPrefetchEnabled,
+      hashJoinPrefetchEnabled,
+      "hash_join_prefetch_enabled",
+      bool,
+      true,
+      "Prefetch row data and next pointers during duplicate-key enumeration.")
 
   /// Maximum memory that a query can use on a single host.
   VELOX_QUERY_CONFIG_PROPERTY(

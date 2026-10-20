@@ -404,7 +404,10 @@ void HashProbe::initializeResultIter() {
   resultIter_ = std::make_unique<BaseHashTable::JoinResultIterator>(
       std::move(varSizeListColumns),
       fixedSizeListColumnsSizeSum,
-      rowSizeEstimation);
+      rowSizeEstimation,
+      operatorCtx_->driverCtx()->queryConfig().hashJoinNumParallelChains(),
+      operatorCtx_->driverCtx()->queryConfig().hashJoinAheadWindow(),
+      operatorCtx_->driverCtx()->queryConfig().hashJoinPrefetchEnabled());
 }
 
 void HashProbe::pushdownDynamicFilters() {
