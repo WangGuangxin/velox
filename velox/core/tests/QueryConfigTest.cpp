@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <gtest/gtest.h>
+#include <algorithm>
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/core/QueryCtx.h"
@@ -27,6 +28,45 @@ class QueryConfigTest : public testing::Test {
     memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
   }
 };
+
+TEST_F(QueryConfigTest, joinEnumerationTuning) {
+  const QueryConfig defaults{{}};
+  EXPECT_EQ(defaults.hashJoinNumParallelChains(), 8);
+  EXPECT_EQ(defaults.hashJoinAheadWindow(), 8);
+  EXPECT_TRUE(defaults.hashJoinPrefetchEnabled());
+  const QueryConfig configured({
+      {QueryConfig::kHashJoinNumParallelChains, "32"},
+      {QueryConfig::kHashJoinAheadWindow, "1"},
+      {QueryConfig::kHashJoinPrefetchEnabled, "false"},
+  });
+  EXPECT_EQ(configured.hashJoinNumParallelChains(), 32);
+  EXPECT_EQ(configured.hashJoinAheadWindow(), 1);
+  EXPECT_FALSE(configured.hashJoinPrefetchEnabled());
+  const auto& properties = QueryConfig::registeredProperties();
+  for (const auto* key :
+       {QueryConfig::kHashJoinNumParallelChains,
+        QueryConfig::kHashJoinAheadWindow,
+        QueryConfig::kHashJoinPrefetchEnabled}) {
+    const auto property = std::find_if(
+        properties.begin(), properties.end(), [&](const auto& property) {
+          return property.name == key;
+        });
+    ASSERT_NE(property, properties.end());
+    const bool isPrefetch = key == QueryConfig::kHashJoinPrefetchEnabled;
+    EXPECT_EQ(
+        property->type,
+        isPrefetch ? config::ConfigPropertyType::kBoolean
+                   : config::ConfigPropertyType::kInteger);
+    EXPECT_EQ(property->defaultValue, isPrefetch ? "true" : "8");
+  }
+  for (const auto* key :
+       {QueryConfig::kHashJoinNumParallelChains,
+        QueryConfig::kHashJoinAheadWindow}) {
+    for (const auto* value : {"0", "-1", "33"}) {
+      EXPECT_THROW((QueryConfig{{{key, value}}}), VeloxUserError);
+    }
+  }
+}
 
 TEST_F(QueryConfigTest, emptyConfig) {
   auto queryCtx = QueryCtx::create(nullptr, QueryConfig{{}});
@@ -183,10 +223,11 @@ TEST_F(QueryConfigTest, expressionEvaluationRelatedConfigs) {
             !queryConfig.debugDisableExpressionsWithLazyInputs());
       };
 
-  auto createConfig = [&](bool debugDisableExpressionsWithPeeling,
-                          bool debugDisableCommonSubExpressions,
-                          bool debugDisableExpressionsWithMemoization,
-                          bool debugDisableExpressionsWithLazyInputs) -> auto {
+  auto createConfig = [&](
+      bool debugDisableExpressionsWithPeeling,
+      bool debugDisableCommonSubExpressions,
+      bool debugDisableExpressionsWithMemoization,
+      bool debugDisableExpressionsWithLazyInputs) -> auto{
     std::unordered_map<std::string, std::string> configData(
         {{core::QueryConfig::kDebugDisableExpressionWithPeeling,
           std::to_string(debugDisableExpressionsWithPeeling)},

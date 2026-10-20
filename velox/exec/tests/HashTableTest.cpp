@@ -132,9 +132,8 @@ class HashTableTest : public testing::TestWithParam<bool>,
       std::vector<RowVectorPtr> batches;
       std::vector<std::unique_ptr<VectorHasher>> keyHashers;
       for (auto channel = 0; channel < numKeys; ++channel) {
-        keyHashers.emplace_back(
-            std::make_unique<VectorHasher>(
-                buildType->childAt(channel), channel));
+        keyHashers.emplace_back(std::make_unique<VectorHasher>(
+            buildType->childAt(channel), channel));
       }
       auto table = HashTable<true>::createForJoin(
           std::move(keyHashers),
@@ -440,9 +439,8 @@ class HashTableTest : public testing::TestWithParam<bool>,
       TypePtr buildType,
       std::vector<RowVectorPtr>& batches) {
     for (auto i = 0; i < numBatches; ++i) {
-      batches.push_back(
-          std::static_pointer_cast<RowVector>(
-              makeVector(buildType, batchSize, sequence)));
+      batches.push_back(std::static_pointer_cast<RowVector>(
+          makeVector(buildType, batchSize, sequence)));
       sequence += batchSize;
     }
   }
@@ -843,39 +841,49 @@ TEST_P(HashTableTest, groupProbeDuplicateNewKeys) {
   // Each batch repeats every new key within one probe window, so later rows
   // must find the groups that earlier rows of the same window inserted.
   constexpr int32_t kNumBatches = 100;
-  constexpr int32_t kBatchSize = 1'000;
   constexpr int32_t kNumNewKeysPerBatch = 20;
-  for (const auto mode :
-       {BaseHashTable::HashMode::kNormalizedKey,
-        BaseHashTable::HashMode::kHash}) {
-    SCOPED_TRACE(BaseHashTable::modeString(mode));
-    auto table =
-        createHashTableForAggregation(ROW({"a", "b"}, {BIGINT(), BIGINT()}), 2);
-    if (mode == BaseHashTable::HashMode::kHash) {
-      table->forceGenericHashMode(
-          BaseHashTable::kNoSpillInputStartPartitionBit);
-    }
-    auto lookup = std::make_unique<HashLookup>(table->hashers(), pool());
-    for (auto batch = 0; batch < kNumBatches; ++batch) {
-      auto groupId = [&](auto row) {
-        return batch * kNumNewKeysPerBatch + row % kNumNewKeysPerBatch;
-      };
-      // Both keys are unique per group, so the product of their distinct
-      // counts outgrows kArray mode. Spacing out 'b' keeps it out of range
-      // mode, while the combined range still fits a normalized key.
-      auto data = makeRowVector({
-          makeFlatVector<int64_t>(kBatchSize, groupId),
-          makeFlatVector<int64_t>(
-              kBatchSize, [&](auto row) { return groupId(row) * 1'000; }),
-      });
-      insertGroups(*data, *lookup, *table);
-      ASSERT_EQ(lookup->newGroups.size(), kNumNewKeysPerBatch);
-      for (auto row = 0; row < kBatchSize; ++row) {
-        ASSERT_EQ(lookup->hits[row], lookup->hits[row % kNumNewKeysPerBatch]);
+  for (const int32_t kBatchSize :
+       {31, 32, 33, 63, 64, 65, 127, 128, 129, 1'000}) {
+    SCOPED_TRACE(kBatchSize);
+    for (const auto mode :
+         {BaseHashTable::HashMode::kNormalizedKey,
+          BaseHashTable::HashMode::kHash}) {
+      SCOPED_TRACE(BaseHashTable::modeString(mode));
+      auto table = createHashTableForAggregation(
+          ROW({"a", "b"}, {BIGINT(), BIGINT()}), 2);
+      if (mode == BaseHashTable::HashMode::kHash) {
+        table->forceGenericHashMode(
+            BaseHashTable::kNoSpillInputStartPartitionBit);
       }
+      auto lookup = std::make_unique<HashLookup>(table->hashers(), pool());
+      for (auto batch = 0; batch < kNumBatches; ++batch) {
+        auto groupId = [&](auto row) {
+          return batch * kNumNewKeysPerBatch + row % kNumNewKeysPerBatch;
+        };
+        // Both keys are unique per group, so the product of their distinct
+        // counts outgrows kArray mode. Spacing out 'b' keeps it out of range
+        // mode, while the combined range still fits a normalized key.
+        auto data = makeRowVector({
+            makeFlatVector<int64_t>(kBatchSize, groupId),
+            makeFlatVector<int64_t>(
+                kBatchSize, [&](auto row) { return groupId(row) * 1'000; }),
+        });
+        insertGroups(*data, *lookup, *table);
+        ASSERT_EQ(lookup->newGroups.size(), kNumNewKeysPerBatch);
+        for (auto row = 0; row < kBatchSize; ++row) {
+          ASSERT_EQ(lookup->hits[row], lookup->hits[row % kNumNewKeysPerBatch]);
+        }
+        const std::vector<char*> existingHits(
+            lookup->hits.begin(), lookup->hits.end());
+        insertGroups(*data, *lookup, *table);
+        ASSERT_TRUE(lookup->newGroups.empty());
+        EXPECT_EQ(
+            std::vector<char*>(lookup->hits.begin(), lookup->hits.end()),
+            existingHits);
+      }
+      EXPECT_EQ(table->numDistinct(), kNumBatches * kNumNewKeysPerBatch);
+      EXPECT_EQ(table->hashMode(), mode);
     }
-    EXPECT_EQ(table->numDistinct(), kNumBatches * kNumNewKeysPerBatch);
-    EXPECT_EQ(table->hashMode(), mode);
   }
 }
 
@@ -1027,12 +1035,12 @@ TEST_P(HashTableTest, listJoinResultsInterleaved) {
     GTEST_SKIP() << "No need to run this in multi-threaded mode";
   }
 
-  // Chains longer than `kAheadWindow` force a non-head slot's buffer to
+  // Chains longer than `kMaxAheadWindow` force a non-head slot's buffer to
   // fill, pause, and resume once its slot becomes head — that boundary is
   // what the interleaved walker rests on.
   constexpr int32_t kNumKeys = 20;
   constexpr int32_t kRowsPerKey =
-      BaseHashTable::JoinResultIterator::kAheadWindow + 4;
+      BaseHashTable::JoinResultIterator::kMaxAheadWindow + 4;
   constexpr int32_t kNumRows = kNumKeys * kRowsPerKey;
 
   std::vector<std::unique_ptr<VectorHasher>> keyHashers;
@@ -1069,11 +1077,10 @@ TEST_P(HashTableTest, listJoinResultsInterleaved) {
     expectedValuesByKey[row % kNumKeys].insert(row);
   }
 
-  // Probe with more than kNumParallelChains keys so the walker refills the
+  // Probe with more than kMaxParallelChains keys so the walker refills the
   // slot batch more than once mid-run.
-  constexpr int32_t kNumParallelChains =
-      BaseHashTable::JoinResultIterator::kNumParallelChains;
-  constexpr int32_t kNumProbe = kNumParallelChains * 3;
+  constexpr int32_t kNumProbe =
+      BaseHashTable::JoinResultIterator::kMaxParallelChains * 3;
 
   const std::vector<std::tuple<int32_t, bool, uint64_t>> cases{
       {64, false, std::numeric_limits<uint64_t>::max()},
@@ -1087,105 +1094,124 @@ TEST_P(HashTableTest, listJoinResultsInterleaved) {
   // `missesFirst=true` fills exactly the first slot batch with misses;
   // `false` scatters misses across all batches. Both cover the miss-vs-
   // refill boundary from different angles.
-  for (const bool missesFirst : {false, true}) {
-    SCOPED_TRACE(fmt::format("missesFirst={}", missesFirst));
-    std::vector<int64_t> probeKeys(kNumProbe);
-    for (int32_t i = 0; i < kNumProbe; ++i) {
-      const bool miss = missesFirst ? (i < kNumParallelChains) : (i % 3 == 0);
-      probeKeys[i] = miss ? (kNumKeys + i) : (i % kNumKeys);
-    }
-    auto probeVector = makeRowVector({makeFlatVector<int64_t>(probeKeys)});
-    SelectivityVector selectivity(kNumProbe);
-    HashLookup lookup(table->hashers(), pool());
-    table->prepareForJoinProbe(lookup, probeVector, selectivity, false);
-    lookup.hits.resize(kNumProbe);
-    std::fill(lookup.hits.begin(), lookup.hits.end(), nullptr);
-    table->joinProbe(lookup);
-    lookup.rows.resize(kNumProbe);
-    std::iota(lookup.rows.begin(), lookup.rows.end(), 0);
+  for (const auto [chains, ahead, prefetch] :
+       {std::tuple{1, 1, false},
+        std::tuple{4, 4, true},
+        std::tuple{8, 8, true},
+        std::tuple{8, 8, false},
+        std::tuple{16, 16, true},
+        std::tuple{32, 32, true},
+        std::tuple{32, 32, false},
+        std::tuple{1, 32, false},
+        std::tuple{32, 1, true},
+        std::tuple{4, 16, false},
+        std::tuple{16, 4, true}}) {
+    SCOPED_TRACE(
+        fmt::format("chains={} ahead={} prefetch={}", chains, ahead, prefetch));
+    for (const bool missesFirst : {false, true}) {
+      SCOPED_TRACE(fmt::format("missesFirst={}", missesFirst));
+      std::vector<int64_t> probeKeys(kNumProbe);
+      for (int32_t i = 0; i < kNumProbe; ++i) {
+        const bool miss = missesFirst ? (i < chains) : (i % 3 == 0);
+        probeKeys[i] = miss ? (kNumKeys + i) : (i % kNumKeys);
+      }
+      auto probeVector = makeRowVector({makeFlatVector<int64_t>(probeKeys)});
+      SelectivityVector selectivity(kNumProbe);
+      HashLookup lookup(table->hashers(), pool());
+      table->prepareForJoinProbe(lookup, probeVector, selectivity, false);
+      lookup.hits.resize(kNumProbe);
+      std::fill(lookup.hits.begin(), lookup.hits.end(), nullptr);
+      table->joinProbe(lookup);
+      lookup.rows.resize(kNumProbe);
+      std::iota(lookup.rows.begin(), lookup.rows.end(), 0);
 
-    for (const auto& [outputCapacity, includeMisses, maxBytes] : cases) {
-      SCOPED_TRACE(
-          fmt::format(
-              "outputCapacity={} includeMisses={} maxBytes={}",
-              outputCapacity,
-              includeMisses,
-              maxBytes));
-
-      BaseHashTable::JoinResultIterator iter(
-          {}, /*fixedSizeListColumnsSizeSum=*/8, std::nullopt);
-      iter.reset(lookup);
-      std::vector<vector_size_t> probeRows;
-      std::vector<char*> hits;
-      std::vector<vector_size_t> outputProbeRows(outputCapacity);
-      std::vector<char*> outputHits(outputCapacity);
-      while (!iter.atEnd()) {
-        const auto numOutput = table->listJoinResults(
-            iter,
+      for (const auto& [outputCapacity, includeMisses, maxBytes] : cases) {
+        SCOPED_TRACE(fmt::format(
+            "outputCapacity={} includeMisses={} maxBytes={}",
+            outputCapacity,
             includeMisses,
-            folly::Range(outputProbeRows.data(), outputCapacity),
-            folly::Range(outputHits.data(), outputCapacity),
-            maxBytes);
-        if (numOutput == 0) {
-          // A call may only return 0 after consuming everything reachable;
-          // otherwise the loop would spin without making progress.
-          EXPECT_TRUE(iter.atEnd());
-          break;
-        }
-        probeRows.insert(
-            probeRows.end(),
-            outputProbeRows.begin(),
-            outputProbeRows.begin() + numOutput);
-        hits.insert(
-            hits.end(), outputHits.begin(), outputHits.begin() + numOutput);
-      }
+            maxBytes));
 
-      // Probe-row indices must be non-decreasing — this is the probe-order
-      // invariant the interleaved walker rests on.
-      for (size_t i = 1; i < probeRows.size(); ++i) {
-        EXPECT_LE(probeRows[i - 1], probeRows[i]);
-      }
-
-      // Partition emits into (probe row, hit) buckets in one pass: non-
-      // miss hits feed the per-probe-row multiset check below; misses go
-      // into a set so we can assert each miss row was emitted exactly once
-      // when `includeMisses` is true, and never when false.
-      std::vector<char*> nonNullHits;
-      std::vector<vector_size_t> nonNullProbeRows;
-      std::set<vector_size_t> observedMisses;
-      for (size_t i = 0; i < hits.size(); ++i) {
-        if (hits[i] == nullptr) {
-          observedMisses.insert(probeRows[i]);
-        } else {
-          nonNullHits.push_back(hits[i]);
-          nonNullProbeRows.push_back(probeRows[i]);
-        }
-      }
-      auto valuesColumn = BaseVector::create<FlatVector<int64_t>>(
-          BIGINT(), nonNullHits.size(), pool());
-      table->rows()->extractColumn(
-          nonNullHits.data(), nonNullHits.size(), 1, valuesColumn);
-
-      std::map<vector_size_t, std::multiset<int64_t>> observedByProbeRow;
-      for (size_t i = 0; i < nonNullHits.size(); ++i) {
-        observedByProbeRow[nonNullProbeRows[i]].insert(
-            valuesColumn->valueAt(i));
-      }
-
-      for (int32_t probeRow = 0; probeRow < kNumProbe; ++probeRow) {
-        const int64_t key = probeKeys[probeRow];
-        if (key >= kNumKeys) {
-          // Miss.
-          if (includeMisses) {
-            EXPECT_EQ(observedMisses.count(probeRow), 1u);
-          } else {
-            EXPECT_EQ(observedMisses.count(probeRow), 0u);
+        BaseHashTable::JoinResultIterator iter(
+            {},
+            /*fixedSizeListColumnsSizeSum=*/8,
+            std::nullopt,
+            chains,
+            ahead,
+            prefetch);
+        iter.reset(lookup);
+        std::vector<vector_size_t> probeRows;
+        std::vector<char*> hits;
+        std::vector<vector_size_t> outputProbeRows(outputCapacity);
+        std::vector<char*> outputHits(outputCapacity);
+        while (!iter.atEnd()) {
+          const auto numOutput = table->listJoinResults(
+              iter,
+              includeMisses,
+              folly::Range(outputProbeRows.data(), outputCapacity),
+              folly::Range(outputHits.data(), outputCapacity),
+              maxBytes);
+          if (numOutput == 0) {
+            // A call may only return 0 after consuming everything reachable;
+            // otherwise the loop would spin without making progress.
+            EXPECT_TRUE(iter.atEnd());
+            break;
           }
-          EXPECT_EQ(observedByProbeRow.count(probeRow), 0u);
-        } else {
-          auto it = observedByProbeRow.find(probeRow);
-          ASSERT_NE(it, observedByProbeRow.end());
-          EXPECT_EQ(it->second, expectedValuesByKey[key]);
+          probeRows.insert(
+              probeRows.end(),
+              outputProbeRows.begin(),
+              outputProbeRows.begin() + numOutput);
+          hits.insert(
+              hits.end(), outputHits.begin(), outputHits.begin() + numOutput);
+        }
+
+        // Probe-row indices must be non-decreasing — this is the probe-order
+        // invariant the interleaved walker rests on.
+        for (size_t i = 1; i < probeRows.size(); ++i) {
+          EXPECT_LE(probeRows[i - 1], probeRows[i]);
+        }
+
+        // Partition emits into (probe row, hit) buckets in one pass: non-
+        // miss hits feed the per-probe-row multiset check below; misses go
+        // into a set so we can assert each miss row was emitted exactly once
+        // when `includeMisses` is true, and never when false.
+        std::vector<char*> nonNullHits;
+        std::vector<vector_size_t> nonNullProbeRows;
+        std::set<vector_size_t> observedMisses;
+        for (size_t i = 0; i < hits.size(); ++i) {
+          if (hits[i] == nullptr) {
+            observedMisses.insert(probeRows[i]);
+          } else {
+            nonNullHits.push_back(hits[i]);
+            nonNullProbeRows.push_back(probeRows[i]);
+          }
+        }
+        auto valuesColumn = BaseVector::create<FlatVector<int64_t>>(
+            BIGINT(), nonNullHits.size(), pool());
+        table->rows()->extractColumn(
+            nonNullHits.data(), nonNullHits.size(), 1, valuesColumn);
+
+        std::map<vector_size_t, std::multiset<int64_t>> observedByProbeRow;
+        for (size_t i = 0; i < nonNullHits.size(); ++i) {
+          observedByProbeRow[nonNullProbeRows[i]].insert(
+              valuesColumn->valueAt(i));
+        }
+
+        for (int32_t probeRow = 0; probeRow < kNumProbe; ++probeRow) {
+          const int64_t key = probeKeys[probeRow];
+          if (key >= kNumKeys) {
+            // Miss.
+            if (includeMisses) {
+              EXPECT_EQ(observedMisses.count(probeRow), 1u);
+            } else {
+              EXPECT_EQ(observedMisses.count(probeRow), 0u);
+            }
+            EXPECT_EQ(observedByProbeRow.count(probeRow), 0u);
+          } else {
+            auto it = observedByProbeRow.find(probeRow);
+            ASSERT_NE(it, observedByProbeRow.end());
+            EXPECT_EQ(it->second, expectedValuesByKey[key]);
+          }
         }
       }
     }

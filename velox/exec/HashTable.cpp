@@ -497,19 +497,28 @@ template <bool isNormalizedKey>
 void HashTable<ignoreNullKeys>::groupProbeWithPrefetch(HashLookup& lookup) {
   constexpr int32_t kKeyOffset =
       isNormalizedKey ? -static_cast<int32_t>(sizeof(normalized_key_t)) : 0;
-  ProbeState states[kPrefetchSize];
+  // Tune normalized-key group probing independently of join probing.
+  // Keep the general-hash window unchanged.
+#if defined(__aarch64__)
+  constexpr int32_t kGroupPrefetchSize = isNormalizedKey ? 128 : kPrefetchSize;
+#else
+  constexpr int32_t kGroupPrefetchSize = kPrefetchSize;
+#endif
+  ProbeState states[kGroupPrefetchSize];
   const int32_t numProbes = lookup.rows.size();
   const vector_size_t* rows = lookup.rows.data();
   const uint64_t* hashes = lookup.hashes.data();
   for (int32_t probeIndex = 0; probeIndex < numProbes;
-       probeIndex += kPrefetchSize) {
-    const int32_t numStates = std::min(kPrefetchSize, numProbes - probeIndex);
+       probeIndex += kGroupPrefetchSize) {
+    const int32_t numStates =
+        std::min(kGroupPrefetchSize, numProbes - probeIndex);
     for (int32_t i = 0; i < numStates; ++i) {
       const auto row = rows[probeIndex + i];
       states[i].preProbe(*this, hashes[row], row);
     }
     for (int32_t i = 0; i < numStates; ++i) {
-      states[i].firstProbe<ProbeState::Operation::kInsert>(*this, kKeyOffset);
+      states[i].template firstProbe<ProbeState::Operation::kInsert>(
+          *this, kKeyOffset);
     }
     // Tags loaded by firstProbe() go stale once an earlier state in this
     // window inserts a new group, possibly with the same key.
@@ -1971,9 +1980,8 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
   }
   otherTables_.reserve(tables.size());
   for (auto& table : tables) {
-    otherTables_.emplace_back(
-        std::unique_ptr<HashTable<ignoreNullKeys>>(
-            dynamic_cast<HashTable<ignoreNullKeys>*>(table.release())));
+    otherTables_.emplace_back(std::unique_ptr<HashTable<ignoreNullKeys>>(
+        dynamic_cast<HashTable<ignoreNullKeys>*>(table.release())));
   }
 
   // If there are multiple tables, we need to merge the 'columnHasNulls' flags
@@ -2157,16 +2165,43 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleaved(
     folly::Range<vector_size_t*> inputRows,
     folly::Range<char**> hits,
     uint64_t maxBytes) {
+  if (iter.numParallelChains == JoinResultIterator::kNumParallelChains &&
+      iter.aheadWindow == JoinResultIterator::kAheadWindow &&
+      iter.prefetchEnabled) {
+    // Keep constants in the default hot loop, including buffer stride and
+    // unconditional prefetch, instead of paying tuning costs per hit.
+    return listJoinResultsInterleavedImpl<true>(
+        iter, includeMisses, inputRows, hits, maxBytes);
+  }
+  return listJoinResultsInterleavedImpl<false>(
+      iter, includeMisses, inputRows, hits, maxBytes);
+}
+
+template <bool ignoreNullKeys>
+template <bool kDefaultPolicy>
+int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
+    JoinResultIterator& iter,
+    bool includeMisses,
+    folly::Range<vector_size_t*> inputRows,
+    folly::Range<char**> hits,
+    uint64_t maxBytes) {
   if (iter.rows == nullptr || iter.rows->empty()) {
     return 0;
   }
 
   size_t numOut = 0;
   uint64_t totalBytes{0};
-  constexpr int32_t kNumParallelChains = JoinResultIterator::kNumParallelChains;
-  constexpr int32_t kAheadWindow = JoinResultIterator::kAheadWindow;
+  const int32_t numParallelChains = kDefaultPolicy
+      ? JoinResultIterator::kNumParallelChains
+      : iter.numParallelChains;
+  const int32_t aheadWindow =
+      kDefaultPolicy ? JoinResultIterator::kAheadWindow : iter.aheadWindow;
+  const bool prefetchEnabled = kDefaultPolicy || iter.prefetchEnabled;
   const auto numProbeRows = iter.rows->size();
   auto& walker = iter.walker;
+  auto bufferedHitAt = [&](int32_t slot, int32_t position) -> char*& {
+    return walker.bufferData[slot * aheadWindow + position];
+  };
 
   auto emit = makeJoinResultEmitter(
       inputRows, hits, numOut, totalBytes, maxBytes, [&](char* hit) {
@@ -2177,7 +2212,7 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleaved(
     if (walker.slotHead >= walker.numActive) {
       walker.slotHead = 0;
       walker.numActive = 0;
-      while (walker.numActive < kNumParallelChains &&
+      while (walker.numActive < numParallelChains &&
              iter.lastRowIndex < numProbeRows) {
         const auto row = (*iter.rows)[iter.lastRowIndex]; // NOLINT
         auto* hit = (*iter.hits)[row]; // NOLINT
@@ -2188,11 +2223,13 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleaved(
         walker.slotProbeRows[walker.numActive] = row;
         walker.slotCursors[walker.numActive] = hit;
         if (hit == nullptr) {
-          walker.bufferData[walker.numActive][0] = nullptr;
+          bufferedHitAt(walker.numActive, 0) = nullptr;
           walker.bufferLength[walker.numActive] = 1;
         } else {
           walker.bufferLength[walker.numActive] = 0;
-          __builtin_prefetch(hit);
+          if (prefetchEnabled) {
+            __builtin_prefetch(hit);
+          }
         }
         ++walker.numActive;
       }
@@ -2206,7 +2243,7 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleaved(
       const auto probeRow = walker.slotProbeRows[walker.slotHead];
       while (walker.drainPosition < bufferLength) {
         auto* bufferedHit =
-            walker.bufferData[walker.slotHead][walker.drainPosition++];
+            bufferedHitAt(walker.slotHead, walker.drainPosition++);
         if (!emit(probeRow, bufferedHit)) {
           if (walker.drainPosition == bufferLength) {
             // Fully drained; reset so the next call skips this slot's
@@ -2229,20 +2266,22 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleaved(
 
     const int32_t numActive = walker.numActive;
     const int32_t slotHead = walker.slotHead;
-    for (int32_t i = slotHead; i < numActive; ++i) {
-      char* cursor = walker.slotCursors[i];
-      if (cursor != nullptr &&
-          (i == slotHead || walker.bufferLength[i] < kAheadWindow)) {
-        __builtin_prefetch(cursor + nextOffset_);
+    if (prefetchEnabled) {
+      for (int32_t i = slotHead; i < numActive; ++i) {
+        char* cursor = walker.slotCursors[i];
+        if (cursor != nullptr &&
+            (i == slotHead || walker.bufferLength[i] < aheadWindow)) {
+          __builtin_prefetch(cursor + nextOffset_);
+        }
       }
     }
 
     for (int32_t i = slotHead + 1; i < numActive; ++i) {
       char* cursor = walker.slotCursors[i];
-      if (cursor == nullptr || walker.bufferLength[i] >= kAheadWindow) {
+      if (cursor == nullptr || walker.bufferLength[i] >= aheadWindow) {
         continue;
       }
-      walker.bufferData[i][walker.bufferLength[i]++] = cursor;
+      bufferedHitAt(i, walker.bufferLength[i]++) = cursor;
       walker.slotCursors[i] = nextRow(cursor);
     }
 

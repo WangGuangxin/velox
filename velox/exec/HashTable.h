@@ -197,6 +197,8 @@ class BaseHashTable {
     static constexpr int32_t kNumParallelChains = 8;
     /// Maximum number of hits a non-head slot can buffer before pausing.
     static constexpr int32_t kAheadWindow = 8;
+    static constexpr int32_t kMaxParallelChains = 32;
+    static constexpr int32_t kMaxAheadWindow = 32;
 
     /// Internal state for the interleaved chain walker. Not read outside
     /// of HashTable.cpp; grouped here to keep the outer iterator focused
@@ -205,25 +207,25 @@ class BaseHashTable {
       /// Current chain node for each in-flight probe row. Only the head
       /// slot emits inline; the others buffer hits into `bufferData` to
       /// preserve probe-row order.
-      std::array<char*, kNumParallelChains> slotCursors{};
+      std::array<char*, kMaxParallelChains> slotCursors{};
 
       /// Probe row index paired with each slot cursor.
-      std::array<vector_size_t, kNumParallelChains> slotProbeRows{};
+      std::array<vector_size_t, kMaxParallelChains> slotProbeRows{};
 
       /// Hits buffered for each non-head slot, drained when the slot
       /// becomes head.
-      std::array<std::array<char*, kAheadWindow>, kNumParallelChains>
-          bufferData{};
+      // Packed using the configured window as stride. Entries are written
+      // before bufferLength makes them visible; do not zero the entire buffer.
+      std::array<char*, kMaxParallelChains * kMaxAheadWindow> bufferData;
 
-      /// Number of buffered entries per slot, in [0, kAheadWindow]. A
-      /// non-head slot pauses its walk once this reaches kAheadWindow.
-      std::array<int32_t, kNumParallelChains> bufferLength{};
+      /// Buffered entries per slot, bounded by the configured aheadWindow.
+      std::array<int32_t, kMaxParallelChains> bufferLength{};
 
       /// Index of the current head slot; advances 0..numActive per batch.
       int32_t slotHead{0};
 
       /// Number of slots holding a live probe row in the current batch,
-      /// in [0, kNumParallelChains].
+      /// in [0, numParallelChains].
       int32_t numActive{0};
 
       /// Resume position within the head slot's buffer across calls.
@@ -247,10 +249,21 @@ class BaseHashTable {
     JoinResultIterator(
         std::vector<vector_size_t>&& _varSizeListColumns,
         uint64_t _fixedSizeListColumnsSizeSum,
-        std::optional<uint64_t> _estimatedRowSize)
+        std::optional<uint64_t> _estimatedRowSize,
+        int32_t parallelChains = kNumParallelChains,
+        int32_t aheadWindow = kAheadWindow,
+        bool prefetchEnabled = true)
         : estimatedRowSize(_estimatedRowSize),
           varSizeListColumns(std::move(_varSizeListColumns)),
-          fixedSizeListColumnsSizeSum(_fixedSizeListColumnsSizeSum) {}
+          fixedSizeListColumnsSizeSum(_fixedSizeListColumnsSizeSum),
+          numParallelChains(parallelChains),
+          aheadWindow(aheadWindow),
+          prefetchEnabled(prefetchEnabled) {
+      VELOX_USER_CHECK_GE(parallelChains, 1);
+      VELOX_USER_CHECK_LE(parallelChains, kMaxParallelChains);
+      VELOX_USER_CHECK_GE(aheadWindow, 1);
+      VELOX_USER_CHECK_LE(aheadWindow, kMaxAheadWindow);
+    }
 
     void reset(const HashLookup& lookup) {
       rows = &lookup.rows;
@@ -281,6 +294,9 @@ class BaseHashTable {
     /// The per row total bytes of the build side projected columns that are
     /// fixed sized.
     const uint64_t fixedSizeListColumnsSizeSum{0};
+    const int32_t numParallelChains;
+    const int32_t aheadWindow;
+    const bool prefetchEnabled;
 
     const raw_vector<vector_size_t>* rows{nullptr};
     const raw_vector<char*>* hits{nullptr};
@@ -552,7 +568,8 @@ class BaseHashTable {
   __attribute__((__no_sanitize__("thread")))
 #endif
 #endif
-  static TagVector loadTags(uint8_t* tags, int64_t tagIndex) {
+  static TagVector
+  loadTags(uint8_t* tags, int64_t tagIndex) {
     // Cannot use xsimd::batch::unaligned here because we need to skip TSAN.
     auto src = tags + tagIndex;
 #if XSIMD_WITH_SSE2
@@ -769,9 +786,8 @@ class HashTable : public BaseHashTable {
     return hashMode_;
   }
 
-  void addRuntimeStats(
-      std::unordered_map<std::string, RuntimeMetric>& runtimeStats)
-      const override {
+  void addRuntimeStats(std::unordered_map<std::string, RuntimeMetric>&
+                           runtimeStats) const override {
     runtimeStats[std::string(kCapacity)] = RuntimeMetric(capacity_);
     runtimeStats[std::string(kHashMode)] =
         RuntimeMetric(static_cast<int64_t>(hashMode_));
@@ -1032,6 +1048,14 @@ class HashTable : public BaseHashTable {
   // Interleaves K chain walks to overlap next-pointer loads while preserving
   // probe-row output order via per-slot buffering.
   int32_t listJoinResultsInterleaved(
+      JoinResultIterator& iter,
+      bool includeMisses,
+      folly::Range<vector_size_t*> inputRows,
+      folly::Range<char**> hits,
+      uint64_t maxBytes);
+
+  template <bool kDefaultPolicy>
+  int32_t listJoinResultsInterleavedImpl(
       JoinResultIterator& iter,
       bool includeMisses,
       folly::Range<vector_size_t*> inputRows,
