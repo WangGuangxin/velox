@@ -28,6 +28,13 @@ DEFINE_bool(
     false,
     "Record time and volume for large allocation/free");
 
+// Used in exec/RowContainer.cpp. Configure before starting worker threads.
+DEFINE_bool(
+    velox_row_container_batch_string_extraction_enabled,
+    false,
+    "Batch RowContainer string extraction into output-owned buffers; set only "
+    "during process initialization");
+
 // Used in common/base/VeloxException.cpp
 DEFINE_bool(
     velox_exception_user_stacktrace_enabled,
