@@ -33,6 +33,9 @@ endif()
 # Set the project name.
 project(velox)
 
+include("${CMAKE_CURRENT_SOURCE_DIR}/CMake/VeloxPGO.cmake")
+velox_configure_pgo(VELOX)
+
 # If we are in an active conda env disable search in system paths and add env to
 # prefix path
 if(DEFINED ENV{CONDA_PREFIX})
