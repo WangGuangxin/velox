@@ -1734,9 +1734,37 @@ class QueryConfig {
 
   std::unordered_map<std::string, std::string> rawConfigsCopy() const;
 
+  VELOX_QUERY_CONFIG(
+      kGroupingSetsValueIdsEnabled,
+      groupingSetsValueIdsEnabled,
+      "grouping_sets_value_ids_enabled",
+      bool,
+      false,
+      "Enable larger string dictionaries only for Expand-fed partial aggregation.")
 
+  VELOX_QUERY_CONFIG(
+      kGroupingSetsValueIdsReuseEnabled,
+      groupingSetsValueIdsReuseEnabled,
+      "grouping_sets_value_ids_reuse_enabled",
+      bool,
+      true,
+      "Reuse exact raw string value IDs across projections of one Expand epoch.")
 
+  VELOX_QUERY_CONFIG(
+      kGroupingSetsValueIdsMaxStringBytes,
+      groupingSetsValueIdsMaxStringBytes,
+      "grouping_sets_value_ids_max_string_bytes",
+      uint64_t,
+      33554432,
+      "String dictionary byte threshold for the eligible partial aggregation only.")
 
+  VELOX_QUERY_CONFIG(
+      kGroupingSetsValueIdsMaxStringValues,
+      groupingSetsValueIdsMaxStringValues,
+      "grouping_sets_value_ids_max_string_values",
+      int64_t,
+      500000,
+      "Maximum string value IDs for the eligible partial aggregation only.")
 
 
  private:

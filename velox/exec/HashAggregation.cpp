@@ -77,7 +77,10 @@ void HashAggregation::initialize() {
       groupingKeyInputChannels, groupingKeyOutputChannels);
 
   auto hashers = createVectorHashers(inputType, groupingKeyInputChannels);
-  if (operatorCtx_->driverCtx()->queryConfig().groupingSetsBatchingEnabled() &&
+  const auto& groupingConfig = operatorCtx_->driverCtx()->queryConfig();
+  const bool valueIdGrouping = groupingConfig.groupingSetsValueIdsEnabled() &&
+      aggregationNode_->step() == core::AggregationNode::Step::kPartial;
+  if ((groupingConfig.groupingSetsBatchingEnabled() || valueIdGrouping) &&
       aggregationNode_->preGroupedKeys().empty()) {
     auto source = aggregationNode_->sources()[0];
     auto channels = groupingKeyInputChannels;
@@ -107,6 +110,17 @@ void HashAggregation::initialize() {
           break;
         }
       }
+    }
+  }
+  if (groupingSetSource_) {
+    for (auto& hasher : hashers) {
+      hasher->configureGroupingSetReuse(
+          groupingConfig.groupingSetsBatchingEnabled(),
+          valueIdGrouping && groupingConfig.groupingSetsValueIdsReuseEnabled(),
+          valueIdGrouping ? groupingConfig.groupingSetsValueIdsMaxStringBytes()
+                          : (1 << 20),
+          valueIdGrouping ? groupingConfig.groupingSetsValueIdsMaxStringValues()
+                          : VectorHasher::kMaxDistinct);
     }
   }
   const auto numHashers = hashers.size();
@@ -322,8 +336,26 @@ void HashAggregation::updateRuntimeStats() {
   for (auto i = 0; i < hashers.size(); i++) {
     if (operatorCtx_->driverCtx()
             ->queryConfig()
-            .groupingSetsBatchingEnabled()) {
+            .groupingSetsBatchingEnabled() ||
+        operatorCtx_->driverCtx()
+            ->queryConfig()
+            .groupingSetsValueIdsEnabled()) {
       const auto reuse = hashers[i]->takeBatchReuseStats();
+      const auto epoch = hashers[i]->takeGroupingSetValueIdStats();
+      if (epoch.valueIdEpochRows || epoch.valueIdEpochInvalidations) {
+        lockedStats->addRuntimeStat(
+            "hashtable.groupingValueIdRows",
+            RuntimeCounter(epoch.valueIdEpochRows));
+        lockedStats->addRuntimeStat(
+            "hashtable.groupingValueIdLookups",
+            RuntimeCounter(epoch.valueIdEpochLookups));
+        lockedStats->addRuntimeStat(
+            "hashtable.groupingValueIdReusedRows",
+            RuntimeCounter(epoch.valueIdEpochReusedRows));
+        lockedStats->addRuntimeStat(
+            "hashtable.groupingValueIdInvalidations",
+            RuntimeCounter(epoch.valueIdEpochInvalidations));
+      }
       if (reuse.encodedHashRows) {
         lockedStats->addRuntimeStat(
             "aggregationKeyHashRows", RuntimeCounter(reuse.encodedHashRows));

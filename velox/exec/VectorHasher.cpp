@@ -390,6 +390,11 @@ bool VectorHasher::computeValueIds(
     raw_vector<uint64_t>& result) {
   checkTypeSupportsValueIds();
 
+  if (groupingSetValueIdReuseEnabled_ && groupingSetHashCacheActive_ &&
+      rangeSize_ > 0 && !isRange_ && !distinctOverflow_ &&
+      rows.hasSelections()) {
+    return makeGroupingSetValueIds(rows, result);
+  }
   if (batchReuseEnabled_ && rows.hasSelections()) {
     batchReuseStats_.valueIdRows += rows.countSelected();
     return VALUE_ID_TYPE_DISPATCH(
@@ -399,16 +404,59 @@ bool VectorHasher::computeValueIds(
   return VALUE_ID_TYPE_DISPATCH(makeValueIds, typeKind_, rows, result.data());
 }
 
+void VectorHasher::configureGroupingSetReuse(
+    bool hashReuse,
+    bool valueIdReuse,
+    uint64_t stringBytes,
+    int64_t stringValues) {
+  VELOX_CHECK_EQ(numDistinct(), 0, "Configure grouping reuse before analysis");
+  VELOX_CHECK_GE(stringBytes, 1 << 20);
+  VELOX_CHECK_LE(stringBytes, 64 << 20);
+  VELOX_CHECK_GE(stringValues, kMaxDistinct);
+  VELOX_CHECK_LE(stringValues, 1000000);
+  const bool string =
+      typeKind_ == TypeKind::VARCHAR || typeKind_ == TypeKind::VARBINARY;
+  groupingSetHashReuseEnabled_ = hashReuse;
+  groupingSetValueIdReuseEnabled_ = valueIdReuse && string;
+  maxDistinctStringBytes_ = string ? stringBytes : kMaxDistinctStringsBytes;
+  maxDistinctStringValues_ = string ? stringValues : kMaxDistinct;
+  finishGroupingSetHashInput();
+  groupingSetHashEpoch_.reset();
+  groupingSetHashInput_.reset();
+  cachedValueIdCount_ = 0;
+  groupingSetHashValid_.resize(0);
+  groupingBufferContainsIds_ = false;
+}
+
+int64_t VectorHasher::distinctValueLimit() const {
+  return typeKind_ == TypeKind::VARCHAR || typeKind_ == TypeKind::VARBINARY
+      ? maxDistinctStringValues_
+      : kMaxDistinct;
+}
+
+VectorHasher::GroupingSetValueIdStats
+VectorHasher::takeGroupingSetValueIdStats() {
+  return {
+      std::exchange(valueIdEpochRows_, 0),
+      std::exchange(valueIdEpochLookups_, 0),
+      std::exchange(valueIdEpochReusedRows_, 0),
+      std::exchange(valueIdEpochInvalidations_, 0)};
+}
+
 void VectorHasher::setGroupingSetHashInput(
     uint64_t epoch,
     const VectorPtr& values,
     memory::MemoryPool* pool) {
-  groupingSetHashCacheActive_ = false;
+  finishGroupingSetHashInput();
+  if (!groupingSetHashReuseEnabled_ && !groupingSetValueIdReuseEnabled_) {
+    return;
+  }
   if (groupingSetHashEpoch_ != epoch) {
     groupingSetHashEpoch_ = epoch;
     groupingSetHashInput_.reset();
-    groupingSetHashValid_.resize(0);
+    cachedValueIdCount_ = 0;
   }
+  // Constant/null projections preserve the source cache for later projections.
   if (values->isConstantEncoding()) {
     return;
   }
@@ -423,8 +471,74 @@ void VectorHasher::setGroupingSetHashInput(
     groupingSetHashes_.resize(values->size());
     groupingSetHashValid_.resize(values->size());
     std::fill(groupingSetHashValid_.begin(), groupingSetHashValid_.end(), 0);
+    cachedValueIdCount_ = 0;
+    cachedDictionaryGeneration_ = dictionaryGeneration_;
   }
+  // Reuse the established inline decode identity guard for either buffer use.
   groupingSetHashCacheActive_ = true;
+}
+
+bool VectorHasher::makeGroupingSetValueIds(
+    const SelectivityVector& rows,
+    raw_vector<uint64_t>& result) {
+  if (!groupingBufferContainsIds_ ||
+      cachedDictionaryGeneration_ != dictionaryGeneration_) {
+    valueIdEpochInvalidations_ += cachedValueIdCount_ != 0;
+    std::fill(groupingSetHashValid_.begin(), groupingSetHashValid_.end(), 0);
+    cachedValueIdCount_ = 0;
+    cachedDictionaryGeneration_ = dictionaryGeneration_;
+  }
+  groupingBufferContainsIds_ = true;
+  valueIdEpochRows_ += rows.countSelected();
+  auto apply = [&](vector_size_t row, uint64_t id) {
+    result[row] = multiplier_ == 1 ? id : result[row] + multiplier_ * id;
+  };
+  if (cachedValueIdCount_ == groupingSetHashes_.size()) {
+    valueIdEpochReusedRows_ += rows.countSelected();
+    rows.applyToSelected(
+        [&](vector_size_t row) { apply(row, groupingSetHashes_[row]); });
+    return true;
+  }
+  bool success = true;
+  const bool mayHaveNulls = decoded_.mayHaveNulls();
+  rows.applyToSelected([&](vector_size_t row) {
+    if (!success) {
+      if (!mayHaveNulls || !decoded_.isNullAt(row)) {
+        analyzeValue(decoded_.valueAt<StringView>(row));
+      }
+      return;
+    }
+    uint64_t id;
+    if (groupingSetHashValid_[row]) {
+      id = groupingSetHashes_[row];
+      ++valueIdEpochReusedRows_;
+    } else {
+      if (mayHaveNulls && decoded_.isNullAt(row)) {
+        id = 0;
+      } else {
+        ++valueIdEpochLookups_;
+        const auto value = decoded_.valueAt<StringView>(row);
+        id = valueId(value);
+        if (id == kUnmappable || id >= rangeSize_) {
+          analyzeValue(value);
+          success = false;
+          return;
+        }
+      }
+      groupingSetHashes_[row] = id;
+      groupingSetHashValid_[row] = 1;
+      ++cachedValueIdCount_;
+    }
+    apply(row, id);
+  });
+  // An overflow may have cleared the codebook while analyzing this batch.
+  if (cachedDictionaryGeneration_ != dictionaryGeneration_) {
+    valueIdEpochInvalidations_ += cachedValueIdCount_ != 0;
+    std::fill(groupingSetHashValid_.begin(), groupingSetHashValid_.end(), 0);
+    cachedValueIdCount_ = 0;
+    cachedDictionaryGeneration_ = dictionaryGeneration_;
+  }
+  return success;
 }
 
 bool VectorHasher::hasRepeatedBaseIndices(const SelectivityVector& rows) const {
@@ -951,6 +1065,13 @@ void VectorHasher::hash(
     const SelectivityVector& rows,
     bool mix,
     raw_vector<uint64_t>& result) {
+  if (!groupingSetHashReuseEnabled_) {
+    groupingSetHashCacheActive_ = false;
+  } else if (groupingSetHashCacheActive_ && groupingBufferContainsIds_) {
+    std::fill(groupingSetHashValid_.begin(), groupingSetHashValid_.end(), 0);
+    groupingBufferContainsIds_ = false;
+    cachedValueIdCount_ = 0;
+  }
   if (typeKind_ == TypeKind::UNKNOWN) {
     rows.applyToSelected([&](auto row) {
       result[row] = mix ? bits::hashMix(result[row], kNullHash) : kNullHash;
@@ -1064,7 +1185,7 @@ void VectorHasher::analyzeValue(StringView value) {
     unique.setId(uniqueValues_.size() + 1);
     auto pair = uniqueValues_.insert(unique);
     if (pair.second) {
-      if (uniqueValues_.size() > kMaxDistinct) {
+      if (uniqueValues_.size() > distinctValueLimit()) {
         setDistinctOverflow();
         return;
       }
@@ -1074,11 +1195,17 @@ void VectorHasher::analyzeValue(StringView value) {
 }
 
 void VectorHasher::copyStringToLocal(const UniqueValue* unique) {
+  copyStringToLocalImpl(unique, true);
+}
+
+void VectorHasher::copyStringToLocalImpl(
+    const UniqueValue* unique,
+    bool enforceBudget) {
   auto size = unique->size();
   if (size <= sizeof(int64_t)) {
     return;
   }
-  if (distinctStringsBytes_ > kMaxDistinctStringsBytes) {
+  if (enforceBudget && distinctStringsBytes_ > maxDistinctStringBytes_) {
     setDistinctOverflow();
     return;
   }
@@ -1217,19 +1344,21 @@ void extendRange(
   }
 }
 
-int64_t addIdReserve(size_t numDistinct, int32_t reservePct) {
+int64_t addIdReserve(
+    size_t numDistinct,
+    int32_t reservePct,
+    int64_t limit = VectorHasher::kMaxDistinct) {
   // A merge of hashers in a hash join build may end up over the limit, so
   // return that.
-  if (numDistinct > VectorHasher::kMaxDistinct) {
+  if (numDistinct > limit) {
     return numDistinct;
   }
   if (reservePct == VectorHasher::kNoLimit) {
-    return VectorHasher::kMaxDistinct;
+    return limit;
   }
   // NOTE: 'kMaxDistinct' is a small value so no need to check overflow for
   // reservation here.
-  return std::min<int64_t>(
-      VectorHasher::kMaxDistinct, numDistinct * (1 + (reservePct / 100.0)));
+  return std::min<int64_t>(limit, numDistinct * (1 + (reservePct / 100.0)));
 }
 } // namespace
 
@@ -1283,7 +1412,8 @@ void VectorHasher::cardinality(
     return;
   }
   // Padded count of values + 1 for null.
-  asDistincts = addIdReserve(numDistinct(), reservePct) + 1;
+  asDistincts =
+      addIdReserve(numDistinct(), reservePct, distinctValueLimit()) + 1;
 }
 
 uint64_t VectorHasher::enableValueIds(uint64_t multiplier, int32_t reservePct) {
@@ -1294,7 +1424,8 @@ uint64_t VectorHasher::enableValueIds(uint64_t multiplier, int32_t reservePct) {
   checkTypeSupportsValueIds();
 
   multiplier_ = multiplier;
-  rangeSize_ = addIdReserve(numDistinct(), reservePct) + 1;
+  rangeSize_ =
+      addIdReserve(numDistinct(), reservePct, distinctValueLimit()) + 1;
   isRange_ = false;
   uint64_t result;
   if (__builtin_mul_overflow(multiplier_, rangeSize_, &result)) {
@@ -1596,6 +1727,8 @@ void VectorHasher::deserializeState(std::string_view data) {
         bloomFilterData);
   }
 
+  ++dictionaryGeneration_;
+  finishGroupingSetHashInput();
   uniqueValues_.clear();
   uniqueValuesStorage_.clear();
   distinctStringsBytes_ = 0;
@@ -1613,7 +1746,9 @@ void VectorHasher::deserializeState(std::string_view data) {
       unique.setId(id);
       auto [iter, inserted] = uniqueValues_.insert(unique);
       VELOX_CHECK(inserted, "Duplicate value in VectorHasher state");
-      copyStringToLocal(&*iter);
+      // Growth limits are query tuning, not serialized state. Restore all
+      // existing IDs exactly; apply the configured limits to future growth.
+      copyStringToLocalImpl(&*iter, false);
     }
   } else {
     for (uint32_t i = 0; i < numUniqueValues; ++i) {
