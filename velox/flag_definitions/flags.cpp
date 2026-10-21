@@ -42,6 +42,11 @@ DEFINE_bool(
     "Use cached size/prefix and equality comparison for RowContainer string "
     "keys; set only during process initialization");
 
+DEFINE_bool(
+    velox_row_container_string_extraction_prefetch_enabled,
+    true,
+    "Prefetch row metadata and out-of-line string headers during batch extraction; "
+    "set only during process initialization");
 
 // Used in common/base/VeloxException.cpp
 DEFINE_bool(
