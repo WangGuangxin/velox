@@ -1038,6 +1038,16 @@ class HashTable : public BaseHashTable {
       folly::Range<char**> hits,
       uint64_t maxBytes);
 
+  // Same as listJoinResultsInterleaved; kCountBytes = false skips per-hit
+  // byte accounting when the output batch is row-limited.
+  template <bool kCountBytes>
+  int32_t listJoinResultsInterleavedImpl(
+      JoinResultIterator& iter,
+      bool includeMisses,
+      folly::Range<vector_size_t*> inputRows,
+      folly::Range<char**> hits,
+      uint64_t maxBytes);
+
   // Tries to use as many range hashers as can in a normalized key situation.
   void enableRangeWhereCan(
       const std::vector<uint64_t>& rangeSizes,

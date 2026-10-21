@@ -147,3 +147,9 @@ DEFINE_int32(
     velox_tpch_text_pool_size_mb,
     300,
     "TPC-H DBGen text pool size in MB");
+
+
+DEFINE_bool(
+    velox_hash_join_fixed_width_output_enabled,
+    true,
+    "Skip per-hit byte accounting when a fixed-width output batch is row-limited.");
