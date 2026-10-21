@@ -24,9 +24,12 @@
 #include "velox/vector/VectorTypeUtils.h"
 
 #include <folly/portability/GFlags.h>
+#include <cstring>
 #include <string_view>
+#include <type_traits>
 
 DECLARE_bool(velox_row_container_batch_string_extraction_enabled);
+DECLARE_bool(velox_row_container_string_equality_enabled);
 
 namespace facebook::velox::exec {
 namespace test {
@@ -1364,6 +1367,14 @@ class RowContainer {
         Kind == TypeKind::MAP) {
       return compareComplexType(row, column.offset(), decoded, index, flags);
     } else if constexpr (is_string_kind(Kind)) {
+      if constexpr (!typeProvidesCustomComparison) {
+        if (FLAGS_velox_row_container_string_equality_enabled &&
+            flags.equalsOnly) {
+          return !stringsEqual<false>(
+              valueAt<StringView>(row, column.offset()),
+              decoded.valueAt<StringView>(index));
+        }
+      }
       auto result = compareStringAsc(
           valueAt<StringView>(row, column.offset()), decoded, index);
       return flags.ascending ? result : result * -1;
@@ -1446,6 +1457,12 @@ class RowContainer {
     } else if constexpr (is_string_kind(Kind)) {
       auto leftValue = valueAt<StringView>(left, leftOffset);
       auto rightValue = valueAt<StringView>(right, rightOffset);
+      if constexpr (!typeProvidesCustomComparison) {
+        if (FLAGS_velox_row_container_string_equality_enabled &&
+            flags.equalsOnly) {
+          return !stringsEqual<true>(leftValue, rightValue);
+        }
+      }
       auto result = compareStringAsc(leftValue, rightValue);
       return flags.ascending ? result : result * -1;
     } else {
@@ -1542,6 +1559,40 @@ class RowContainer {
       vector_size_t index);
 
   static int32_t compareStringAsc(StringView left, StringView right);
+
+  // RowContainer strings can span allocator blocks. Reject unequal cached
+  // lengths/prefixes before touching payloads, but never compare a fragmented
+  // payload as a contiguous StringView. Decoded-vector strings are contiguous
+  // and do not have HashStringAllocator headers.
+  template <bool rightStored>
+  static bool stringsEqual(StringView left, StringView right) {
+    // StringView documents its first eight bytes as uint32 size + four-byte
+    // prefix. memcpy reads the representation without alignment/aliasing UB.
+    static_assert(std::is_standard_layout_v<StringView>);
+    static_assert(sizeof(StringView) == 16);
+    uint64_t leftPrefix;
+    uint64_t rightPrefix;
+    std::memcpy(&leftPrefix, &left, sizeof(leftPrefix));
+    std::memcpy(&rightPrefix, &right, sizeof(rightPrefix));
+    if (leftPrefix != rightPrefix) {
+      return false;
+    }
+    if (left.isInline()) {
+      return left == right;
+    }
+    if (HashStringAllocator::headerOf(left.data())->size() < left.size()) {
+      return stringsEqualSlow<rightStored>(left, right);
+    }
+    if constexpr (rightStored) {
+      if (HashStringAllocator::headerOf(right.data())->size() < right.size()) {
+        return stringsEqualSlow<true>(left, right);
+      }
+    }
+    return left == right;
+  }
+
+  template <bool rightStored>
+  static bool stringsEqualSlow(StringView left, StringView right);
 
   int32_t compareComplexType(
       const char* row,
