@@ -142,6 +142,7 @@ set(
   SortBufferTest.cpp
   VectorHasherTest.cpp
   VectorHasherAdaptiveTest.cpp
+  HashBuildAdaptiveTest.cpp
   VectorHasherBatchReuseTest.cpp
   GroupingSetsBatchingTest.cpp
   # group7 (~449s): IndexLookupJoinTestExtra 188

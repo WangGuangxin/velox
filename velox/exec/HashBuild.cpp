@@ -72,7 +72,11 @@ HashBuild::HashBuild(
           driverCtx->queryConfig().joinBuildVectorHasherMaxNumDistinct()),
       adaptiveValueIdsEnabled_(
           driverCtx->queryConfig().hashJoinAdaptiveValueIdsEnabled() &&
-          !dropDuplicates_ && !joinNode_->isCountingJoin()),
+          // canDropDuplicates describes join semantics, not the build path.
+          // A zero threshold disables dedup and appends every build row.
+          (!dropDuplicates_ ||
+           driverCtx->queryConfig().abandonHashBuildDedupMinPct() == 0) &&
+          !joinNode_->isCountingJoin()),
       batchValueIdsEnabled_(
           driverCtx->queryConfig().hashJoinBatchValueIdsEnabled()),
       adaptiveValueIdsMinRows_(
