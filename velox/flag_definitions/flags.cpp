@@ -148,6 +148,10 @@ DEFINE_int32(
     300,
     "TPC-H DBGen text pool size in MB");
 
+DEFINE_bool(
+    velox_hash_join_head_chain_drain_enabled,
+    false,
+    "Drain a duplicate head chain without rescanning already buffered later chains");
 
 DEFINE_bool(
     velox_hash_join_fixed_width_output_enabled,

@@ -31,6 +31,7 @@
 #include <algorithm>
 
 DECLARE_bool(velox_hash_join_fixed_width_output_enabled);
+DECLARE_bool(velox_hash_join_head_chain_drain_enabled);
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -2226,6 +2227,8 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
   const int32_t aheadWindow =
       kDefaultPolicy ? JoinResultIterator::kAheadWindow : iter.aheadWindow;
   const bool prefetchEnabled = kDefaultPolicy || iter.prefetchEnabled;
+  const bool headChainDrainEnabled =
+      FLAGS_velox_hash_join_head_chain_drain_enabled;
   const auto numProbeRows = iter.rows->size();
   auto& walker = iter.walker;
   auto bufferedHitAt = [&](int32_t slot, int32_t position) -> char*& {
@@ -2295,6 +2298,34 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
 
     const int32_t numActive = walker.numActive;
     const int32_t slotHead = walker.slotHead;
+    // Once every later slot is full (or exhausted), its state cannot change
+    // until this head chain ends. Avoid rescanning those slots per result.
+    if (headChainDrainEnabled) {
+      bool laterSlotsReady = true;
+      for (int32_t i = slotHead + 1; i < numActive; ++i) {
+        if (walker.slotCursors[i] != nullptr &&
+            walker.bufferLength[i] < aheadWindow) {
+          laterSlotsReady = false;
+          break;
+        }
+      }
+      if (laterSlotsReady) {
+        const auto headRow = walker.slotProbeRows[slotHead];
+        do {
+          char* next = nextRow(headCursor);
+          if (prefetchEnabled && next != nullptr) {
+            __builtin_prefetch(next + nextOffset_);
+          }
+          walker.slotCursors[slotHead] = next;
+          if (!emit(headRow, headCursor)) {
+            return numOut;
+          }
+          headCursor = next;
+        } while (headCursor != nullptr);
+        ++walker.slotHead;
+        continue;
+      }
+    }
     if (prefetchEnabled) {
       for (int32_t i = slotHead; i < numActive; ++i) {
         char* cursor = walker.slotCursors[i];
