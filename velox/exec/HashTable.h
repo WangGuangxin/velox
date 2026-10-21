@@ -1054,7 +1054,7 @@ class HashTable : public BaseHashTable {
       folly::Range<char**> hits,
       uint64_t maxBytes);
 
-  template <bool kDefaultPolicy>
+  template <bool kDefaultPolicy, bool kCountBytes>
   int32_t listJoinResultsInterleavedImpl(
       JoinResultIterator& iter,
       bool includeMisses,

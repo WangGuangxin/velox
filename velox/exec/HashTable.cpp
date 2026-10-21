@@ -30,6 +30,8 @@
 
 #include <algorithm>
 
+DECLARE_bool(velox_hash_join_fixed_width_output_enabled);
+
 using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
@@ -2065,7 +2067,7 @@ namespace {
 // accounting, and returns true when more results can still fit. The size
 // of one hit is looked up via `sizeFunction` so this stays independent of the
 // HashTable template.
-template <typename SizeFunction>
+template <bool kCountBytes, typename SizeFunction>
 struct JoinResultEmitter {
   folly::Range<vector_size_t*> inputRows;
   folly::Range<char**> hits;
@@ -2078,16 +2080,21 @@ struct JoinResultEmitter {
   bool operator()(vector_size_t probeRow, char* hit) {
     inputRows[numOut] = probeRow; // NOLINT
     hits[numOut] = hit;
-    if (hit != nullptr) {
-      totalBytes += sizeFunction(hit);
+    if constexpr (kCountBytes) {
+      if (hit != nullptr) {
+        totalBytes += sizeFunction(hit);
+      }
     }
     ++numOut;
-    return numOut < maxOut && totalBytes < maxBytes;
+    if constexpr (kCountBytes) {
+      return numOut < maxOut && totalBytes < maxBytes;
+    }
+    return numOut < maxOut;
   }
 };
 
-template <typename SizeFunction>
-JoinResultEmitter<SizeFunction> makeJoinResultEmitter(
+template <bool kCountBytes = true, typename SizeFunction>
+JoinResultEmitter<kCountBytes, SizeFunction> makeJoinResultEmitter(
     folly::Range<vector_size_t*> inputRows,
     folly::Range<char**> hits,
     size_t& numOut,
@@ -2170,20 +2177,37 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleaved(
     folly::Range<vector_size_t*> inputRows,
     folly::Range<char**> hits,
     uint64_t maxBytes) {
-  if (iter.numParallelChains == JoinResultIterator::kNumParallelChains &&
+  const bool defaultPolicy =
+      iter.numParallelChains == JoinResultIterator::kNumParallelChains &&
       iter.aheadWindow == JoinResultIterator::kAheadWindow &&
-      iter.prefetchEnabled) {
-    // Keep constants in the default hot loop, including buffer stride and
-    // unconditional prefetch, instead of paying tuning costs per hit.
-    return listJoinResultsInterleavedImpl<true>(
+      iter.prefetchEnabled;
+  // In this case every hit has the same fixed width, and misses add no
+  // bytes. Division avoids overflow in the capacity * row-width bound.
+  const bool rowLimited = FLAGS_velox_hash_join_fixed_width_output_enabled &&
+      iter.varSizeListColumns.empty() && maxBytes > 0 &&
+      (!iter.estimatedRowSize.has_value() || *iter.estimatedRowSize >= 0) &&
+      (iter.estimatedRowSize.value_or(iter.fixedSizeListColumnsSizeSum) == 0 ||
+       inputRows.size() <= maxBytes /
+               iter.estimatedRowSize.value_or(
+                   iter.fixedSizeListColumnsSizeSum));
+  if (rowLimited) {
+    if (defaultPolicy) {
+      return listJoinResultsInterleavedImpl<true, false>(
+          iter, includeMisses, inputRows, hits, maxBytes);
+    }
+    return listJoinResultsInterleavedImpl<false, false>(
         iter, includeMisses, inputRows, hits, maxBytes);
   }
-  return listJoinResultsInterleavedImpl<false>(
+  if (defaultPolicy) {
+    return listJoinResultsInterleavedImpl<true, true>(
+        iter, includeMisses, inputRows, hits, maxBytes);
+  }
+  return listJoinResultsInterleavedImpl<false, true>(
       iter, includeMisses, inputRows, hits, maxBytes);
 }
 
 template <bool ignoreNullKeys>
-template <bool kDefaultPolicy>
+template <bool kDefaultPolicy, bool kCountBytes>
 int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
     JoinResultIterator& iter,
     bool includeMisses,
@@ -2208,7 +2232,7 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
     return walker.bufferData[slot * aheadWindow + position];
   };
 
-  auto emit = makeJoinResultEmitter(
+  auto emit = makeJoinResultEmitter<kCountBytes>(
       inputRows, hits, numOut, totalBytes, maxBytes, [&](char* hit) {
         return projectedRowSize(iter, hit);
       });

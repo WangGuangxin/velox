@@ -542,3 +542,7 @@ target_link_libraries(
 )
 
 velox_add_library(velox_aggregate_registry_util INTERFACE HEADERS AggregateRegistryTestUtil.h)
+
+add_executable(velox_hash_join_fixed_width_output_test HashJoinFixedWidthOutputTest.cpp)
+target_link_libraries(velox_hash_join_fixed_width_output_test velox_exec velox_vector_test_lib GTest::gtest GTest::gtest_main)
+add_test(velox_hash_join_fixed_width_output_test velox_hash_join_fixed_width_output_test)
