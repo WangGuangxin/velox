@@ -964,6 +964,23 @@ int32_t RowContainer::compareStringAsc(StringView left, StringView right) {
       .compare(HashStringAllocator::contiguousString(right, rightStorage));
 }
 
+template <bool rightStored>
+bool RowContainer::stringsEqualSlow(StringView left, StringView right) {
+  std::string leftStorage;
+  auto contiguousLeft =
+      HashStringAllocator::contiguousString(left, leftStorage);
+  if constexpr (rightStored) {
+    std::string rightStorage;
+    return contiguousLeft ==
+        HashStringAllocator::contiguousString(right, rightStorage);
+  } else {
+    return contiguousLeft == right;
+  }
+}
+
+template bool RowContainer::stringsEqualSlow<false>(StringView, StringView);
+template bool RowContainer::stringsEqualSlow<true>(StringView, StringView);
+
 int32_t RowContainer::compareComplexType(
     const char* left,
     const char* right,

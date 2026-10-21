@@ -391,7 +391,12 @@ bool HashTable<ignoreNullKeys>::compareKeys(
   auto numKeys = hashers_.size();
   int32_t i = 0;
   do {
-    if (rows_->compare(group, inserted, i, CompareFlags{true, true})) {
+    if (rows_->compare(
+            group,
+            inserted,
+            i,
+            CompareFlags::equality(
+                CompareFlags::NullHandlingMode::kNullAsValue))) {
       return false;
     }
   } while (++i < numKeys);

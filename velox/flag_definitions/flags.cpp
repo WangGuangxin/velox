@@ -35,6 +35,14 @@ DEFINE_bool(
     "Batch RowContainer string extraction into output-owned buffers; set only "
     "during process initialization");
 
+// Used in exec/RowContainer.cpp. Configure before starting worker threads.
+DEFINE_bool(
+    velox_row_container_string_equality_enabled,
+    false,
+    "Use cached size/prefix and equality comparison for RowContainer string "
+    "keys; set only during process initialization");
+
+
 // Used in common/base/VeloxException.cpp
 DEFINE_bool(
     velox_exception_user_stacktrace_enabled,

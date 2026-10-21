@@ -58,6 +58,149 @@ class RowContainerBatchStringTest : public testing::Test,
   }
 };
 
+TEST_F(RowContainerBatchStringTest, equalityAndOrdering) {
+  gflags::FlagSaver savedFlags;
+  std::vector<std::optional<std::string>> values{
+      std::nullopt,
+      "",
+      "a",
+      "abcd",
+      "abcdefghijkl",
+      "abcdefghijklm",
+      "abcdefghijklN",
+      "different-prefix-long",
+      std::string("abcd\0abcdefghi", 14),
+      std::string("abcd\0abcdefghj", 14),
+      "\xE4\xB8\xAD\xE6\x96\x87-long-key",
+      std::string(8192, 'x')};
+  for (const auto& type : std::vector<TypePtr>{VARCHAR(), VARBINARY()}) {
+    auto data = container(type, true);
+    auto input = BaseVector::create<FlatVector<StringView>>(
+        type, values.size(), pool_.get());
+    for (vector_size_t i = 0; i < values.size(); ++i) {
+      if (values[i]) {
+        input->set(i, StringView(*values[i]));
+      } else {
+        input->setNull(i, true);
+      }
+    }
+    SelectivityVector all(values.size());
+    DecodedVector decoded(*input, all);
+    std::vector<char*> rows(values.size());
+    for (vector_size_t i = 0; i < values.size(); ++i) {
+      rows[i] = data->newRow();
+      data->store(decoded, i, rows[i], 0);
+    }
+    auto indices = makeIndices(
+        values.size(), [&](auto i) { return values.size() - 1 - i; });
+    auto dictionary =
+        BaseVector::wrapInDictionary(nullptr, indices, values.size(), input);
+    auto constant = BaseVector::wrapInConstant(values.size(), 5, input);
+    for (const auto& vector :
+         std::vector<VectorPtr>{input, dictionary, constant}) {
+      DecodedVector encoded(*vector, all);
+      for (bool ascending : {false, true}) {
+        for (bool nullsFirst : {false, true}) {
+          CompareFlags flags{nullsFirst, ascending};
+          for (bool equalsOnly : {false, true}) {
+            flags.equalsOnly = equalsOnly;
+            for (vector_size_t i = 0; i < values.size(); ++i) {
+              for (vector_size_t j = 0; j < values.size(); ++j) {
+                FLAGS_velox_row_container_string_equality_enabled = false;
+                auto legacy = data->compare(
+                    rows[i], data->columnAt(0), encoded, j, flags);
+                auto legacyStored = data->compare(rows[i], rows[j], 0, flags);
+                FLAGS_velox_row_container_string_equality_enabled = true;
+                auto fast = data->compare(
+                    rows[i], data->columnAt(0), encoded, j, flags);
+                auto fastStored = data->compare(rows[i], rows[j], 0, flags);
+                if (equalsOnly) {
+                  EXPECT_EQ(legacy == 0, fast == 0);
+                  EXPECT_EQ(legacyStored == 0, fastStored == 0);
+                } else {
+                  EXPECT_EQ(legacy, fast);
+                  EXPECT_EQ(legacyStored, fastStored);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    // No-null dispatch is used by joins which reject null keys.
+    auto equality =
+        CompareFlags::equality(CompareFlags::NullHandlingMode::kNullAsValue);
+    for (vector_size_t i = 1; i < values.size(); ++i) {
+      EXPECT_EQ(
+          data->compare<false>(
+              rows[i], data->columnAt(0), decoded, i, equality),
+          0);
+    }
+  }
+}
+
+TEST_F(RowContainerBatchStringTest, equalityOfFragmentedPayloads) {
+  gflags::FlagSaver savedFlags;
+  FLAGS_velox_row_container_string_equality_enabled = true;
+  for (const auto& type : std::vector<TypePtr>{VARCHAR(), VARBINARY()}) {
+    auto data = container(type, false);
+    // Exceed even a two-MiB allocator slab so newWrite cannot happen to
+    // satisfy the fixture contiguously from a large free block.
+    std::string bytes(4 * 1024 * 1024 + 3, 'x');
+    bytes[90000] = '\0';
+    auto unequal = bytes;
+    unequal.back() = 'z';
+    auto input =
+        BaseVector::create<FlatVector<StringView>>(type, 3, pool_.get());
+    input->set(0, StringView(bytes));
+    input->set(1, StringView(unequal));
+    input->set(2, StringView(bytes));
+    SelectivityVector all(3);
+    DecodedVector decoded(*input, all);
+    auto initial =
+        BaseVector::create<FlatVector<StringView>>(type, 1, pool_.get());
+    initial->set(0, StringView("inline"));
+    SelectivityVector initialRow(1);
+    DecodedVector initialDecoded(*initial, initialRow);
+    std::vector<char*> rows(3);
+    for (int i = 0; i < 3; ++i) {
+      rows[i] = data->newRow();
+      data->store(initialDecoded, 0, rows[i], 0);
+      const auto& source = i == 1 ? unequal : bytes;
+      ByteOutputStream stream(&data->stringAllocator(), false, false);
+      auto position = data->stringAllocator().newWrite(stream, 32);
+      stream.appendStringView(StringView(source));
+      data->stringAllocator().finishWrite(stream, 0);
+      StringView fragmented(position.position, source.size());
+      ASSERT_LT(
+          HashStringAllocator::headerOf(fragmented.data())->size(),
+          fragmented.size());
+      std::memcpy(
+          rows[i] + data->columnAt(0).offset(),
+          &fragmented,
+          sizeof(fragmented));
+    }
+    auto equality =
+        CompareFlags::equality(CompareFlags::NullHandlingMode::kNullAsValue);
+    for (int i = 0; i < 3; ++i) {
+      for (int j = 0; j < 3; ++j) {
+        EXPECT_EQ(
+            data->compare(rows[i], data->columnAt(0), decoded, j, equality) ==
+                0,
+            (i == 1) == (j == 1));
+        EXPECT_EQ(
+            data->compare(rows[i], rows[j], 0, equality) == 0,
+            (i == 1) == (j == 1));
+      }
+    }
+    // One contiguous stored string on either side must also be handled.
+    auto* contiguous = data->newRow();
+    data->store(decoded, 0, contiguous, 0);
+    EXPECT_EQ(data->compare(contiguous, rows[0], 0, equality), 0);
+    EXPECT_EQ(data->compare(rows[0], contiguous, 0, equality), 0);
+  }
+}
+
 TEST_F(RowContainerBatchStringTest, offsetsSelectionsNullsAndOwnership) {
   gflags::FlagSaver savedFlags;
   std::vector<VectorPtr> legacyResults, batchResults;
