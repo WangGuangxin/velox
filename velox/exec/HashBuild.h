@@ -295,6 +295,8 @@ class HashBuild final : public Operator {
   // and counting builds retain their existing group-probe analysis.
   const bool adaptiveValueIdsEnabled_;
   const bool batchValueIdsEnabled_;
+  const bool batchStoreEnabled_;
+  BufferPtr batchStoreRows_;
   const uint32_t adaptiveValueIdsMinRows_;
   const uint32_t adaptiveValueIdsMinDistinctPct_;
 

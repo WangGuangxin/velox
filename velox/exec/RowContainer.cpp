@@ -45,7 +45,8 @@ static int32_t typeKindSize(TypeKind kind) {
 __attribute__((__no_sanitize__("thread")))
 #endif
 #endif
-inline void setBit(char* bits, uint32_t idx) {
+inline void
+setBit(char* bits, uint32_t idx) {
   auto bitsAs8Bit = reinterpret_cast<uint8_t*>(bits);
   bitsAs8Bit[idx / 8] |= (1 << (idx % 8));
 }
@@ -566,6 +567,19 @@ void RowContainer::store(
     folly::Range<char**> rows,
     int32_t column) {
   VELOX_CHECK_GE(decoded.size(), rows.size());
+  switch (typeKinds_[column]) {
+    case TypeKind::ARRAY:
+    case TypeKind::MAP:
+    case TypeKind::ROW:
+    case TypeKind::OPAQUE:
+    case TypeKind::UNKNOWN:
+      for (int32_t row = 0; row < rows.size(); ++row) {
+        store(decoded, row, rows[row], column);
+      }
+      return;
+    default:
+      break;
+  }
   const bool isKey = column < keyTypes_.size();
   if ((isKey && !nullableKeys_) || !decoded.mayHaveNulls()) {
     VELOX_DYNAMIC_TYPE_DISPATCH(

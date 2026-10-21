@@ -199,6 +199,26 @@ class RowColumn {
       ++nullCount_;
     }
 
+    // Equivalent to repeated addCellSize/addNullCell for a fixed-width column.
+    void addFixedWidthCells(
+        int32_t bytes,
+        uint32_t nonNullCount,
+        uint32_t nullCount = 0) {
+      nullCount_ += nullCount;
+      if (nonNullCount == 0) {
+        return;
+      }
+      if (nonNullCount_ == 0) {
+        minBytes_ = bytes;
+        maxBytes_ = bytes;
+      } else {
+        minBytes_ = std::min(minBytes_, bytes);
+        maxBytes_ = std::max(maxBytes_, bytes);
+      }
+      sumBytes_ += static_cast<uint64_t>(bytes) * nonNullCount;
+      nonNullCount_ += nonNullCount;
+    }
+
     void removeOrUpdateCellStats(int32_t bytes, bool wasNull, bool setToNull);
 
     int32_t maxBytes() const {
@@ -617,7 +637,8 @@ class RowContainer {
   __attribute__((__no_sanitize__("thread")))
 #endif
 #endif
-  int32_t listRows(
+  int32_t
+  listRows(
       RowContainerIterator* iter,
       int32_t maxRows,
       uint64_t maxBytes,
@@ -646,10 +667,8 @@ class RowContainer {
         // the target lies past the current range; the hint itself is
         // non-faulting for an invalid target on x86.
         if constexpr (prefetchDistanceBytes > 0) {
-          __builtin_prefetch(
-              reinterpret_cast<const char*>(
-                  reinterpret_cast<uintptr_t>(data) + row +
-                  prefetchDistanceBytes));
+          __builtin_prefetch(reinterpret_cast<const char*>(
+              reinterpret_cast<uintptr_t>(data) + row + prefetchDistanceBytes));
         }
 #endif
         rows[count++] = data + row +
@@ -740,7 +759,8 @@ class RowContainer {
   __attribute__((__no_sanitize__("thread")))
 #endif
 #endif
-  void setProbedFlag(char** rows, int32_t numRows);
+  void
+  setProbedFlag(char** rows, int32_t numRows);
 
   /// Sets 'probed' flag for a single non-null row. Returns true if the flag
   /// transitioned from false to true.
@@ -749,7 +769,8 @@ class RowContainer {
   __attribute__((__no_sanitize__("thread")))
 #endif
 #endif
-  bool testAndSetProbedFlag(char* row);
+  bool
+  testAndSetProbedFlag(char* row);
 
   /// Compares the value at 'column' in 'row' with the value at 'index' in
   /// 'decoded'. Returns 0 for equal, < 0 for 'row' < 'decoded', > 0 otherwise.
@@ -1176,6 +1197,19 @@ class RowContainer {
       int32_t nullByte,
       uint8_t nullMask,
       int32_t column) {
+    if (rowColumnsStats_.empty() || types_[column]->isFixedWidth()) {
+      uint32_t nulls = 0;
+      for (int32_t i = 0; i < rows.size(); ++i) {
+        storeWithNulls<Kind>(
+            decoded, i, isKey, rows[i], offset, nullByte, nullMask, column);
+        nulls += decoded.isNullAt(i);
+      }
+      if (!rowColumnsStats_.empty()) {
+        rowColumnsStats_[column].addFixedWidthCells(
+            fixedSizeAt(column), rows.size() - nulls, nulls);
+      }
+      return;
+    }
     for (int32_t i = 0; i < rows.size(); ++i) {
       storeWithNulls<Kind>(
           decoded, i, isKey, rows[i], offset, nullByte, nullMask, column);
@@ -1190,6 +1224,16 @@ class RowContainer {
       bool isKey,
       int32_t offset,
       int32_t column) {
+    if (rowColumnsStats_.empty() || types_[column]->isFixedWidth()) {
+      for (int32_t i = 0; i < rows.size(); ++i) {
+        storeNoNulls<Kind>(decoded, i, isKey, rows[i], offset);
+      }
+      if (!rowColumnsStats_.empty()) {
+        rowColumnsStats_[column].addFixedWidthCells(
+            fixedSizeAt(column), rows.size());
+      }
+      return;
+    }
     for (int32_t i = 0; i < rows.size(); ++i) {
       storeNoNulls<Kind>(decoded, i, isKey, rows[i], offset);
       updateColumnStats(decoded, i, rows[i], column);

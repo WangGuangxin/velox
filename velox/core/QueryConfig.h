@@ -142,6 +142,14 @@ class QueryConfig {
       "Reuse repeated key value IDs during hash build, including deduplicating builds.")
 
   VELOX_QUERY_CONFIG(
+      kHashBuildBatchStoreEnabled,
+      hashBuildBatchStoreEnabled,
+      "hash_build_batch_store_enabled",
+      bool,
+      false,
+      "Store dense append-only hash build input one column at a time.")
+
+  VELOX_QUERY_CONFIG(
       kGroupingSetsBatchingEnabled,
       groupingSetsBatchingEnabled,
       "grouping_sets_batching_enabled",
@@ -1725,6 +1733,11 @@ class QueryConfig {
       std::unordered_map<std::string, std::string>&& values);
 
   std::unordered_map<std::string, std::string> rawConfigsCopy() const;
+
+
+
+
+
 
  private:
   void validateConfig();

@@ -79,6 +79,7 @@ HashBuild::HashBuild(
           !joinNode_->isCountingJoin()),
       batchValueIdsEnabled_(
           driverCtx->queryConfig().hashJoinBatchValueIdsEnabled()),
+      batchStoreEnabled_(driverCtx->queryConfig().hashBuildBatchStoreEnabled()),
       adaptiveValueIdsMinRows_(
           driverCtx->queryConfig().hashJoinAdaptiveValueIdsMinRows()),
       adaptiveValueIdsMinDistinctPct_(
@@ -663,6 +664,44 @@ void HashBuild::addInput(RowVectorPtr input) {
   if (isInputFromSpill() && needProbedFlagSpill_) {
     spillProbedFlagVector =
         input->childAt(spillProbedFlagChannel_)->asFlatVector<bool>();
+  }
+
+  if (batchStoreEnabled_ && activeRows_.isAllSelected() &&
+      activeRows_.end() >= 32) {
+    const auto count = activeRows_.end();
+    if (!batchStoreRows_ ||
+        batchStoreRows_->capacity() < count * sizeof(char*)) {
+      batchStoreRows_ = AlignedBuffer::allocate<char*>(count, pool());
+    }
+    auto* destinations = batchStoreRows_->asMutable<char*>();
+    for (vector_size_t row = 0; row < count; ++row) {
+      destinations[row] = rows->newRow();
+      if (nextOffset) {
+        *reinterpret_cast<char**>(destinations[row] + nextOffset) = nullptr;
+      }
+    }
+    const auto range = folly::Range<char**>(destinations, count);
+    for (auto i = 0; i < hashers.size(); ++i) {
+      rows->store(hashers[i]->decodedVector(), range, i);
+    }
+    for (auto i = 0; i < dependentChannels_.size(); ++i) {
+      rows->store(*decoders_[i], range, i + hashers.size());
+    }
+    if (spillProbedFlagVector != nullptr) {
+      for (vector_size_t row = 0; row < count; ++row) {
+        VELOX_CHECK(!spillProbedFlagVector->isNullAt(row));
+        if (spillProbedFlagVector->valueAt(row)) {
+          rows->setProbedFlag(destinations + row, 1);
+        }
+      }
+    }
+    addRuntimeStat("hashBuildBatchStoredRows", RuntimeCounter(count));
+    return;
+  }
+  if (batchStoreEnabled_) {
+    addRuntimeStat(
+        "hashBuildScalarStoredRows",
+        RuntimeCounter(activeRows_.countSelected()));
   }
 
   activeRows_.applyToSelected([&](auto rowIndex) {
@@ -1544,6 +1583,7 @@ void HashBuild::close() {
     joinBridge_.reset();
     spiller_.reset();
     table_.reset();
+    batchStoreRows_.reset();
   }
 
   // Release the entry here rather than at operator destruction:
