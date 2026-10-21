@@ -18,6 +18,9 @@
 
 #include <array>
 #include <cstring>
+#include <type_traits>
+
+DECLARE_bool(velox_row_container_string_extraction_prefetch_enabled);
 
 #include "velox/common/memory/RawVector.h"
 #include "velox/exec/Aggregate.h"
@@ -838,55 +841,82 @@ void RowContainer::extractStringsBatch(
     nulls = result->mutableNulls(maxRows, true)->asMutable<uint64_t>();
   }
   const bool useRowNumbers = !rowNumbers.empty();
-  for (int32_t begin = 0; begin < numRows;) {
-    int32_t count = 0;
-    int32_t numStrings = 0;
-    size_t bytes = 0;
-    do {
-      const auto input = begin + count;
-      const auto number = useRowNumbers ? rowNumbers[input] : input;
-      const auto* row = number >= 0 ? rows[number] : nullptr;
-      const auto output = resultOffset + input;
-      if (row != nullptr &&
-          (nullMask == 0 || !isNullAt(row, nullByte, nullMask))) {
-        if (nulls != nullptr) {
-          bits::setNull(nulls, output, false);
+  // Dispatch once so the disabled loop contains no per-row flag checks.
+  auto extract = [&](auto prefetchEnabled) {
+    for (int32_t begin = 0; begin < numRows;) {
+      int32_t count = 0;
+      int32_t numStrings = 0;
+      size_t bytes = 0;
+      do {
+        const auto input = begin + count;
+        if constexpr (decltype(prefetchEnabled)::value) {
+          constexpr int32_t kRowLookahead = 32;
+          if (input + kRowLookahead < numRows) {
+            const auto futureNumber = useRowNumbers
+                ? rowNumbers[input + kRowLookahead]
+                : input + kRowLookahead;
+            const auto* futureRow =
+                futureNumber >= 0 ? rows[futureNumber] : nullptr;
+            if (futureRow != nullptr) {
+              __builtin_prefetch(futureRow + offset, 0, 3);
+            }
+          }
         }
-        const auto value = valueAt<StringView>(row, offset);
-        if (value.isInline()) {
-          values[output] = value;
+        const auto number = useRowNumbers ? rowNumbers[input] : input;
+        const auto* row = number >= 0 ? rows[number] : nullptr;
+        const auto output = resultOffset + input;
+        if (row != nullptr &&
+            (nullMask == 0 || !isNullAt(row, nullByte, nullMask))) {
+          if (nulls != nullptr) {
+            bits::setNull(nulls, output, false);
+          }
+          const auto value = valueAt<StringView>(row, offset);
+          if (value.isInline()) {
+            values[output] = value;
+          } else {
+            if constexpr (decltype(prefetchEnabled)::value) {
+              // This allocator header is valid even for fragmented strings.
+              // Do not form addresses beyond the first contiguous fragment.
+              __builtin_prefetch(
+                  HashStringAllocator::headerOf(value.data()), 0, 3);
+            }
+            strings[numStrings] = value;
+            outputRows[numStrings++] = output;
+            bytes += value.size();
+          }
         } else {
-          strings[numStrings] = value;
-          outputRows[numStrings++] = output;
-          bytes += value.size();
+          if (nulls == nullptr) {
+            nulls = result->mutableNulls(maxRows, true)->asMutable<uint64_t>();
+          }
+          bits::setNull(nulls, output, true);
         }
-      } else {
-        if (nulls == nullptr) {
-          nulls = result->mutableNulls(maxRows, true)->asMutable<uint64_t>();
-        }
-        bits::setNull(nulls, output, true);
-      }
-      ++count;
-    } while (count < kBlockRows && begin + count < numRows &&
-             bytes < kBlockBytes);
+        ++count;
+      } while (count < kBlockRows && begin + count < numRows &&
+               bytes < kBlockBytes);
 
-    // Reserve only non-inline payload bytes. An individual large value may
-    // exceed the block byte target. Inline values need no second pass.
-    auto* cursor =
-        bytes == 0 ? nullptr : result->getRawStringBufferWithSpace(bytes);
-    for (int32_t i = 0; i < numStrings; ++i) {
-      const auto value = strings[i];
-      auto* header = HashStringAllocator::headerOf(value.data());
-      if (header->size() >= value.size()) {
-        std::memcpy(cursor, value.data(), value.size());
-      } else {
-        HashStringAllocator::InputStream stream(header);
-        stream.ByteInputStream::readBytes(cursor, value.size());
+      // Reserve only non-inline payload bytes. An individual large value may
+      // exceed the block byte target. Inline values need no second pass.
+      auto* cursor =
+          bytes == 0 ? nullptr : result->getRawStringBufferWithSpace(bytes);
+      for (int32_t i = 0; i < numStrings; ++i) {
+        const auto value = strings[i];
+        auto* header = HashStringAllocator::headerOf(value.data());
+        if (header->size() >= value.size()) {
+          std::memcpy(cursor, value.data(), value.size());
+        } else {
+          HashStringAllocator::InputStream stream(header);
+          stream.ByteInputStream::readBytes(cursor, value.size());
+        }
+        values[outputRows[i]] = StringView(cursor, value.size());
+        cursor += value.size();
       }
-      values[outputRows[i]] = StringView(cursor, value.size());
-      cursor += value.size();
+      begin += count;
     }
-    begin += count;
+  };
+  if (FLAGS_velox_row_container_string_extraction_prefetch_enabled) {
+    extract(std::true_type{});
+  } else {
+    extract(std::false_type{});
   }
 }
 

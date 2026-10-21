@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <cstring>
 
+DECLARE_bool(velox_row_container_string_extraction_prefetch_enabled);
+
 namespace facebook::velox::exec::test {
 using velox::test::assertEqualVectors;
 
@@ -410,5 +412,86 @@ TEST_F(RowContainerBatchStringTest, freshNullBitmapAndSharedOutputBuffers) {
   EXPECT_EQ(
       flat->valueAt(17),
       StringView("different long payload for the reused output"));
+}
+TEST_F(
+    RowContainerBatchStringTest,
+    prefetchPreservesSelectionsFragmentationAndOwnership) {
+  gflags::FlagSaver savedFlags;
+  FLAGS_velox_row_container_batch_string_extraction_enabled = true;
+  constexpr vector_size_t count = 513;
+  for (const auto& type : std::vector<TypePtr>{VARCHAR(), VARBINARY()}) {
+    auto data = container(type, true);
+    auto input =
+        BaseVector::create<FlatVector<StringView>>(type, count, pool_.get());
+    for (vector_size_t i = 0; i < count; ++i) {
+      std::string bytes(i % 3 == 0 ? 4 : 257, 'a' + i % 20);
+      bytes[1] = '\0';
+      input->set(i, StringView(bytes));
+      if (i % 11 == 0) {
+        input->setNull(i, true);
+      }
+    }
+    SelectivityVector all(count);
+    DecodedVector decoded(*input, all);
+    std::vector<char*> rows(count);
+    for (vector_size_t i = 0; i < count; ++i) {
+      rows[i] = data->newRow();
+      data->store(decoded, i, rows[i], 0);
+    }
+    std::string large(200003, 'x');
+    large[100000] = '\0';
+    ByteOutputStream stream(&data->stringAllocator(), false, false);
+    auto position = data->stringAllocator().newWrite(stream, 32);
+    stream.appendStringView(StringView(large));
+    data->stringAllocator().finishWrite(stream, 0);
+    StringView fragmented(position.position, large.size());
+    ASSERT_LT(
+        HashStringAllocator::headerOf(fragmented.data())->size(),
+        fragmented.size());
+    std::memcpy(
+        rows[1] + data->columnAt(0).offset(), &fragmented, sizeof(fragmented));
+    rows[17] = nullptr;
+    std::vector<vector_size_t> selection(count);
+    for (vector_size_t i = 0; i < count; ++i) {
+      selection[i] = i % 13 == 0 ? -1 : count - 1 - i;
+    }
+    std::vector<VectorPtr> results;
+    for (bool indexed : {false, true}) {
+      auto off = output(type, count + 9);
+      auto on = output(type, count + 9);
+      auto alias = on->as<FlatVector<StringView>>()->values();
+      for (bool enabled : {false, true}) {
+        FLAGS_velox_row_container_string_extraction_prefetch_enabled = enabled;
+        auto& result = enabled ? on : off;
+        if (indexed) {
+          RowContainer::extractColumn(
+              rows.data(),
+              folly::Range<const vector_size_t*>(selection.data(), count),
+              data->columnAt(0),
+              data->columnHasNulls(0),
+              4,
+              result);
+        } else {
+          RowContainer::extractColumn(
+              rows.data(),
+              count,
+              data->columnAt(0),
+              data->columnHasNulls(0),
+              4,
+              result);
+        }
+      }
+      assertEqualVectors(off, on);
+      EXPECT_EQ(
+          alias->as<StringView>()[4], StringView("untouched-output-value"));
+      results.push_back(off);
+      results.push_back(on);
+    }
+    data.reset();
+    input.reset();
+    for (int i = 0; i < results.size(); i += 2) {
+      assertEqualVectors(results[i], results[i + 1]);
+    }
+  }
 }
 } // namespace facebook::velox::exec::test
