@@ -32,6 +32,9 @@
 
 DECLARE_bool(velox_hash_join_fixed_width_output_enabled);
 DECLARE_bool(velox_hash_join_head_chain_drain_enabled);
+DECLARE_bool(velox_hash_join_compact_chains_enabled);
+DECLARE_int64(velox_hash_join_compact_chains_max_bytes);
+DECLARE_bool(velox_hash_join_estimated_width_output_enabled);
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -50,6 +53,69 @@ std::string BaseHashTable::modeString(HashMode mode) {
       return fmt::format(
           "Unknown HashTable mode:{}", static_cast<int32_t>(mode));
   }
+}
+
+template <bool ignoreNullKeys>
+struct HashTable<ignoreNullKeys>::CompactJoinChains {
+  struct Entry {
+    char* head;
+    uint64_t offset;
+    uint64_t count;
+  };
+  explicit CompactJoinChains(memory::MemoryPool* pool)
+      : entries(memory::StlAllocator<Entry>(pool)),
+        rows(memory::StlAllocator<char*>(pool)) {}
+  std::vector<Entry, memory::StlAllocator<Entry>> entries;
+  std::vector<char*, memory::StlAllocator<char*>> rows;
+  mutable std::atomic<uint64_t> bulkRows{0};
+  uint64_t totalHeads{0};
+
+  uint64_t allocatedBytes() const {
+    return sizeof(*this) + entries.capacity() * sizeof(Entry) +
+        rows.capacity() * sizeof(char*);
+  }
+
+  std::pair<char**, char**> find(char* head) {
+    const auto found = std::lower_bound(
+        entries.begin(),
+        entries.end(),
+        head,
+        [](const Entry& entry, char* key) {
+          return std::less<char*>{}(entry.head, key);
+        });
+    if (found == entries.end() || found->head != head) {
+      return {nullptr, nullptr};
+    }
+    return {
+        rows.data() + found->offset,
+        rows.data() + found->offset + found->count};
+  }
+};
+
+template <bool ignoreNullKeys>
+HashTable<ignoreNullKeys>::~HashTable() = default;
+
+template <bool ignoreNullKeys>
+uint64_t HashTable<ignoreNullKeys>::compactJoinAllocatedBytes() const {
+  return compactJoinChains_ ? compactJoinChains_->allocatedBytes() : 0;
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::addCompactJoinStats(
+    std::unordered_map<std::string, RuntimeMetric>& stats) const {
+  if (!compactJoinChains_) {
+    return;
+  }
+  stats["hashtable.compactJoinChains"] =
+      RuntimeMetric(compactJoinChains_->entries.size());
+  stats["hashtable.compactJoinRows"] =
+      RuntimeMetric(compactJoinChains_->rows.size());
+  stats["hashtable.compactJoinHeadCount"] =
+      RuntimeMetric(compactJoinChains_->totalHeads);
+  stats["hashtable.compactJoinBytes"] = RuntimeMetric(
+      compactJoinChains_->allocatedBytes(), RuntimeCounter::Unit::kBytes);
+  stats["hashtable.compactJoinSharedBulkRows"] = RuntimeMetric(
+      compactJoinChains_->bulkRows.load(std::memory_order_relaxed));
 }
 
 template <bool ignoreNullKeys>
@@ -314,6 +380,121 @@ class ProbeState {
   // the table.
   uint8_t indexInTags_ = kNotSet;
 };
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::buildCompactJoinChains() {
+  compactJoinChains_.reset();
+  const auto budget = FLAGS_velox_hash_join_compact_chains_max_bytes;
+  if (!FLAGS_velox_hash_join_compact_chains_enabled || budget <= 0 ||
+      !isJoinBuild_ || !hasDuplicates_ || nextOffset_ <= 0 ||
+      numDistinct_ == 0) {
+    return;
+  }
+  uint64_t totalRows = rows_->numRows();
+  for (const auto& other : otherTables_) {
+    totalRows += other->rows_->numRows();
+  }
+  if (totalRows < 16 || totalRows > budget / sizeof(char*)) {
+    return;
+  }
+  auto forEachHead = [&](auto&& visitor) {
+    if (hashMode_ == HashMode::kArray) {
+      for (uint64_t i = 0; i < capacity_; ++i) {
+        if (auto* head = table_[i]) {
+          visitor(head);
+        }
+      }
+    } else {
+      for (int64_t offset = 0; offset <= sizeMask_; offset += kBucketSize) {
+        auto* bucket = bucketAt(offset);
+        for (int32_t slot = 0; slot < sizeof(TagVector); ++slot) {
+          const auto tag = bucket->tagAt(slot);
+          if (tag != ProbeState::kEmptyTag &&
+              tag != ProbeState::kTombstoneTag) {
+            visitor(bucket->pointerAt(slot));
+          }
+        }
+      }
+    }
+  };
+  // prepareJoinTable seeds numDistinct_ with the build row count. It is not
+  // the number of occupied slots when duplicates are allowed: count actual
+  // chain heads instead, both for density and for index allocation.
+  uint64_t numHeads = 0;
+  forEachHead([&](char*) { ++numHeads; });
+  if (numHeads == 0 || totalRows / numHeads < 4) {
+    return;
+  }
+  // Avoid work for mostly unique build sides. This conservative upper bound
+  // includes every row pointer and every possible index entry, not just long
+  // chains, so optional construction never grows beyond its explicit cap.
+  using Entry = typename CompactJoinChains::Entry;
+  const uint64_t upperBytes = sizeof(CompactJoinChains) +
+      totalRows * sizeof(char*) + numHeads * sizeof(Entry);
+  if (upperBytes > budget ||
+      upperBytes >
+          std::max<int64_t>(
+              0, pool_->root()->maxCapacity() - pool_->root()->usedBytes())) {
+    return;
+  }
+  // Gluten's root capacity is a current grant which grows on demand, not the
+  // task limit. Request this bounded optional reservation through the normal
+  // arbitrator/listener so Spark's existing memory budget is still enforced.
+  // maybeReserve returns false on ordinary admission failure, but propagates
+  // an aborted pool rather than proceeding with potentially reclaimed rows.
+  if (!pool_->maybeReserve(upperBytes)) {
+    return;
+  }
+  const auto releaseReservation = folly::makeGuard([&]() { pool_->release(); });
+  try {
+    auto compact = std::make_unique<CompactJoinChains>(pool_);
+    compact->totalHeads = numHeads;
+    compact->entries.reserve(numHeads);
+    uint64_t numPointers = 0;
+    auto consider = [&](char* head) {
+      if (!head) {
+        return;
+      }
+      uint64_t count = 0;
+      for (auto* row = head; row; row = nextRow(row)) {
+        ++count;
+      }
+      if (count >= 16) {
+        compact->entries.push_back({head, numPointers, count});
+        numPointers += count;
+      }
+    };
+    forEachHead(consider);
+    if (compact->entries.empty()) {
+      return;
+    }
+    compact->rows.resize(numPointers);
+    if (compact->allocatedBytes() > budget) {
+      return;
+    }
+    for (const auto& entry : compact->entries) {
+      auto* row = entry.head;
+      for (uint64_t i = 0; i < entry.count; ++i) {
+        compact->rows[entry.offset + i] = row;
+        row = nextRow(row);
+      }
+      VELOX_DCHECK_NULL(row);
+    }
+    std::sort(
+        compact->entries.begin(),
+        compact->entries.end(),
+        [](const Entry& a, const Entry& b) {
+          return std::less<char*>{}(a.head, b.head);
+        });
+    compactJoinChains_ = std::move(compact);
+  } catch (const VeloxException& e) {
+    if (e.errorCode() != error_code::kMemCapExceeded) {
+      throw;
+    }
+    // This optional index is not required for correctness. The linked rows
+    // and the published hash table remain untouched on allocation failure.
+  }
+}
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::storeKeys(
@@ -733,6 +914,7 @@ void HashTable<ignoreNullKeys>::allocateTables(
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::clear(bool freeTable) {
+  compactJoinChains_.reset();
   for (auto* rowContainer : allRows()) {
     rowContainer->clear();
   }
@@ -1523,6 +1705,7 @@ template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::rehash(
     bool initNormalizedKeys,
     int8_t spillInputStartPartitionBit) {
+  compactJoinChains_.reset();
   ++numRehashes_;
   if (canApplyParallelJoinBuild()) {
     parallelJoinBuild();
@@ -1582,6 +1765,7 @@ void HashTable<ignoreNullKeys>::setHashMode(
     HashMode mode,
     int32_t numNew,
     int8_t spillInputStartPartitionBit) {
+  compactJoinChains_.reset();
   VELOX_CHECK_NE(hashMode_, HashMode::kHash);
   TestValue::adjust("facebook::velox::exec::HashTable::setHashMode", &mode);
   if (mode == HashMode::kArray) {
@@ -1974,6 +2158,7 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
     size_t vectorHasherMaxNumDistinct,
     bool dropDuplicates,
     folly::Executor* executor) {
+  compactJoinChains_.reset();
   buildExecutor_ = executor;
   if (dropDuplicates) {
     if (table_ != nullptr) {
@@ -1990,6 +2175,9 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
   for (auto& table : tables) {
     otherTables_.emplace_back(std::unique_ptr<HashTable<ignoreNullKeys>>(
         dynamic_cast<HashTable<ignoreNullKeys>*>(table.release())));
+    // Incoming tables normally contain only accumulated rows. Also handle a
+    // previously prepared table: the merge is about to rebuild its row links.
+    otherTables_.back()->compactJoinChains_.reset();
   }
 
   // If there are multiple tables, we need to merge the 'columnHasNulls' flags
@@ -2047,6 +2235,7 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
   } else {
     decideHashMode(0, spillInputStartPartitionBit);
   }
+  buildCompactJoinChains();
 }
 
 template <bool ignoreNullKeys>
@@ -2185,7 +2374,10 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleaved(
   // In this case every hit has the same fixed width, and misses add no
   // bytes. Division avoids overflow in the capacity * row-width bound.
   const bool rowLimited = FLAGS_velox_hash_join_fixed_width_output_enabled &&
-      iter.varSizeListColumns.empty() && maxBytes > 0 &&
+      (iter.varSizeListColumns.empty() ||
+       (FLAGS_velox_hash_join_estimated_width_output_enabled &&
+        iter.estimatedRowSize.has_value())) &&
+      maxBytes > 0 &&
       (!iter.estimatedRowSize.has_value() || *iter.estimatedRowSize >= 0) &&
       (iter.estimatedRowSize.value_or(iter.fixedSizeListColumnsSizeSum) == 0 ||
        inputRows.size() <= maxBytes /
@@ -2193,14 +2385,30 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleaved(
                    iter.fixedSizeListColumnsSizeSum));
   if (rowLimited) {
     if (defaultPolicy) {
+      if (FLAGS_velox_hash_join_compact_chains_enabled && compactJoinChains_) {
+        return listJoinResultsInterleavedImpl<true, false, true>(
+            iter, includeMisses, inputRows, hits, maxBytes);
+      }
       return listJoinResultsInterleavedImpl<true, false>(
+          iter, includeMisses, inputRows, hits, maxBytes);
+    }
+    if (FLAGS_velox_hash_join_compact_chains_enabled && compactJoinChains_) {
+      return listJoinResultsInterleavedImpl<false, false, true>(
           iter, includeMisses, inputRows, hits, maxBytes);
     }
     return listJoinResultsInterleavedImpl<false, false>(
         iter, includeMisses, inputRows, hits, maxBytes);
   }
   if (defaultPolicy) {
+    if (FLAGS_velox_hash_join_compact_chains_enabled && compactJoinChains_) {
+      return listJoinResultsInterleavedImpl<true, true, true>(
+          iter, includeMisses, inputRows, hits, maxBytes);
+    }
     return listJoinResultsInterleavedImpl<true, true>(
+        iter, includeMisses, inputRows, hits, maxBytes);
+  }
+  if (FLAGS_velox_hash_join_compact_chains_enabled && compactJoinChains_) {
+    return listJoinResultsInterleavedImpl<false, true, true>(
         iter, includeMisses, inputRows, hits, maxBytes);
   }
   return listJoinResultsInterleavedImpl<false, true>(
@@ -2208,7 +2416,7 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleaved(
 }
 
 template <bool ignoreNullKeys>
-template <bool kDefaultPolicy, bool kCountBytes>
+template <bool kDefaultPolicy, bool kCountBytes, bool kCompactChains>
 int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
     JoinResultIterator& iter,
     bool includeMisses,
@@ -2220,6 +2428,18 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
   }
 
   size_t numOut = 0;
+  uint64_t compactBulkRows = 0;
+  auto finish = [&]() {
+    if constexpr (kCompactChains) {
+      if (compactBulkRows) {
+        compactJoinChains_->bulkRows.fetch_add(
+            compactBulkRows, std::memory_order_relaxed);
+        addThreadLocalRuntimeStat(
+            "hashtable.compactJoinBulkRows", RuntimeCounter(compactBulkRows));
+      }
+    }
+    return numOut;
+  };
   uint64_t totalBytes{0};
   const int32_t numParallelChains = kDefaultPolicy
       ? JoinResultIterator::kNumParallelChains
@@ -2240,6 +2460,17 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
         return projectedRowSize(iter, hit);
       });
 
+  auto advance = [&](int32_t slot, char* row) -> char* {
+    if constexpr (kCompactChains) {
+      auto*& cursor = walker.compactNext[slot];
+      if (cursor) {
+        ++cursor;
+        return cursor == walker.compactEnd[slot] ? nullptr : *cursor;
+      }
+    }
+    return nextRow(row);
+  };
+
   while (true) {
     if (walker.slotHead >= walker.numActive) {
       walker.slotHead = 0;
@@ -2254,6 +2485,13 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
         }
         walker.slotProbeRows[walker.numActive] = row;
         walker.slotCursors[walker.numActive] = hit;
+        if constexpr (kCompactChains) {
+          const auto compactRange = hit
+              ? compactJoinChains_->find(hit)
+              : std::pair<char**, char**>{nullptr, nullptr};
+          walker.compactNext[walker.numActive] = compactRange.first;
+          walker.compactEnd[walker.numActive] = compactRange.second;
+        }
         if (hit == nullptr) {
           bufferedHitAt(walker.numActive, 0) = nullptr;
           walker.bufferLength[walker.numActive] = 1;
@@ -2266,7 +2504,7 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
         ++walker.numActive;
       }
       if (walker.numActive == 0) {
-        return numOut;
+        return finish();
       }
     }
 
@@ -2283,7 +2521,7 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
             walker.bufferLength[walker.slotHead] = 0;
             walker.drainPosition = 0;
           }
-          return numOut;
+          return finish();
         }
       }
       walker.bufferLength[walker.slotHead] = 0;
@@ -2298,6 +2536,26 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
 
     const int32_t numActive = walker.numActive;
     const int32_t slotHead = walker.slotHead;
+    if constexpr (kCompactChains && !kCountBytes) {
+      auto*& cursor = walker.compactNext[slotHead];
+      if (cursor) {
+        const auto count = std::min<uint64_t>(
+            walker.compactEnd[slotHead] - cursor, inputRows.size() - numOut);
+        std::copy_n(cursor, count, hits.data() + numOut);
+        std::fill_n(
+            inputRows.data() + numOut, count, walker.slotProbeRows[slotHead]);
+        cursor += count;
+        numOut += count;
+        walker.slotCursors[slotHead] =
+            cursor == walker.compactEnd[slotHead] ? nullptr : *cursor;
+        compactBulkRows += count;
+        if (numOut == inputRows.size()) {
+          return finish();
+        }
+        ++walker.slotHead;
+        continue;
+      }
+    }
     // Once every later slot is full (or exhausted), its state cannot change
     // until this head chain ends. Avoid rescanning those slots per result.
     if (headChainDrainEnabled) {
@@ -2312,13 +2570,13 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
       if (laterSlotsReady) {
         const auto headRow = walker.slotProbeRows[slotHead];
         do {
-          char* next = nextRow(headCursor);
+          char* next = advance(slotHead, headCursor);
           if (prefetchEnabled && next != nullptr) {
             __builtin_prefetch(next + nextOffset_);
           }
           walker.slotCursors[slotHead] = next;
           if (!emit(headRow, headCursor)) {
-            return numOut;
+            return finish();
           }
           headCursor = next;
         } while (headCursor != nullptr);
@@ -2342,13 +2600,13 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleavedImpl(
         continue;
       }
       bufferedHitAt(i, walker.bufferLength[i]++) = cursor;
-      walker.slotCursors[i] = nextRow(cursor);
+      walker.slotCursors[i] = advance(i, cursor);
     }
 
     const auto headRow = walker.slotProbeRows[slotHead];
-    walker.slotCursors[slotHead] = nextRow(headCursor);
+    walker.slotCursors[slotHead] = advance(slotHead, headCursor);
     if (!emit(headRow, headCursor)) {
-      return numOut;
+      return finish();
     }
   }
 }
@@ -2567,6 +2825,7 @@ int32_t HashTable<true>::listNullKeyRows(
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::erase(folly::Range<char**> rows) {
+  compactJoinChains_.reset();
   auto numRows = rows.size();
   raw_vector<uint64_t> hashes(pool_);
   hashes.resize(numRows);

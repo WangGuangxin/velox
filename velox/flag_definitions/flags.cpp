@@ -157,3 +157,16 @@ DEFINE_bool(
     velox_hash_join_fixed_width_output_enabled,
     false,
     "Skip per-hit byte accounting when a fixed-width output batch is row-limited.");
+
+DEFINE_bool(
+    velox_hash_join_compact_chains_enabled,
+    false,
+    "Build bounded immutable pointer lists for long duplicate join chains");
+DEFINE_int64(
+    velox_hash_join_compact_chains_max_bytes,
+    128LL << 20,
+    "Maximum optional posting-list and index bytes per join table");
+DEFINE_bool(
+    velox_hash_join_estimated_width_output_enabled,
+    false,
+    "Use the row-limited emitter for constant-accounted estimated join output");

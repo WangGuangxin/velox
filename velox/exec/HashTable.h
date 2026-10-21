@@ -231,6 +231,11 @@ class BaseHashTable {
       /// Resume position within the head slot's buffer across calls.
       int32_t drainPosition{0};
 
+      // Optional immutable postings. Cursors always identify the same actual
+      // row as slotCursors; overwritten for every occupied slot on refill.
+      std::array<char**, kMaxParallelChains> compactNext{};
+      std::array<char**, kMaxParallelChains> compactEnd{};
+
       /// Marks the walker as holding no active slots so a fresh probe
       /// batch starts empty. Stale `slotCursors` / `slotProbeRows` /
       /// `bufferData` entries from a previous batch are left in place;
@@ -624,7 +629,8 @@ class ProbeState;
 namespace test {
 template <bool ignoreNullKeys>
 class HashTableTestHelper;
-}
+class HashJoinCompactChainsTestHelper;
+} // namespace test
 
 template <bool ignoreNullKeys>
 class HashTable : public BaseHashTable {
@@ -648,7 +654,7 @@ class HashTable : public BaseHashTable {
       memory::MemoryPool* pool,
       uint64_t bloomFilterMaxSize = 0);
 
-  ~HashTable() override = default;
+  ~HashTable() override;
 
   static std::unique_ptr<HashTable> createForAggregation(
       std::vector<std::unique_ptr<VectorHasher>>&& hashers,
@@ -750,7 +756,8 @@ class HashTable : public BaseHashTable {
   int64_t allocatedBytes() const override {
     // For each row: sizeof(char*) per table entry + memory
     // allocated with MemoryAllocator for fixed-width rows and strings.
-    return sizeof(char*) * capacity_ + rows_->allocatedBytes();
+    return sizeof(char*) * capacity_ + rows_->allocatedBytes() +
+        compactJoinAllocatedBytes();
   }
 
   HashStringAllocator* stringAllocator() override {
@@ -796,6 +803,7 @@ class HashTable : public BaseHashTable {
     if (numTombstones_ != 0) {
       runtimeStats[std::string(kNumTombstones)] = RuntimeMetric(numTombstones_);
     }
+    addCompactJoinStats(runtimeStats);
   }
 
   void decideHashMode(
@@ -1054,7 +1062,7 @@ class HashTable : public BaseHashTable {
       folly::Range<char**> hits,
       uint64_t maxBytes);
 
-  template <bool kDefaultPolicy, bool kCountBytes>
+  template <bool kDefaultPolicy, bool kCountBytes, bool kCompactChains = false>
   int32_t listJoinResultsInterleavedImpl(
       JoinResultIterator& iter,
       bool includeMisses,
@@ -1411,6 +1419,16 @@ class HashTable : public BaseHashTable {
 
   // If true, avoids using VectorHasher value ranges with kArray hash mode.
   bool disableRangeArrayHash_{false};
+
+  friend class test::HashJoinCompactChainsTestHelper;
+  // Constructed only after the complete join table is immutable. The
+  // out-of-line destructor keeps this private type out of caller ownership.
+  struct CompactJoinChains;
+  std::unique_ptr<CompactJoinChains> compactJoinChains_;
+  void buildCompactJoinChains();
+  uint64_t compactJoinAllocatedBytes() const;
+  void addCompactJoinStats(
+      std::unordered_map<std::string, RuntimeMetric>& runtimeStats) const;
 
   friend class ProbeState;
   friend test::HashTableTestHelper<ignoreNullKeys>;
