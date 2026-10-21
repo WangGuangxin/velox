@@ -146,7 +146,7 @@ class HashAggregation : public Operator {
   // yields one grand-total row over all input.
   const bool hasGlobalGroupingSets_;
   const bool memoryCompactionEnabled_;
-  const int64_t maxExtendedPartialAggregationMemoryUsage_;
+  int64_t maxExtendedPartialAggregationMemoryUsage_;
   // Minimum number of rows to see before deciding to give up on partial
   // aggregation.
   const int32_t abandonPartialAggregationMinRows_;

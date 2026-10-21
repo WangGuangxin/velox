@@ -100,6 +100,28 @@ TEST_F(QueryConfigTest, adaptiveJoinValueIds) {
   }
 }
 
+TEST_F(QueryConfigTest, adaptivePartialMemoryBudget) {
+  const QueryConfig defaults{{}};
+  EXPECT_EQ(defaults.adaptivePartialAggregationMemoryLimit(), 0);
+  const QueryConfig configured{
+      {{QueryConfig::kAdaptivePartialAggregationMemoryLimit, "1073741824"}}};
+  EXPECT_EQ(configured.adaptivePartialAggregationMemoryLimit(), 1LL << 30);
+  for (const auto* value : {"-1", "1073741825"}) {
+    EXPECT_THROW(
+        (QueryConfig{
+            {{QueryConfig::kAdaptivePartialAggregationMemoryLimit, value}}}),
+        VeloxUserError);
+  }
+  const auto& properties = QueryConfig::registeredProperties();
+  const auto property =
+      std::find_if(properties.begin(), properties.end(), [](const auto& p) {
+        return p.name == QueryConfig::kAdaptivePartialAggregationMemoryLimit;
+      });
+  ASSERT_NE(property, properties.end());
+  EXPECT_EQ(property->type, config::ConfigPropertyType::kInteger);
+  EXPECT_EQ(property->defaultValue, "0");
+}
+
 TEST_F(QueryConfigTest, emptyConfig) {
   auto queryCtx = QueryCtx::create(nullptr, QueryConfig{{}});
   const QueryConfig& config = queryCtx->queryConfig();

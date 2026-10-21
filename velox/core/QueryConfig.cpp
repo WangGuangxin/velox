@@ -29,6 +29,7 @@ const std::vector<config::ConfigProperty>& QueryConfig::registeredProperties() {
   config::registerConfigProperty<QueryConfig::constName##Property>(properties)
 
     // Memory.
+    VELOX_REGISTER_QUERY_CONFIG(kAdaptivePartialAggregationMemoryLimit);
     VELOX_REGISTER_QUERY_CONFIG(kQueryMaxMemoryPerNode);
 
     // Session.
@@ -300,6 +301,9 @@ QueryConfig::QueryConfig(
 }
 
 void QueryConfig::validateConfig() {
+  VELOX_USER_CHECK_GE(adaptivePartialAggregationMemoryLimit(), 0);
+  VELOX_USER_CHECK_LE(
+      adaptivePartialAggregationMemoryLimit(), int64_t{1} << 30);
   VELOX_USER_CHECK_GE(hashJoinNumParallelChains(), 1);
   VELOX_USER_CHECK_LE(hashJoinNumParallelChains(), 32);
   VELOX_USER_CHECK_GE(hashJoinAheadWindow(), 1);

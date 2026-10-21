@@ -20,6 +20,7 @@
 #include <optional>
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/OperatorType.h"
+#include "velox/exec/PartialAggregationMemoryPolicy.h"
 #include "velox/exec/PrefixSort.h"
 #include "velox/exec/Task.h"
 #include "velox/expression/Expr.h"
@@ -271,9 +272,35 @@ void HashAggregation::addInput(RowVectorPtr input) {
   // partial aggregator. Hence, we have to use more memory anyway.
   const bool abandonPartialEarly = isPartialOutput_ && !isGlobal_ &&
       abandonPartialAggregationEarly(groupingSet_->numDistinct());
-  const bool partialMemoryFull = !abandonPartialEarly && isPartialOutput_ &&
+  bool partialMemoryFull = !abandonPartialEarly && isPartialOutput_ &&
       !isGlobal_ &&
       groupingSet_->isPartialFull(maxPartialAggregationMemoryUsage_);
+  if (partialMemoryFull && !isDistinct_) {
+    const auto adaptiveLimit = operatorCtx_->driverCtx()
+                                   ->queryConfig()
+                                   .adaptivePartialAggregationMemoryLimit();
+    const auto oldLimit = maxPartialAggregationMemoryUsage_;
+    const auto growth = detail::tryGrowPartialAggregationMemory(
+        oldLimit,
+        adaptiveLimit,
+        numInputRows_,
+        groupingSet_->numDistinct(),
+        groupingSet_->allocatedBytes(),
+        [&](int64_t bytes) { return pool()->maybeReserve(bytes); });
+    if (growth == detail::PartialMemoryGrowth::kGrown) {
+      maxPartialAggregationMemoryUsage_ = adaptiveLimit;
+      maxExtendedPartialAggregationMemoryUsage_ =
+          std::max(maxExtendedPartialAggregationMemoryUsage_, adaptiveLimit);
+      partialMemoryFull = groupingSet_->isPartialFull(adaptiveLimit);
+      addRuntimeStat("adaptivePartialMemoryGrowths", RuntimeCounter(1));
+      addRuntimeStat(
+          "adaptivePartialMemoryGrowthBytes",
+          RuntimeCounter(
+              adaptiveLimit - oldLimit, RuntimeCounter::Unit::kBytes));
+    } else if (growth == detail::PartialMemoryGrowth::kReservationRejected) {
+      addRuntimeStat("adaptivePartialMemoryReserveRejected", RuntimeCounter(1));
+    }
+  }
   if (isPartialOutput_ && !isGlobal_ &&
       (abandonPartialEarly || partialMemoryFull)) {
     partialFull_ = true;

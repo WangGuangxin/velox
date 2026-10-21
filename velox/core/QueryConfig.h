@@ -1766,6 +1766,13 @@ class QueryConfig {
       500000,
       "Maximum string value IDs for the eligible partial aggregation only.")
 
+  VELOX_QUERY_CONFIG(
+      kAdaptivePartialAggregationMemoryLimit,
+      adaptivePartialAggregationMemoryLimit,
+      "adaptive_partial_aggregation_memory_limit",
+      int64_t,
+      0,
+      "Optional partial aggregation memory ceiling after reservation; zero disables growth.")
 
  private:
   void validateConfig();
