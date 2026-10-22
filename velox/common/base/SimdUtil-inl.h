@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
+#include <gflags/gflags.h>
 #include <numeric>
+#include "velox/common/base/ArmSveNeonGather.h"
 
 #if XSIMD_WITH_NEON
 namespace xsimd::types {
@@ -31,6 +33,8 @@ namespace xsimd::types {
 XSIMD_DECLARE_SIMD_REGISTER(bool, sve, detail::sve_vector_type<unsigned char>);
 }
 #endif
+
+DECLARE_bool(velox_arm_sve_gather_enabled);
 
 namespace facebook::velox::simd {
 
@@ -650,6 +654,56 @@ struct Gather<T, int32_t, A, 4> {
     vindex.store_aligned(indices);
     return genericMaskGather<T, A, kScale>(src, mask, base, indices);
   }
+
+#if VELOX_SVE_NEON_GATHER_AVAILABLE
+  template <int kScale>
+  static xsimd::batch<T, A>
+  apply(const T* base, const int32_t* indices, const xsimd::neon& arch) {
+    return apply<kScale>(base, VIndexType::load_unaligned(indices), arch);
+  }
+
+  template <int kScale>
+  static xsimd::batch<T, A>
+  apply(const T* base, VIndexType indices, const xsimd::neon&) {
+    if constexpr (kScale == 1 || kScale == 4) {
+      if (FLAGS_velox_arm_sve_gather_enabled) {
+        return arm_detail::gather32<T, kScale>(base, indices.data);
+      }
+    }
+    alignas(A::alignment()) int32_t scalar[VIndexType::size];
+    indices.store_aligned(scalar);
+    return genericGather<T, A, kScale>(base, scalar);
+  }
+
+  template <int kScale>
+  static xsimd::batch<T, A> maskApply(
+      xsimd::batch<T, A> source,
+      xsimd::batch_bool<T, A> mask,
+      const T* base,
+      const int32_t* indices,
+      const xsimd::neon& arch) {
+    return maskApply<kScale>(
+        source, mask, base, VIndexType::load_unaligned(indices), arch);
+  }
+
+  template <int kScale>
+  static xsimd::batch<T, A> maskApply(
+      xsimd::batch<T, A> source,
+      xsimd::batch_bool<T, A> mask,
+      const T* base,
+      VIndexType indices,
+      const xsimd::neon&) {
+    if constexpr (kScale == 1 || kScale == 4) {
+      if (FLAGS_velox_arm_sve_gather_enabled) {
+        return arm_detail::maskGather32<T, kScale>(
+            source.data, mask.data, base, indices.data);
+      }
+    }
+    alignas(A::alignment()) int32_t scalar[VIndexType::size];
+    indices.store_aligned(scalar);
+    return genericMaskGather<T, A, kScale>(source, mask, base, scalar);
+  }
+#endif
 };
 
 template <typename T, typename A>
@@ -823,6 +877,31 @@ struct Gather<T, int32_t, A, 8> {
             vindex,
             reinterpret_cast<__m256i>(mask.data),
             kScale));
+  }
+#endif
+
+#if VELOX_SVE_NEON_GATHER_AVAILABLE
+  template <int kScale>
+  static xsimd::batch<T, A>
+  apply(const T* base, const int32_t* indices, const xsimd::neon&) {
+    if (FLAGS_velox_arm_sve_gather_enabled) {
+      return arm_detail::gather64<T, kScale>(base, vld1_s32(indices));
+    }
+    return genericGather<T, A, kScale>(base, indices);
+  }
+
+  template <int kScale>
+  static xsimd::batch<T, A> maskApply(
+      xsimd::batch<T, A> source,
+      xsimd::batch_bool<T, A> mask,
+      const T* base,
+      const int32_t* indices,
+      const xsimd::neon&) {
+    if (FLAGS_velox_arm_sve_gather_enabled) {
+      return arm_detail::maskGather64<T, kScale>(
+          source.data, mask.data, base, vld1_s32(indices));
+    }
+    return genericMaskGather<T, A, kScale>(source, mask, base, indices);
   }
 #endif
 };
