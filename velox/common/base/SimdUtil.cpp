@@ -17,6 +17,11 @@
 #include "velox/common/base/SimdUtil.h"
 #include <folly/Preprocessor.h>
 
+DEFINE_bool(
+    velox_arm_sve_gather_enabled,
+    false,
+    "Use predicated SVE gathers with the NEON register ABI. Set only before worker tasks start.");
+
 namespace facebook::velox::simd {
 
 void gatherBits(
