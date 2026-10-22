@@ -32,6 +32,8 @@ endif()
 add_executable(
   velox_dwio_common_test
   BitConcatenationTest.cpp
+  ArmSelectedUnpackTest.cpp
+  ArmSelectedUnpackApiTest.cpp
   BitPackDecoderTest.cpp
   ChainedBufferTests.cpp
   ColumnRuntimeStatsTests.cpp

@@ -71,6 +71,7 @@ velox_add_library(
   Adaptor.h
   Arena.h
   BitConcatenation.h
+  ArmSelectedUnpack.h
   BitPackDecoder.h
   BufferUtil.h
   BufferedInput.h

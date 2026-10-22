@@ -16,7 +16,15 @@
 
 #include "velox/dwio/common/BitPackDecoder.h"
 
+#include "velox/dwio/common/ArmSelectedUnpack.h"
+
+#include <gflags/gflags.h>
 #include <cstring>
+
+DEFINE_bool(
+    velox_arm_sve_bit_unpack_enabled,
+    false,
+    "Use ARM SVE for the bounded safe prefix of selected integer bit unpacking; application-static.");
 
 namespace facebook::velox::dwio::common {
 
@@ -243,6 +251,15 @@ void unpack(
     }
   }
   int32_t i = 0;
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
+  if constexpr (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
+    if (FLAGS_velox_arm_sve_bit_unpack_enabled) {
+      i = arm_sve::unpackSafePrefix(
+          bits, bitOffset, rows.data(), numSafeRows, bitWidth, mask, result);
+    }
+  }
+#endif
 
 #if XSIMD_WITH_AVX2
   // Use AVX2 for specific widths.
