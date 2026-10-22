@@ -15,11 +15,18 @@
  */
 
 #include "velox/common/base/BitUtil.h"
+#include "velox/common/base/ArmSveHashTail.h"
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/SimdUtil.h"
 #include "velox/common/process/ProcessBase.h"
 
 #include <folly/BenchmarkUtil.h>
+#include <gflags/gflags.h>
+
+DEFINE_bool(
+    velox_arm_sve_hash_tail_enabled,
+    false,
+    "Use bounded predicated ARM SVE loads for CRC32C byte-hash tails");
 
 namespace facebook::velox::bits {
 
@@ -175,10 +182,18 @@ void scatterBits(
 }
 
 uint64_t hashBytes(uint64_t seed, const char* data, size_t size) {
+  const auto loadTail = [](const uint8_t* input, int32_t bytes) {
+#if VELOX_ARM_SVE_HASH_TAIL_AVAILABLE
+    if (FLAGS_velox_arm_sve_hash_tail_enabled) {
+      return arm_sve_hash_tail::load0To7(input, bytes);
+    }
+#endif
+    return loadPartialWord(input, bytes);
+  };
   auto begin = reinterpret_cast<const uint8_t*>(data);
   const uint64_t kMul = 0x9ddfea08eb382d69ULL;
   if (size < 8) {
-    auto word = loadPartialWord(begin, size);
+    auto word = loadTail(begin, size);
     uint64_t crc = simd::crc32U64(seed, word);
     uint64_t crc2 = simd::crc32U64(seed, word >> 32);
     return crc | (crc2 << 32);
@@ -199,23 +214,19 @@ uint64_t hashBytes(uint64_t seed, const char* data, size_t size) {
     a0 = simd::crc32U64(a0, words[0]);
     a1 = simd::crc32U64(a1, words[1]);
     a2 = simd::crc32U64(
-        a2,
-        loadPartialWord(
-            reinterpret_cast<const uint8_t*>(words + 2), toGo - 16));
+        a2, loadTail(reinterpret_cast<const uint8_t*>(words + 2), toGo - 16));
   } else if (toGo > 8) {
     a0 = simd::crc32U64(a0, words[0]);
     a1 = simd::crc32U64(
         a1,
         toGo == 16
             ? words[1]
-            : loadPartialWord(
-                  reinterpret_cast<const uint8_t*>(words + 1), toGo - 8));
+            : loadTail(reinterpret_cast<const uint8_t*>(words + 1), toGo - 8));
   } else if (toGo > 0) {
     a0 = simd::crc32U64(
         a0,
-        toGo == 8
-            ? words[0]
-            : loadPartialWord(reinterpret_cast<const uint8_t*>(words), toGo));
+        toGo == 8 ? words[0]
+                  : loadTail(reinterpret_cast<const uint8_t*>(words), toGo));
   }
   return a0 ^ ((a1 * kMul)) ^ (a2 * kMul);
 }

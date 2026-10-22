@@ -49,6 +49,7 @@ velox_add_library(
   AdmissionController.h
   BitSet.h
   BitUtil.h
+  ArmSveHashTail.h
   BloomFilter.h
   CheckedArithmetic.h
   ClassName.h
