@@ -15,6 +15,7 @@
 add_executable(
   velox_base_test
   ArmSveNeonGatherTest.cpp
+  ArmSveHashTailTest.cpp
   ArmSveNeonGatherApiTest.cpp
   AdmissionControllerTest.cpp
   AsyncSourceTest.cpp
