@@ -34,6 +34,7 @@ add_executable(
   BitConcatenationTest.cpp
   ArmSelectedUnpackTest.cpp
   ArmSelectedUnpackApiTest.cpp
+  ArmSveBitDepositTest.cpp
   BitPackDecoderTest.cpp
   ChainedBufferTests.cpp
   ColumnRuntimeStatsTests.cpp
