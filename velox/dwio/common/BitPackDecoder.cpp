@@ -17,6 +17,7 @@
 #include "velox/dwio/common/BitPackDecoder.h"
 
 #include "velox/dwio/common/ArmSelectedUnpack.h"
+#include "velox/dwio/common/ArmSveBitDeposit.h"
 
 #include <gflags/gflags.h>
 #include <cstring>
@@ -25,6 +26,11 @@ DEFINE_bool(
     velox_arm_sve_bit_unpack_enabled,
     true,
     "Use ARM SVE for the bounded safe prefix of selected integer bit unpacking; application-static.");
+
+DEFINE_bool(
+    velox_arm_sve_bit_deposit_enabled,
+    true,
+    "Use ARM SVE2 BitPerm for contiguous selected integer fields; application-static.");
 
 namespace facebook::velox::dwio::common {
 
@@ -252,11 +258,24 @@ void unpack(
   }
   int32_t i = 0;
 
+#if VELOX_ARM_SVE_BDEP_AVAILABLE
+  if (FLAGS_velox_arm_sve_bit_deposit_enabled) {
+    i = arm_sve_bdep::unpackSelectedPrefix(
+        bits, bitOffset, rows.data(), numSafeRows, bitWidth, result);
+  }
+#endif
+
 #if defined(__aarch64__) && defined(__ARM_FEATURE_SVE)
   if constexpr (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
     if (FLAGS_velox_arm_sve_bit_unpack_enabled) {
-      i = arm_sve::unpackSafePrefix(
-          bits, bitOffset, rows.data(), numSafeRows, bitWidth, mask, result);
+      i += arm_sve::unpackSafePrefix(
+          bits,
+          bitOffset,
+          rows.data() + i,
+          numSafeRows - i,
+          bitWidth,
+          mask,
+          result + i);
     }
   }
 #endif
