@@ -13,45 +13,85 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #pragma once
 
-#include <optional>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
 
-#include "velox/common/base/BloomFilter.h"
-#include "velox/core/QueryConfig.h"
-#include "velox/functions/Macros.h"
+#include <folly/hash/Hash.h>
+
+#include "velox/expression/VectorFunction.h"
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE) && \
+    defined(__BYTE_ORDER__) && (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#include <arm_sve.h>
+#define VELOX_ARM_SVE_BLOOM_PROBE_AVAILABLE 1
+#else
+#define VELOX_ARM_SVE_BLOOM_PROBE_AVAILABLE 0
+#endif
 
 namespace facebook::velox::functions::sparksql {
 
-template <typename T>
-struct BloomFilterMightContainFunction {
-  VELOX_DEFINE_FUNCTION_TYPES(T);
+/// Batched Bloom filter probes for might_contain. Each result equals
+/// BloomFilterView::mayContain(folly::hasher<int64_t>()(value)): the hash
+/// selects word (hash >> 24) & (bloomSize - 1) and requires the four bits
+/// selected by the low four 6-bit fields of the hash.
+namespace bloom_probe {
 
-  void initialize(
-      const std::vector<TypePtr>& /*inputTypes*/,
-      const core::QueryConfig&,
-      const arg_type<Varbinary>* serialized,
-      const arg_type<int64_t>*) {
-    if (serialized == nullptr) {
-      return;
-    }
+inline uint64_t mask(uint64_t hash) {
+  return (1UL << (hash & 63)) | (1UL << ((hash >> 6) & 63)) |
+      (1UL << ((hash >> 12) & 63)) | (1UL << ((hash >> 18) & 63));
+}
 
-    VELOX_USER_CHECK_GE(
-        serialized->size(),
-        BloomFilterView::kSerializedHeaderSize,
-        "Serialized BloomFilter is too small: {}",
-        serialized->size());
-    bloomFilterView_.emplace(serialized->data());
-  }
+inline bool test(const uint64_t* bloom, uint32_t bloomSize, int64_t value) {
+  const uint64_t hash = folly::hasher<int64_t>()(value);
+  const uint64_t m = mask(hash);
+  return (bloom[(hash >> 24) & (bloomSize - 1)] & m) == m;
+}
 
-  FOLLY_ALWAYS_INLINE void
-  call(bool& result, const arg_type<Varbinary>&, const int64_t& input) {
-    result = bloomFilterView_.has_value() &&
-        bloomFilterView_->mayContain(folly::hasher<int64_t>()(input));
-  }
+/// Portable batch: hash a block of values first and prefetch its words so
+/// that the dependent loads overlap.
+void probeGeneric(
+    const uint64_t* bloom,
+    uint32_t bloomSize,
+    const int64_t* values,
+    int32_t size,
+    uint8_t* out);
 
- private:
-  std::optional<BloomFilterView> bloomFilterView_;
-};
+/// ARM SVE batch: vector twang hash, vector masks and a predicated gather of
+/// the selected words. Falls back to probeGeneric without SVE.
+void probeSve(
+    const uint64_t* bloom,
+    uint32_t bloomSize,
+    const int64_t* values,
+    int32_t size,
+    uint8_t* out);
+
+/// The probe used by might_contain: probeSve when built with SVE, otherwise
+/// probeGeneric.
+inline void probe(
+    const uint64_t* bloom,
+    uint32_t bloomSize,
+    const int64_t* values,
+    int32_t size,
+    uint8_t* out) {
+#if VELOX_ARM_SVE_BLOOM_PROBE_AVAILABLE
+  probeSve(bloom, bloomSize, values, size, out);
+#else
+  probeGeneric(bloom, bloomSize, values, size, out);
+#endif
+}
+
+} // namespace bloom_probe
+
+/// might_contain(serialized_bloom_filter, value) as a vector function. Any
+/// NULL input yields NULL and a non-constant filter yields false.
+std::vector<std::shared_ptr<exec::FunctionSignature>> mightContainSignatures();
+
+std::shared_ptr<exec::VectorFunction> makeMightContain(
+    const std::vector<exec::VectorFunctionArg>& inputArgs);
 
 } // namespace facebook::velox::functions::sparksql

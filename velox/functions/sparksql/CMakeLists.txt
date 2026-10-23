@@ -43,6 +43,7 @@ velox_add_library(
   FormatString.cpp
   GetJsonObject.cpp
   Hash.cpp
+  MightContain.cpp
   In.cpp
   LeastGreatest.cpp
   Map.cpp

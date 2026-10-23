@@ -38,8 +38,14 @@ void registerBinaryFunctions(const std::string& prefix) {
       makeXxHash64WithSeed,
       hashMetadata());
   registerFunction<Md5Function, Varchar, Varbinary>({prefix + "md5"});
-  registerFunction<BloomFilterMightContainFunction, bool, Varbinary, int64_t>(
-      {prefix + "might_contain"});
+  exec::registerStatefulVectorFunction(
+      prefix + "might_contain",
+      mightContainSignatures(),
+      [](const std::string& /*name*/,
+         const std::vector<exec::VectorFunctionArg>& inputArgs,
+         const core::QueryConfig& /*config*/) {
+        return makeMightContain(inputArgs);
+      });
   registerFunction<Sha1HexStringFunction, Varchar, Varbinary>(
       {prefix + "sha1"});
   registerFunction<Sha2HexStringFunction, Varchar, Varbinary, int32_t>(
