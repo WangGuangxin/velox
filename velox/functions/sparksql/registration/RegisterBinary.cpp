@@ -17,6 +17,7 @@
 #include "velox/functions/prestosql/BinaryFunctions.h"
 #include "velox/functions/sparksql/Hash.h"
 #include "velox/functions/sparksql/MightContain.h"
+#include "velox/functions/sparksql/MightContainBatch.h"
 #include "velox/functions/sparksql/String.h"
 
 namespace facebook::velox::functions::sparksql {
@@ -40,6 +41,17 @@ void registerBinaryFunctions(const std::string& prefix) {
   registerFunction<Md5Function, Varchar, Varbinary>({prefix + "md5"});
   registerFunction<BloomFilterMightContainFunction, bool, Varbinary, int64_t>(
       {prefix + "might_contain"});
+  for (bool sve : {false, true}) {
+    exec::registerStatefulVectorFunction(
+        prefix + (sve ? "might_contain_batch_sve" : "might_contain_batch"),
+        mightContainSignatures(),
+        [sve](
+            const std::string& /*name*/,
+            const std::vector<exec::VectorFunctionArg>& inputArgs,
+            const core::QueryConfig& /*config*/) {
+          return makeMightContainBatch(inputArgs, sve);
+        });
+  }
   registerFunction<Sha1HexStringFunction, Varchar, Varbinary>(
       {prefix + "sha1"});
   registerFunction<Sha2HexStringFunction, Varchar, Varbinary, int32_t>(
