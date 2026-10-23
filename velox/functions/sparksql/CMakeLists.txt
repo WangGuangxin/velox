@@ -43,6 +43,7 @@ velox_add_library(
   FormatString.cpp
   GetJsonObject.cpp
   Hash.cpp
+  MightContainBatch.cpp
   In.cpp
   LeastGreatest.cpp
   Map.cpp
@@ -93,6 +94,7 @@ velox_add_library(
   MakeTimestamp.h
   MaskFunction.h
   MightContain.h
+  MightContainBatch.h
   MonotonicallyIncreasingId.h
   RaiseError.h
   Rand.h
