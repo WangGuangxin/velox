@@ -15,6 +15,20 @@
  */
 
 #include "velox/exec/RowContainer.h"
+#include "velox/exec/ArmRowExtraction.h"
+
+#include <array>
+#include <cstring>
+#include <type_traits>
+
+DEFINE_bool(
+    velox_row_container_batch_fixed_extraction_enabled,
+    false,
+    "Batch fixed-width row extraction and null bitmap updates");
+DEFINE_bool(
+    velox_arm_sve_row_extraction_enabled,
+    false,
+    "Use predicated ARM SVE gathers for direct non-nullable integer columns");
 
 #include "velox/common/memory/RawVector.h"
 #include "velox/exec/Aggregate.h"
@@ -23,6 +37,102 @@
 #include "velox/type/FloatingPointUtil.h"
 
 namespace facebook::velox::exec {
+
+namespace {
+template <typename T, bool selected, bool nullable>
+void extractFixedBatchValues(
+    const char* const* rows,
+    const vector_size_t* numbers,
+    int32_t count,
+    RowColumn column,
+    int32_t resultOffset,
+    const VectorPtr& result,
+    bool useSve) {
+  auto* flat = result->as<FlatVector<T>>();
+  BufferPtr valuesBuffer = flat->mutableValues();
+  auto* output = reinterpret_cast<uint8_t*>(valuesBuffer->asMutable<T>()) +
+      resultOffset * sizeof(T);
+  uint64_t* nulls = nullptr;
+  if (flat->rawNulls()) {
+    nulls =
+        flat->mutableNulls(flat->size(), true)->template asMutable<uint64_t>();
+  }
+  for (int32_t i = 0; i < count; i += 64) {
+    const auto n = std::min(64, count - i);
+    const auto* const* blockRows = selected ? rows : rows + i;
+    const auto* blockNumbers = selected ? numbers + i : nullptr;
+    const uint64_t valid = useSve
+        ? detail::row_extraction::blockSve<sizeof(T), selected, nullable>(
+              blockRows,
+              blockNumbers,
+              n,
+              column.offset(),
+              column.nullByte(),
+              column.nullMask(),
+              output + i * sizeof(T))
+        : detail::row_extraction::blockScalar<sizeof(T), selected, nullable>(
+              blockRows,
+              blockNumbers,
+              n,
+              column.offset(),
+              column.nullByte(),
+              column.nullMask(),
+              output + i * sizeof(T));
+    const auto all = n == 64 ? ~uint64_t{0} : (uint64_t{1} << n) - 1;
+    if (!nulls && valid != all) {
+      nulls = flat->mutableNulls(flat->size(), true)
+                  ->template asMutable<uint64_t>();
+    }
+    if (nulls) {
+      bits::copyBits(&valid, 0, nulls, resultOffset + i, n);
+    }
+  }
+}
+} // namespace
+
+bool RowContainer::extractFixedWidthBatch(
+    const char* const* rows,
+    const vector_size_t* rowNumbers,
+    int32_t numRows,
+    RowColumn column,
+    bool columnHasNulls,
+    int32_t resultOffset,
+    int32_t width,
+    const VectorPtr& result) {
+  const bool nullable = columnHasNulls && column.nullMask() != 0;
+  // The complete API micro found the extra SVE gather of null bytes and row
+  // indices slower than the same batched scalar algorithm. Keep these scalar.
+  const bool sve = VELOX_ARM_ROW_EXTRACTION_AVAILABLE &&
+      FLAGS_velox_arm_sve_row_extraction_enabled && !rowNumbers && !nullable;
+  if (!sve && !FLAGS_velox_row_container_batch_fixed_extraction_enabled) {
+    return false;
+  }
+  const auto dispatch = [&]<typename T>() {
+    if (rowNumbers) {
+      if (nullable) {
+        extractFixedBatchValues<T, true, true>(
+            rows, rowNumbers, numRows, column, resultOffset, result, false);
+      } else {
+        extractFixedBatchValues<T, true, false>(
+            rows, rowNumbers, numRows, column, resultOffset, result, false);
+      }
+    } else if (nullable) {
+      extractFixedBatchValues<T, false, true>(
+          rows, nullptr, numRows, column, resultOffset, result, false);
+    } else {
+      extractFixedBatchValues<T, false, false>(
+          rows, nullptr, numRows, column, resultOffset, result, sve);
+    }
+  };
+  if (width == sizeof(int32_t)) {
+    dispatch.operator()<int32_t>();
+  } else {
+    VELOX_DCHECK_EQ(width, sizeof(int64_t));
+    dispatch.operator()<int64_t>();
+  }
+  return true;
+}
+
 namespace {
 template <TypeKind Kind>
 static int32_t kindSize() {

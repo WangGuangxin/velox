@@ -24,6 +24,12 @@
 #include "velox/vector/VectorTypeUtils.h"
 
 #include <string_view>
+#include <folly/portability/GFlags.h>
+#include <cstring>
+#include <type_traits>
+
+DECLARE_bool(velox_row_container_batch_fixed_extraction_enabled);
+DECLARE_bool(velox_arm_sve_row_extraction_enabled);
 
 namespace facebook::velox::exec {
 namespace test {
@@ -1085,6 +1091,22 @@ class RowContainer {
       return;
     }
     using T = typename KindToFlatVector<Kind>::HashRowType;
+    if constexpr (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
+      if (numRows >= 32 &&
+          (FLAGS_velox_row_container_batch_fixed_extraction_enabled ||
+           FLAGS_velox_arm_sve_row_extraction_enabled) &&
+          extractFixedWidthBatch(
+              rows,
+              useRowNumbers ? rowNumbers.data() : nullptr,
+              numRows,
+              column,
+              columnHasNulls,
+              resultOffset,
+              sizeof(T),
+              result)) {
+        return;
+      }
+    }
     auto* flatResult = result->as<FlatVector<T>>();
     auto nullMask = column.nullMask();
     auto offset = column.offset();
@@ -1265,6 +1287,18 @@ class RowContainer {
       }
     }
   }
+
+  // Does not change class layout. Returns false before touching output when
+  // only the ARM switch is enabled and the input needs the scalar fallback.
+  static bool extractFixedWidthBatch(
+      const char* const* rows,
+      const vector_size_t* rowNumbers,
+      int32_t numRows,
+      RowColumn column,
+      bool columnHasNulls,
+      int32_t resultOffset,
+      int32_t width,
+      const VectorPtr& result);
 
   static HashStringAllocator::InputStream prepareRead(
       const char* row,
