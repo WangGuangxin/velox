@@ -33,6 +33,7 @@ add_executable(
   ScopedLockTest.cpp
   SemaphoreTest.cpp
   SimdUtilTest.cpp
+  SimdUtilSveTest.cpp
   SkewedPartitionBalancerTest.cpp
   SpillConfigTest.cpp
   SplitBlockBloomFilterTest.cpp
