@@ -36,6 +36,7 @@ add_executable(
   ArmSelectedUnpackApiTest.cpp
   ArmSveBitDepositTest.cpp
   BitPackDecoderTest.cpp
+  BitPackSveTest.cpp
   ChainedBufferTests.cpp
   ColumnRuntimeStatsTests.cpp
   ColumnSelectorTests.cpp
