@@ -15,6 +15,7 @@
  */
 
 #include "velox/dwio/common/BitPackDecoder.h"
+#include "velox/common/base/SimdUtil.h"
 
 #include "velox/dwio/common/ArmSelectedUnpack.h"
 #include "velox/dwio/common/ArmSveBitDeposit.h"
@@ -276,6 +277,36 @@ void unpack(
           bitWidth,
           mask,
           result + i);
+    }
+  }
+#endif
+
+#if XSIMD_WITH_SVE && VELOX_SVE_GATHER_INTRINSICS_SAFE
+  // Continue after any prefix decoded by the opt-in ARM implementations.
+  // Up to 24 bits plus the seven possible starting-bit positions fit in a
+  // 32-bit gather. numSafeRows already excludes the buffer-end red zone.
+  // Keep wider fields and the tail on the existing bounded scalar path.
+  if constexpr (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
+    if (bitWidth <= 24) {
+      using I = xsimd::batch<int32_t>;
+      using U = xsimd::batch<uint32_t>;
+      for (; i + I::size <= numSafeRows; i += I::size) {
+        const auto positions = I::load_unaligned(rows.data() + i) *
+                static_cast<int32_t>(bitWidth) +
+            bitOffset;
+        const auto words = simd::gather<uint32_t, int32_t, 1>(
+            reinterpret_cast<const uint32_t*>(bits), positions >> 3);
+        const auto shifts = xsimd::bitwise_cast<U>(positions & 7);
+        const auto values = xsimd::bitwise_cast<I>(
+            (words >> shifts) & static_cast<uint32_t>(mask));
+        if constexpr (std::is_same_v<T, int32_t>) {
+          values.store_unaligned(result + i);
+        } else {
+          simd::getHalf<int64_t, 0>(values).store_unaligned(result + i);
+          simd::getHalf<int64_t, 1>(values).store_unaligned(
+              result + i + xsimd::batch<int64_t>::size);
+        }
+      }
     }
   }
 #endif
