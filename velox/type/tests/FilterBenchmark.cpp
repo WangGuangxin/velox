@@ -47,18 +47,22 @@ int32_t run4x64(const std::vector<int64_t>& data) {
 }
 
 BENCHMARK(scalarDense) {
+  folly::compiler_must_not_predict(denseValues);
   folly::doNotOptimizeAway(run1x64(denseValues));
 }
 
 BENCHMARK_RELATIVE(simdDense) {
+  folly::compiler_must_not_predict(denseValues);
   folly::doNotOptimizeAway(run4x64(denseValues));
 }
 
 BENCHMARK(scalarSparse) {
+  folly::compiler_must_not_predict(sparseValues);
   folly::doNotOptimizeAway(run1x64(sparseValues));
 }
 
 BENCHMARK_RELATIVE(simdSparse) {
+  folly::compiler_must_not_predict(sparseValues);
   folly::doNotOptimizeAway(run4x64(sparseValues));
 }
 
@@ -76,9 +80,11 @@ int32_t main(int32_t argc, char* argv[]) {
       filterValues.front(), filterValues.back(), filterValues, false);
   denseValues.resize(kNumValues);
   sparseValues.resize(kNumValues);
+  folly::Random::DefaultGenerator rng;
+  rng.seed(1);
   for (auto i = 0; i < kNumValues; ++i) {
-    denseValues[i] = (folly::Random::rand32() % 3000) * 1000;
-    sparseValues[i] = (folly::Random::rand32() % 100000) * 1000;
+    denseValues[i] = (folly::Random::rand32(rng) % 3000) * 1000;
+    sparseValues[i] = (folly::Random::rand32(rng) % 100000) * 1000;
   }
 
   VELOX_CHECK_EQ(run1x64(denseValues), run4x64(denseValues));
