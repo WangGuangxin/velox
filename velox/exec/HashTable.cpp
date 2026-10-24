@@ -28,7 +28,15 @@
 #include "velox/functions/prestosql/types/parser/TypeParser.h"
 #include "velox/vector/FlatVector.h"
 
+#include <gflags/gflags.h>
 #include <algorithm>
+
+#if defined(__aarch64__)
+DEFINE_int32(
+    velox_arm_hash_table_prefetch_distance,
+    10,
+    "ARM group-by rehash prefetch look-ahead in rows; zero disables prefetch");
+#endif
 
 using facebook::velox::common::testutil::TestValue;
 
@@ -1310,18 +1318,23 @@ void HashTable<ignoreNullKeys>::insertForGroupBy(
       table_[index] = groups[i];
     }
   } else {
-    constexpr int32_t kPrefetchDistance = 10;
+#if defined(__aarch64__)
+    const int32_t prefetchDistance =
+        std::clamp(FLAGS_velox_arm_hash_table_prefetch_distance, 0, numGroups);
+#else
+    constexpr int32_t prefetchDistance = 10;
+#endif
     for (int32_t i = 0; i < numGroups; ++i) {
       auto hash = hashes[i];
       auto offset = this->bucketOffset(hash);
       auto tagsInTable =
           BaseHashTable::loadTags(reinterpret_cast<uint8_t*>(table_), offset);
-      if (i + kPrefetchDistance < numGroups) {
-        // Prefetch a future cache line. kPrefetchDistance positions ahead
+      if (prefetchDistance > 0 && i < numGroups - prefetchDistance) {
+        // Prefetch a future cache line. prefetchDistance positions ahead
         // should be beyond the CPU's out of order window.
         __builtin_prefetch(
             reinterpret_cast<char*>(table_) +
-            bucketOffset(hashes[i + kPrefetchDistance]));
+            bucketOffset(hashes[i + prefetchDistance]));
       }
       bool inserted{false};
       for (int64_t numProbedBuckets = 0; numProbedBuckets < numBuckets();
