@@ -29,6 +29,10 @@
 #include <gtest/gtest.h>
 #include <memory>
 
+#if defined(__aarch64__)
+DECLARE_int32(velox_arm_hash_table_prefetch_distance);
+#endif
+
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::test;
@@ -886,6 +890,38 @@ TEST_P(HashTableTest, groupProbeDuplicateNewKeys) {
     }
   }
 }
+
+#if defined(__aarch64__)
+TEST_P(HashTableTest, groupRehashPrefetchDistances) {
+  gflags::FlagSaver flagSaver;
+  for (const auto distance :
+       {-1, 0, 1, 10, 32, std::numeric_limits<int32_t>::max()}) {
+    SCOPED_TRACE(distance);
+    FLAGS_velox_arm_hash_table_prefetch_distance = distance;
+    auto table =
+        createHashTableForAggregation(ROW({"a", "b"}, {BIGINT(), BIGINT()}), 2);
+    table->forceGenericHashMode(BaseHashTable::kNoSpillInputStartPartitionBit);
+    auto lookup = std::make_unique<HashLookup>(table->hashers(), pool());
+    constexpr int kBatchSize = 1024;
+    for (int batch = 0; batch < 8; ++batch) {
+      const auto key = [batch](auto row) { return batch * kBatchSize + row; };
+      auto data = makeRowVector({
+          makeFlatVector<int64_t>(kBatchSize, key),
+          makeFlatVector<int64_t>(
+              kBatchSize, [&](auto row) { return key(row) * 1000; }),
+      });
+      insertGroups(*data, *lookup, *table);
+      ASSERT_EQ(lookup->newGroups.size(), kBatchSize);
+      ASSERT_EQ(table->numDistinct(), (batch + 1) * kBatchSize);
+      const std::vector<char*> hits(lookup->hits.begin(), lookup->hits.end());
+      insertGroups(*data, *lookup, *table);
+      EXPECT_TRUE(lookup->newGroups.empty());
+      EXPECT_EQ(
+          std::vector<char*>(lookup->hits.begin(), lookup->hits.end()), hits);
+    }
+  }
+}
+#endif
 
 TEST_P(HashTableTest, regularHashingTableSize) {
   keySpacing_ = 1000;
