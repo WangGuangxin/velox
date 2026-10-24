@@ -114,7 +114,8 @@ function install_velox_deps_from_apt {
     libgflags-dev \
     libgtest-dev \
     libgmock-dev \
-    libevent-dev librdkafka-dev \
+    libevent-dev \
+    librdkafka-dev \
     liblz4-dev \
     libzstd-dev \
     libre2-dev \
@@ -250,7 +251,6 @@ function install_velox_deps {
   run_and_time install_conda
   run_and_time install_duckdb
   run_and_time install_stemmer
-
   run_and_time install_xsimd
   run_and_time install_simdjson
   run_and_time install_geos
