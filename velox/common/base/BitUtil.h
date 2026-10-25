@@ -32,6 +32,16 @@
 #include <x86intrin.h>
 #endif
 
+// SVE2 BEXT/BDEP are the AArch64 counterparts of BMI2 PEXT/PDEP. The NEON-SVE
+// bridge moves a scalar through lane 0 without a predicated extract.
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE2_BITPERM) && \
+    __has_include(<arm_neon_sve_bridge.h>)
+#include <arm_neon_sve_bridge.h>
+#define VELOX_ARM_BITPERM 1
+#else
+#define VELOX_ARM_BITPERM 0
+#endif
+
 // Remove once we upgrade folly.
 #ifndef FOLLY_BUILTIN_MEMCPY
 #if FOLLY_HAS_BUILTIN(__builtin_memcpy_inline)
@@ -915,18 +925,26 @@ template <>
 inline uint64_t extractBits(uint64_t a, uint64_t mask) {
   return _pext_u64(a, mask);
 }
+#elif VELOX_ARM_BITPERM
+template <>
+inline uint64_t extractBits(uint64_t a, uint64_t mask) {
+  return vgetq_lane_u64(
+      svget_neonq_u64(svbext_n_u64(svdup_n_u64(a), mask)), 0);
+}
+template <>
+inline uint32_t extractBits(uint32_t a, uint32_t mask) {
+  return vgetq_lane_u32(
+      svget_neonq_u32(svbext_n_u32(svdup_n_u32(a), mask)), 0);
+}
 #else
 template <typename T>
 T extractBits(T a, T mask) {
-  constexpr int kBitsCount = 8 * sizeof(T);
+  // Visits only the selected bits, so sparse masks cost popcount(mask)
+  // iterations instead of the full word width.
   T dst = 0;
-  for (int i = 0, k = 0; i < kBitsCount; ++i) {
-    if (mask & 1) {
-      dst |= ((a & 1) << k);
-      ++k;
-    }
-    a >>= 1;
-    mask >>= 1;
+  for (int k = 0; mask != 0; ++k) {
+    dst |= ((a >> __builtin_ctzll(mask)) & 1) << k;
+    mask &= mask - 1;
   }
   return dst;
 }
