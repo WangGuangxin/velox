@@ -22,6 +22,14 @@
 #include "velox/common/serialization/NativeSerdeIO.h"
 #include "velox/type/FloatingPointUtil.h"
 
+#include <gflags/gflags.h>
+
+DEFINE_int32(
+    velox_vector_hasher_value_id_prefetch_distance,
+    0,
+    "Rows to look ahead when prefetching distinct-value table chunks for "
+    "value-ID lookups; zero disables prefetch");
+
 namespace facebook::velox::exec {
 
 namespace {
@@ -29,7 +37,33 @@ namespace {
 constexpr uint32_t kVectorHasherStateMagic = 0x56485331; // VHS1
 constexpr uint32_t kVectorHasherStateVersion = 3;
 
+// Runs 'func' on each selected row. For dense selections with a positive
+// 'distance', first calls 'prefetch' on the row 'distance' ahead so that
+// independent cache misses overlap. Sparse selections run unchanged.
+template <typename Prefetch, typename Func>
+void applyWithPrefetch(
+    const SelectivityVector& rows,
+    int32_t distance,
+    Prefetch&& prefetch,
+    Func&& func) {
+  if (distance <= 0 || !rows.isAllSelected()) {
+    rows.applyToSelected(func);
+    return;
+  }
+  const auto end = rows.end();
+  for (auto row = rows.begin(); row < end; ++row) {
+    if (row + distance < end) {
+      prefetch(row + distance);
+    }
+    func(row);
+  }
+}
+
 } // namespace
+
+int32_t VectorHasher::valueIdPrefetchDistance() const {
+  return isRange_ ? 0 : FLAGS_velox_vector_hasher_value_id_prefetch_distance;
+}
 
 #define VALUE_ID_TYPE_DISPATCH(TEMPLATE_FUNC, typeKind, ...)                \
   [&]() {                                                                   \
@@ -267,9 +301,14 @@ bool VectorHasher::makeValueIdsFlatNoNulls(
   }
 
   bool success = true;
-  rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
-    makeValueIdForOneRow<T, false>(nullptr, row, values, row, result, success);
-  });
+  applyWithPrefetch(
+      rows,
+      valueIdPrefetchDistance(),
+      [&](vector_size_t row) { prefetchValueId(values[row]); },
+      [&](vector_size_t row) INLINE_LAMBDA {
+        makeValueIdForOneRow<T, false>(
+            nullptr, row, values, row, result, success);
+      });
 
   return success;
 }
@@ -282,9 +321,17 @@ bool VectorHasher::makeValueIdsFlatWithNulls(
   const auto* nulls = decoded_.nulls(&rows);
 
   bool success = true;
-  rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
-    makeValueIdForOneRow<T, true>(nulls, row, values, row, result, success);
-  });
+  applyWithPrefetch(
+      rows,
+      valueIdPrefetchDistance(),
+      [&](vector_size_t row) {
+        if (nulls == nullptr || !bits::isBitNull(nulls, row)) {
+          prefetchValueId(values[row]);
+        }
+      },
+      [&](vector_size_t row) INLINE_LAMBDA {
+        makeValueIdForOneRow<T, true>(nulls, row, values, row, result, success);
+      });
   return success;
 }
 
@@ -299,18 +346,37 @@ bool VectorHasher::makeValueIdsDecoded(
   if (rows.countSelected() <= decoded_.base()->size()) {
     // Cache is not beneficial in this case and we don't use them.
     auto* nulls = decoded_.nulls(&rows);
-    rows.applyToSelected([&](vector_size_t row) INLINE_LAMBDA {
-      makeValueIdForOneRow<T, mayHaveNulls>(
-          nulls, row, values, indices[row], result, success);
-    });
+    applyWithPrefetch(
+        rows,
+        valueIdPrefetchDistance(),
+        [&](vector_size_t row) {
+          if (!mayHaveNulls || nulls == nullptr ||
+              !bits::isBitNull(nulls, row)) {
+            prefetchValueId(values[indices[row]]);
+          }
+        },
+        [&](vector_size_t row) INLINE_LAMBDA {
+          makeValueIdForOneRow<T, mayHaveNulls>(
+              nulls, row, values, indices[row], result, success);
+        });
     return success;
   }
 
   cachedHashes_.resize(decoded_.base()->size());
   std::fill(cachedHashes_.begin(), cachedHashes_.end(), 0);
 
+  // Prefetch only dense selections, where every row ahead is valid to read.
+  const auto distance = rows.isAllSelected() ? valueIdPrefetchDistance() : 0;
+  const auto end = rows.end();
   int numCachedHashes = 0;
   rows.testSelected([&](vector_size_t row) INLINE_LAMBDA {
+    if (distance > 0 && row + distance < end) {
+      const auto ahead = row + distance;
+      if ((!mayHaveNulls || !decoded_.isNullAt(ahead)) &&
+          cachedHashes_[indices[ahead]] == 0) {
+        prefetchValueId(values[indices[ahead]]);
+      }
+    }
     if constexpr (mayHaveNulls) {
       if (decoded_.isNullAt(row)) {
         if (multiplier_ == 1) {
@@ -501,36 +567,45 @@ bool VectorHasher::makeGroupingSetValueIds(
   }
   bool success = true;
   const bool mayHaveNulls = decoded_.mayHaveNulls();
-  rows.applyToSelected([&](vector_size_t row) {
-    if (!success) {
-      if (!mayHaveNulls || !decoded_.isNullAt(row)) {
-        analyzeValue(decoded_.valueAt<StringView>(row));
-      }
-      return;
-    }
-    uint64_t id;
-    if (groupingSetHashValid_[row]) {
-      id = groupingSetHashes_[row];
-      ++valueIdEpochReusedRows_;
-    } else {
-      if (mayHaveNulls && decoded_.isNullAt(row)) {
-        id = 0;
-      } else {
-        ++valueIdEpochLookups_;
-        const auto value = decoded_.valueAt<StringView>(row);
-        id = valueId(value);
-        if (id == kUnmappable || id >= rangeSize_) {
-          analyzeValue(value);
-          success = false;
+  applyWithPrefetch(
+      rows,
+      valueIdPrefetchDistance(),
+      [&](vector_size_t row) {
+        if (!groupingSetHashValid_[row] &&
+            (!mayHaveNulls || !decoded_.isNullAt(row))) {
+          prefetchValueId(decoded_.valueAt<StringView>(row));
+        }
+      },
+      [&](vector_size_t row) {
+        if (!success) {
+          if (!mayHaveNulls || !decoded_.isNullAt(row)) {
+            analyzeValue(decoded_.valueAt<StringView>(row));
+          }
           return;
         }
-      }
-      groupingSetHashes_[row] = id;
-      groupingSetHashValid_[row] = 1;
-      ++cachedValueIdCount_;
-    }
-    apply(row, id);
-  });
+        uint64_t id;
+        if (groupingSetHashValid_[row]) {
+          id = groupingSetHashes_[row];
+          ++valueIdEpochReusedRows_;
+        } else {
+          if (mayHaveNulls && decoded_.isNullAt(row)) {
+            id = 0;
+          } else {
+            ++valueIdEpochLookups_;
+            const auto value = decoded_.valueAt<StringView>(row);
+            id = valueId(value);
+            if (id == kUnmappable || id >= rangeSize_) {
+              analyzeValue(value);
+              success = false;
+              return;
+            }
+          }
+          groupingSetHashes_[row] = id;
+          groupingSetHashValid_[row] = 1;
+          ++cachedValueIdCount_;
+        }
+        apply(row, id);
+      });
   // An overflow may have cleared the codebook while analyzing this batch.
   if (cachedDictionaryGeneration_ != dictionaryGeneration_) {
     valueIdEpochInvalidations_ += cachedValueIdCount_ != 0;
@@ -884,7 +959,12 @@ bool VectorHasher::makeValueIdsForRows<TypeKind::VARCHAR>(
     int32_t nullByte,
     uint8_t nullMask,
     uint64_t* result) {
+  const auto distance = valueIdPrefetchDistance();
   for (int32_t i = 0; i < numGroups; ++i) {
+    if (distance > 0) {
+      prefetchRowValueIds<StringView>(
+          groups, numGroups, i, distance, offset, nullByte, nullMask);
+    }
     if (isNullAt(groups[i], nullByte, nullMask)) {
       if (multiplier_ == 1) {
         result[i] = 0;

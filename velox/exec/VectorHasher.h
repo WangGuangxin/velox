@@ -24,6 +24,7 @@
 #include <utility>
 
 #include <velox/type/Filter.h>
+#include "velox/common/memory/HashStringAllocator.h"
 #include "velox/common/memory/RawVector.h"
 #include "velox/exec/Operator.h"
 #include "velox/vector/FlatVector.h"
@@ -521,6 +522,39 @@ class VectorHasher {
   template <typename T, bool mayHaveNulls>
   bool makeValueIdsDecoded(const SelectivityVector& rows, uint64_t* result);
 
+  // Prefetches the row 2 * 'distance' ahead of 'index' and the value-ID
+  // table chunk of the row 'distance' ahead, which the previous calls
+  // already brought into cache.
+  template <typename T>
+  void prefetchRowValueIds(
+      char** groups,
+      int32_t numGroups,
+      int32_t index,
+      int32_t distance,
+      int32_t offset,
+      int32_t nullByte,
+      uint8_t nullMask) const {
+    if (index + 2 * distance < numGroups) {
+      __builtin_prefetch(groups[index + 2 * distance] + offset);
+    }
+    if (index + distance >= numGroups) {
+      return;
+    }
+    const char* group = groups[index + distance];
+    if (isNullAt(group, nullByte, nullMask)) {
+      return;
+    }
+    const auto value = valueAt<T>(group, offset);
+    if constexpr (std::is_same_v<T, StringView>) {
+      // Hashing reads every byte, so skip strings split across blocks.
+      if (!value.isInline() &&
+          HashStringAllocator::headerOf(value.data())->size() < value.size()) {
+        return;
+      }
+    }
+    prefetchValueId(value);
+  }
+
   template <TypeKind Kind>
   bool makeValueIdsForRows(
       char** groups,
@@ -530,7 +564,12 @@ class VectorHasher {
       uint8_t nullMask,
       uint64_t* result) {
     using T = typename TypeTraits<Kind>::NativeType;
+    const auto distance = valueIdPrefetchDistance();
     for (int32_t i = 0; i < numGroups; ++i) {
+      if (distance > 0) {
+        prefetchRowValueIds<T>(
+            groups, numGroups, i, distance, offset, nullByte, nullMask);
+      }
       if (isNullAt(groups[i], nullByte, nullMask)) {
         if (multiplier_ == 1) {
           result[i] = 0;
@@ -647,6 +686,32 @@ class VectorHasher {
       return inRange;
     }
   }
+
+  // Prefetches the 'uniqueValues_' chunk that valueId(value) will probe.
+  // Value-ID lookups are dependent random accesses into a table that often
+  // outgrows L2, so issuing them a few rows ahead overlaps the cache misses.
+  // 'value' must be readable: callers skip null rows and non-contiguous
+  // strings.
+  template <typename T>
+  void prefetchValueId(T value) const {
+    if constexpr (std::is_same_v<T, StringView>) {
+      prefetchUniqueValue(UniqueValue(value.data(), value.size()));
+    } else if constexpr (std::is_same_v<T, Timestamp>) {
+      prefetchUniqueValue(UniqueValue(value.toMillis()));
+    } else if constexpr (
+        std::is_same_v<T, int8_t> || std::is_same_v<T, int16_t> ||
+        std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
+      prefetchUniqueValue(UniqueValue(value));
+    }
+  }
+
+  void prefetchUniqueValue(const UniqueValue& unique) const {
+    uniqueValues_.prefetch(uniqueValues_.prehash(unique));
+  }
+
+  // Returns the value-ID prefetch distance in rows, or 0 when prefetching
+  // cannot help because ids come from the range mapping.
+  int32_t valueIdPrefetchDistance() const;
 
   template <typename T>
   uint64_t valueId(T value) {

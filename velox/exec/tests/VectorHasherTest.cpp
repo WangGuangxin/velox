@@ -14,9 +14,11 @@
  * limitations under the License.
  */
 #include "velox/exec/VectorHasher.h"
+#include <gflags/gflags.h>
 #include <gtest/gtest.h>
 #include <array>
 #include "velox/common/base/tests/GTestUtils.h"
+#include "velox/exec/RowContainer.h"
 #include "velox/type/Type.h"
 #include "velox/type/tests/utils/CustomTypesForTesting.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
@@ -25,6 +27,8 @@ using namespace facebook;
 using namespace facebook::velox;
 using namespace facebook::velox::exec;
 using namespace facebook::velox::test;
+
+DECLARE_int32(velox_vector_hasher_value_id_prefetch_distance);
 
 class VectorHasherTest : public testing::Test, public VectorTestBase {
  protected:
@@ -488,6 +492,185 @@ TEST_F(VectorHasherTest, stringDistinctOverflow) {
       hasher->decode(*batches[i], rows);
       hasher->computeValueIds(rows, hashes);
     }
+  }
+}
+
+namespace {
+
+// Restores the value-ID prefetch distance on scope exit.
+class PrefetchDistanceGuard {
+ public:
+  explicit PrefetchDistanceGuard(int32_t distance)
+      : saved_(FLAGS_velox_vector_hasher_value_id_prefetch_distance) {
+    FLAGS_velox_vector_hasher_value_id_prefetch_distance = distance;
+  }
+
+  ~PrefetchDistanceGuard() {
+    FLAGS_velox_vector_hasher_value_id_prefetch_distance = saved_;
+  }
+
+ private:
+  const int32_t saved_;
+};
+
+// Value ids and success flags from feeding 'batches' through one hasher.
+struct ValueIdTrace {
+  std::vector<bool> success;
+  std::vector<std::vector<uint64_t>> ids;
+
+  bool operator==(const ValueIdTrace& other) const = default;
+};
+
+// Feeds 'batches' through a hasher in distinct-value mode and records every
+// result. The first batch only analyzes; later batches use value ids.
+ValueIdTrace traceValueIds(
+    const TypePtr& type,
+    const std::vector<VectorPtr>& batches,
+    const SelectivityVector& rows,
+    int32_t prefetchDistance) {
+  PrefetchDistanceGuard guard(prefetchDistance);
+  auto hasher = VectorHasher::create(type, 0);
+  ValueIdTrace trace;
+  for (auto i = 0; i < batches.size(); ++i) {
+    raw_vector<uint64_t> ids(batches[i]->size());
+    std::fill(ids.begin(), ids.end(), 0);
+    hasher->decode(*batches[i], rows);
+    trace.success.push_back(hasher->computeValueIds(rows, ids));
+    trace.ids.emplace_back(ids.begin(), ids.end());
+    if (i == 0) {
+      hasher->enableValueIds(1, VectorHasher::kNoLimit);
+    }
+  }
+  return trace;
+}
+
+} // namespace
+
+TEST_F(VectorHasherTest, valueIdPrefetchKeepsIds) {
+  constexpr vector_size_t kSize = 5'000;
+  // Spread integers so that the hasher uses distinct values, not a range.
+  auto bigints = [&](int32_t seed) {
+    return makeFlatVector<int64_t>(kSize, [seed](auto row) {
+      return ((row * 7 + seed) % 3'001) * 1'000'000'007LL;
+    });
+  };
+  auto smallBigints = [&](int32_t seed) {
+    return makeFlatVector<int64_t>(
+        977, [seed](auto row) { return (row * 5 + seed) * 1'000'000'007LL; });
+  };
+  auto strings = [&](int32_t seed, bool withNulls, int32_t width) {
+    return makeFlatVector<std::string>(
+        kSize,
+        [seed, width](auto row) {
+          return fmt::format("{:0>{}}", (row * 13 + seed) % 2'003, width);
+        },
+        withNulls ? nullEvery(7) : nullptr);
+  };
+
+  struct TestCase {
+    std::string name;
+    TypePtr type;
+    std::vector<VectorPtr> batches;
+  };
+  std::vector<TestCase> testCases;
+  testCases.push_back(
+      {"bigintFlat", BIGINT(), {bigints(1), bigints(2), bigints(3)}});
+  testCases.push_back(
+      {"bigintNulls",
+       BIGINT(),
+       {makeFlatVector<int64_t>(
+            kSize,
+            [](auto row) { return (row % 2'001) * 999'999'937LL; },
+            nullEvery(5)),
+        makeFlatVector<int64_t>(
+            kSize,
+            [](auto row) { return (row % 2'003) * 999'999'937LL; },
+            nullEvery(3))}});
+  // Dictionary over a smaller base takes the cached-id path; over a larger
+  // base, the per-row path.
+  auto indices = makeIndices(kSize, [](auto row) { return (row * 31) % 977; });
+  auto wideIndices =
+      makeIndices(kSize, [](auto row) { return (row * 17) % kSize; });
+  testCases.push_back(
+      {"bigintDictionarySmallBase",
+       BIGINT(),
+       {wrapInDictionary(indices, kSize, smallBigints(4)),
+        wrapInDictionary(indices, kSize, smallBigints(5))}});
+  testCases.push_back(
+      {"stringDictionaryLargeBase",
+       VARCHAR(),
+       {wrapInDictionary(wideIndices, kSize, strings(6, true, 20)),
+        wrapInDictionary(wideIndices, kSize, strings(7, true, 20))}});
+  testCases.push_back(
+      {"shortStrings",
+       VARCHAR(),
+       {strings(1, false, 9), strings(2, true, 9), strings(3, false, 9)}});
+  testCases.push_back(
+      {"longStrings",
+       VARCHAR(),
+       {strings(1, true, 24), strings(2, false, 24), strings(3, true, 24)}});
+
+  SelectivityVector allRows(kSize);
+  SelectivityVector oddRows(kSize);
+  for (auto row = 0; row < kSize; row += 2) {
+    oddRows.setValid(row, false);
+  }
+  oddRows.updateBounds();
+  for (const auto& testCase : testCases) {
+    SCOPED_TRACE(testCase.name);
+    for (const auto* rows : {&allRows, &oddRows}) {
+      const auto expected =
+          traceValueIds(testCase.type, testCase.batches, *rows, 0);
+      ASSERT_TRUE(expected.success.back());
+      for (auto distance : {1, 4, 16}) {
+        SCOPED_TRACE(fmt::format("distance {}", distance));
+        EXPECT_EQ(
+            expected,
+            traceValueIds(testCase.type, testCase.batches, *rows, distance));
+      }
+    }
+  }
+}
+
+TEST_F(VectorHasherTest, valueIdPrefetchKeepsRowIds) {
+  constexpr vector_size_t kSize = 3'000;
+  auto vector = makeFlatVector<std::string>(
+      kSize,
+      [](auto row) {
+        // Mix inline and out-of-line strings.
+        return row % 3 == 0 ? fmt::format("k{}", row % 101)
+                            : fmt::format("key-out-of-line-{:06}", row % 997);
+      },
+      nullEvery(11));
+  RowContainer container({VARCHAR()}, pool());
+  DecodedVector decoded(*vector);
+  std::vector<char*> groups(kSize);
+  for (auto row = 0; row < kSize; ++row) {
+    groups[row] = container.newRow();
+    container.store(decoded, row, groups[row], 0);
+  }
+  const auto& column = container.columnAt(0);
+
+  auto computeIds = [&](int32_t distance) {
+    PrefetchDistanceGuard guard(distance);
+    auto hasher = VectorHasher::create(VARCHAR(), 0);
+    hasher->decode(*vector, SelectivityVector(kSize));
+    raw_vector<uint64_t> ids(kSize);
+    hasher->computeValueIds(SelectivityVector(kSize), ids);
+    hasher->enableValueIds(1, VectorHasher::kNoLimit);
+    std::fill(ids.begin(), ids.end(), 0);
+    EXPECT_TRUE(hasher->computeValueIdsForRows(
+        groups.data(),
+        kSize,
+        column.offset(),
+        column.nullByte(),
+        column.nullMask(),
+        ids));
+    return std::vector<uint64_t>(ids.begin(), ids.end());
+  };
+  const auto expected = computeIds(0);
+  for (auto distance : {1, 8}) {
+    EXPECT_EQ(expected, computeIds(distance));
   }
 }
 
