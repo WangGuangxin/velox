@@ -656,6 +656,14 @@ struct LoadIndices<int16_t, A> {
         _mm_loadu_si128(reinterpret_cast<const __m128i*>(values)));
   }
 #endif
+
+#if XSIMD_WITH_NEON64
+  static xsimd::batch<int32_t, A> apply(
+      const int16_t* values,
+      const xsimd::neon&) {
+    return vmovl_s16(vld1_s16(values));
+  }
+#endif
 };
 
 template <typename A>

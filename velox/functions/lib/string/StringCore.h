@@ -58,6 +58,9 @@ FOLLY_ALWAYS_INLINE bool isAscii(const char* str, size_t length) {
 #if XSIMD_WITH_AVX
     // 1 instruction instead of 2 on AVX.
     if (!_mm256_testz_si256(batch, mask)) {
+#elif XSIMD_WITH_NEON64
+    // One UMAXV reduction instead of compare plus reduction.
+    if (vmaxvq_u8(batch.data) & 0x80) {
 #else
     if (xsimd::any(batch >= mask)) {
 #endif
