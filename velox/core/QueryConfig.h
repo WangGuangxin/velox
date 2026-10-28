@@ -114,7 +114,7 @@ class QueryConfig {
       hashJoinAdaptiveValueIdsEnabled,
       "hash_join_adaptive_value_ids_enabled",
       bool,
-      false,
+      true,
       "Enable build-only cardinality sampling and early distinct dictionary abandonment.")
 
   VELOX_QUERY_CONFIG(
@@ -138,7 +138,7 @@ class QueryConfig {
       hashJoinBatchValueIdsEnabled,
       "hash_join_batch_value_ids_enabled",
       bool,
-      false,
+      true,
       "Reuse repeated key value IDs during hash build, including deduplicating builds.")
 
   VELOX_QUERY_CONFIG(
@@ -146,7 +146,7 @@ class QueryConfig {
       hashBuildBatchStoreEnabled,
       "hash_build_batch_store_enabled",
       bool,
-      false,
+      true,
       "Store dense append-only hash build input one column at a time.")
 
   VELOX_QUERY_CONFIG(
@@ -154,7 +154,7 @@ class QueryConfig {
       groupingSetsBatchingEnabled,
       "grouping_sets_batching_enabled",
       bool,
-      false,
+      true,
       "Reuse raw column hashes across projections of the same Expand input batch.")
 
   /// Maximum memory that a query can use on a single host.
@@ -1739,7 +1739,7 @@ class QueryConfig {
       groupingSetsValueIdsEnabled,
       "grouping_sets_value_ids_enabled",
       bool,
-      false,
+      true,
       "Enable larger string dictionaries only for Expand-fed partial aggregation.")
 
   VELOX_QUERY_CONFIG(
@@ -1771,7 +1771,7 @@ class QueryConfig {
       adaptivePartialAggregationMemoryLimit,
       "adaptive_partial_aggregation_memory_limit",
       int64_t,
-      0,
+      int64_t{1} << 30,
       "Optional partial aggregation memory ceiling after reservation; zero disables growth.")
 
  private:

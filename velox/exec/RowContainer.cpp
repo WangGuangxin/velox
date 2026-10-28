@@ -23,11 +23,11 @@
 
 DEFINE_bool(
     velox_row_container_batch_fixed_extraction_enabled,
-    false,
+    true,
     "Batch fixed-width row extraction and null bitmap updates");
 DEFINE_bool(
     velox_arm_sve_row_extraction_enabled,
-    false,
+    true,
     "Use predicated ARM SVE gathers for direct non-nullable integer columns");
 
 DECLARE_bool(velox_row_container_string_extraction_prefetch_enabled);

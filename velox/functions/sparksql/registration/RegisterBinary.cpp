@@ -39,8 +39,16 @@ void registerBinaryFunctions(const std::string& prefix) {
       makeXxHash64WithSeed,
       hashMetadata());
   registerFunction<Md5Function, Varchar, Varbinary>({prefix + "md5"});
-  registerFunction<BloomFilterMightContainFunction, bool, Varbinary, int64_t>(
-      {prefix + "might_contain"});
+  // might_contain uses the batched probe (SVE where available; it falls back
+  // to the portable batch otherwise). Results equal the scalar function.
+  exec::registerStatefulVectorFunction(
+      prefix + "might_contain",
+      mightContainSignatures(),
+      [](const std::string& /*name*/,
+         const std::vector<exec::VectorFunctionArg>& inputArgs,
+         const core::QueryConfig& /*config*/) {
+        return makeMightContainBatch(inputArgs, true);
+      });
   for (bool sve : {false, true}) {
     exec::registerStatefulVectorFunction(
         prefix + (sve ? "might_contain_batch_sve" : "might_contain_batch"),

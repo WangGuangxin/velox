@@ -70,15 +70,15 @@ TEST_F(QueryConfigTest, joinEnumerationTuning) {
 
 TEST_F(QueryConfigTest, adaptiveJoinValueIds) {
   const QueryConfig defaults{{}};
-  EXPECT_FALSE(defaults.hashJoinBatchValueIdsEnabled());
-  EXPECT_FALSE(defaults.groupingSetsBatchingEnabled());
-  const QueryConfig reuse({
-      {QueryConfig::kHashJoinBatchValueIdsEnabled, "true"},
-      {QueryConfig::kGroupingSetsBatchingEnabled, "true"},
+  EXPECT_TRUE(defaults.hashJoinBatchValueIdsEnabled());
+  EXPECT_TRUE(defaults.groupingSetsBatchingEnabled());
+  const QueryConfig noReuse({
+      {QueryConfig::kHashJoinBatchValueIdsEnabled, "false"},
+      {QueryConfig::kGroupingSetsBatchingEnabled, "false"},
   });
-  EXPECT_TRUE(reuse.hashJoinBatchValueIdsEnabled());
-  EXPECT_TRUE(reuse.groupingSetsBatchingEnabled());
-  EXPECT_FALSE(defaults.hashJoinAdaptiveValueIdsEnabled());
+  EXPECT_FALSE(noReuse.hashJoinBatchValueIdsEnabled());
+  EXPECT_FALSE(noReuse.groupingSetsBatchingEnabled());
+  EXPECT_TRUE(defaults.hashJoinAdaptiveValueIdsEnabled());
   EXPECT_EQ(defaults.hashJoinAdaptiveValueIdsMinRows(), 32768);
   EXPECT_EQ(defaults.hashJoinAdaptiveValueIdsMinDistinctPct(), 80);
   const QueryConfig configured({
@@ -102,10 +102,10 @@ TEST_F(QueryConfigTest, adaptiveJoinValueIds) {
 
 TEST_F(QueryConfigTest, adaptivePartialMemoryBudget) {
   const QueryConfig defaults{{}};
-  EXPECT_EQ(defaults.adaptivePartialAggregationMemoryLimit(), 0);
+  EXPECT_EQ(defaults.adaptivePartialAggregationMemoryLimit(), 1LL << 30);
   const QueryConfig configured{
-      {{QueryConfig::kAdaptivePartialAggregationMemoryLimit, "1073741824"}}};
-  EXPECT_EQ(configured.adaptivePartialAggregationMemoryLimit(), 1LL << 30);
+      {{QueryConfig::kAdaptivePartialAggregationMemoryLimit, "0"}}};
+  EXPECT_EQ(configured.adaptivePartialAggregationMemoryLimit(), 0);
   for (const auto* value : {"-1", "1073741825"}) {
     EXPECT_THROW(
         (QueryConfig{
@@ -119,7 +119,7 @@ TEST_F(QueryConfigTest, adaptivePartialMemoryBudget) {
       });
   ASSERT_NE(property, properties.end());
   EXPECT_EQ(property->type, config::ConfigPropertyType::kInteger);
-  EXPECT_EQ(property->defaultValue, "0");
+  EXPECT_EQ(property->defaultValue, "1073741824");
 }
 
 TEST_F(QueryConfigTest, emptyConfig) {

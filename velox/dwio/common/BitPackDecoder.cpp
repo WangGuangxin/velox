@@ -25,12 +25,12 @@
 
 DEFINE_bool(
     velox_arm_sve_bit_unpack_enabled,
-    false,
+    true,
     "Use ARM SVE for the bounded safe prefix of selected integer bit unpacking; application-static.");
 
 DEFINE_bool(
     velox_arm_sve_bit_deposit_enabled,
-    false,
+    true,
     "Use ARM SVE2 BitPerm for contiguous selected integer fields; application-static.");
 
 namespace facebook::velox::dwio::common {

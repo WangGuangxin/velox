@@ -31,20 +31,20 @@ DEFINE_bool(
 // Used in exec/RowContainer.cpp. Configure before starting worker threads.
 DEFINE_bool(
     velox_row_container_batch_string_extraction_enabled,
-    false,
+    true,
     "Batch RowContainer string extraction into output-owned buffers; set only "
     "during process initialization");
 
 // Used in exec/RowContainer.cpp. Configure before starting worker threads.
 DEFINE_bool(
     velox_row_container_string_equality_enabled,
-    false,
+    true,
     "Use cached size/prefix and equality comparison for RowContainer string "
     "keys; set only during process initialization");
 
 DEFINE_bool(
     velox_row_container_string_extraction_prefetch_enabled,
-    false,
+    true,
     "Prefetch row metadata and out-of-line string headers during batch extraction; "
     "set only during process initialization");
 
@@ -155,17 +155,17 @@ DEFINE_int32(
 
 DEFINE_bool(
     velox_hash_join_head_chain_drain_enabled,
-    false,
+    true,
     "Drain a duplicate head chain without rescanning already buffered later chains");
 
 DEFINE_bool(
     velox_hash_join_fixed_width_output_enabled,
-    false,
+    true,
     "Skip per-hit byte accounting when a fixed-width output batch is row-limited.");
 
 DEFINE_bool(
     velox_hash_join_compact_chains_enabled,
-    false,
+    true,
     "Build bounded immutable pointer lists for long duplicate join chains");
 DEFINE_int64(
     velox_hash_join_compact_chains_max_bytes,
@@ -173,5 +173,5 @@ DEFINE_int64(
     "Maximum optional posting-list and index bytes per join table");
 DEFINE_bool(
     velox_hash_join_estimated_width_output_enabled,
-    false,
+    true,
     "Use the row-limited emitter for constant-accounted estimated join output");

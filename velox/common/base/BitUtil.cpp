@@ -25,7 +25,7 @@
 
 DEFINE_bool(
     velox_arm_sve_hash_tail_enabled,
-    false,
+    true,
     "Use bounded predicated ARM SVE loads for CRC32C byte-hash tails");
 
 namespace facebook::velox::bits {
