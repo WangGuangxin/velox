@@ -50,6 +50,7 @@ velox_add_library(
   BitSet.h
   BitUtil.h
   ArmSveHashTail.h
+  ArmSveNeonGather.h
   BloomFilter.h
   CheckedArithmetic.h
   ClassName.h
