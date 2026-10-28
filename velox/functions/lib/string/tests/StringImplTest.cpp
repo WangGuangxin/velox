@@ -1304,6 +1304,17 @@ TEST_F(StringImplTest, isAscii) {
   memcpy(&s[0], alpha, strlen(alpha));
   ASSERT_FALSE(isAscii(s.data(), strlen(alpha)));
   ASSERT_FALSE(isAscii(s.data(), s.size()));
+
+  for (size_t length = 0; length <= 129; ++length) {
+    std::string input(length, 'a');
+    ASSERT_TRUE(isAscii(input.data(), length));
+    for (size_t position = 0; position < length; ++position) {
+      input[position] = static_cast<char>(0x80);
+      ASSERT_FALSE(isAscii(input.data(), length))
+          << "length=" << length << " position=" << position;
+      input[position] = 'a';
+    }
+  }
 }
 
 TEST_F(StringImplTest, initcapUnicodePresto) {
