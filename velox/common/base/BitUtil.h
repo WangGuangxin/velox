@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+// Copyright (c) ByteDance Ltd. and/or its affiliates.
+
 #pragma once
 
 #include "velox/common/base/Exceptions.h"
@@ -27,6 +29,10 @@
 #include <cstring>
 #include <span>
 #include <string>
+
+#if defined(__ARM_FEATURE_SVE)
+#include <arm_sve.h>
+#endif
 
 #ifdef __BMI2__
 #include <x86intrin.h>
@@ -396,6 +402,44 @@ inline void reverseBits(uint8_t* bytes, int numBytes) {
 
 inline bool
 isAllSet(const uint64_t* bits, int32_t begin, int32_t end, bool value = true) {
+#if defined(__ARM_FEATURE_SVE)
+  if (begin >= end) {
+    return true;
+  }
+  const uint64_t expected = value ? ~uint64_t{0} : 0;
+  auto wordIndex = begin >> 6;
+  const auto beginOffset = begin & 63;
+  if (beginOffset != 0) {
+    auto mask = ~uint64_t{0} << beginOffset;
+    const bool isLastWord = wordIndex == (end >> 6);
+    if (isLastWord) {
+      mask &= lowMask(end - (wordIndex << 6));
+    }
+    if ((bits[wordIndex] & mask) != (expected & mask)) {
+      return false;
+    }
+    if (isLastWord) {
+      return true;
+    }
+    ++wordIndex;
+  }
+
+  const auto fullWordEnd = end >> 6;
+  while (wordIndex < fullWordEnd) {
+    const auto active = svwhilelt_b64(wordIndex, fullWordEnd);
+    const auto words = svld1_u64(active, bits + wordIndex);
+    const auto matches = svcmpeq_n_u64(active, words, expected);
+    if (svptest_any(active, svnot_b_z(active, matches))) {
+      return false;
+    }
+    wordIndex += svcntd();
+  }
+  if ((end & 63) != 0) {
+    const auto mask = lowMask(end & 63);
+    return (bits[fullWordEnd] & mask) == (expected & mask);
+  }
+  return true;
+#else
   if (begin >= end) {
     return true;
   }
@@ -407,9 +451,58 @@ isAllSet(const uint64_t* bits, int32_t begin, int32_t end, bool value = true) {
         return (word & mask) == (bits[idx] & mask);
       },
       [bits, word](int32_t idx) { return word == bits[idx]; });
+#endif
 }
 
 inline int32_t findFirstBit(const uint64_t* bits, int32_t begin, int32_t end) {
+#if defined(__ARM_FEATURE_SVE)
+  if (begin >= end) {
+    return -1;
+  }
+
+  auto wordIndex = begin >> 6;
+  const auto beginOffset = begin & 63;
+  if (beginOffset != 0) {
+    auto word = bits[wordIndex] & (~uint64_t{0} << beginOffset);
+    const bool isLastWord = wordIndex == (end >> 6);
+    if (isLastWord) {
+      word &= lowMask(end - (wordIndex << 6));
+    }
+    if (word != 0) {
+      return (wordIndex << 6) + std::countr_zero(word);
+    }
+    if (isLastWord) {
+      return -1;
+    }
+    ++wordIndex;
+  }
+
+  // Only words wholly contained in [begin, end) are handled by SIMD. This
+  // keeps the loads in bounds and leaves the final partial word to the scalar
+  // path below.
+  const auto fullWordEnd = end >> 6;
+
+  while (wordIndex < fullWordEnd) {
+    const auto active = svwhilelt_b64(wordIndex, fullWordEnd);
+    const auto words = svld1_u64(active, bits + wordIndex);
+    const auto nonZero = svcmpne_n_u64(active, words, 0);
+    if (svptest_any(active, nonZero)) {
+      const auto beforeFirst = svbrkb_z(active, nonZero);
+      const auto lane = svcntp_b64(active, beforeFirst);
+      const auto word = bits[wordIndex + lane];
+      return ((wordIndex + lane) << 6) + std::countr_zero(word);
+    }
+    wordIndex += svcntd();
+  }
+
+  if ((end & 63) != 0) {
+    const auto word = bits[fullWordEnd] & lowMask(end & 63);
+    if (word != 0) {
+      return (fullWordEnd << 6) + std::countr_zero(word);
+    }
+  }
+  return -1;
+#else
   int32_t found = -1;
   testWords(
       begin,
@@ -431,6 +524,7 @@ inline int32_t findFirstBit(const uint64_t* bits, int32_t begin, int32_t end) {
         return true;
       });
   return found;
+#endif
 }
 
 /**
@@ -565,6 +659,55 @@ inline int32_t findLastBit(
     int32_t begin,
     int32_t end,
     bool value = true) {
+#if defined(__ARM_FEATURE_SVE)
+  if (begin >= end) {
+    return -1;
+  }
+  const auto select = [value](uint64_t word) { return value ? word : ~word; };
+  auto wordIndex = end >> 6;
+  const auto endOffset = end & 63;
+  const auto beginWord = begin >> 6;
+  const auto beginOffset = begin & 63;
+  if (endOffset != 0) {
+    auto mask = lowMask(endOffset);
+    if (wordIndex == beginWord) {
+      mask &= ~uint64_t{0} << beginOffset;
+    }
+    const auto word = select(bits[wordIndex]) & mask;
+    if (word != 0) {
+      return (wordIndex << 6) + static_cast<int32_t>(std::bit_width(word)) - 1;
+    }
+    if (wordIndex == beginWord) {
+      return -1;
+    }
+  }
+
+  const auto fullWordBegin = (begin >> 6) + ((begin & 63) != 0);
+  while (wordIndex > fullWordBegin) {
+    const auto numWords =
+        std::min<int32_t>(svcntd(), wordIndex - fullWordBegin);
+    wordIndex -= numWords;
+    const auto active = svwhilelt_b64(int32_t{0}, numWords);
+    auto words = svld1_u64(active, bits + wordIndex);
+    if (!value) {
+      words = svnot_u64_z(active, words);
+    }
+    const auto nonZero = svcmpne_n_u64(active, words, 0);
+    if (svptest_any(active, nonZero)) {
+      const auto lane = svlastb_u64(nonZero, svindex_u64(0, 1));
+      const auto word = select(bits[wordIndex + lane]);
+      return ((wordIndex + lane) << 6) +
+          static_cast<int32_t>(std::bit_width(word)) - 1;
+    }
+  }
+  if (beginOffset != 0) {
+    const auto word = select(bits[beginWord]) & (~uint64_t{0} << beginOffset);
+    if (word != 0) {
+      return (beginWord << 6) + static_cast<int32_t>(std::bit_width(word)) - 1;
+    }
+  }
+  return -1;
+#else
   int32_t found = -1;
   testWordsReverse(
       begin,
@@ -586,6 +729,7 @@ inline int32_t findLastBit(
         return true;
       });
   return found;
+#endif
 }
 
 inline int32_t
@@ -928,13 +1072,11 @@ inline uint64_t extractBits(uint64_t a, uint64_t mask) {
 #elif VELOX_ARM_BITPERM
 template <>
 inline uint64_t extractBits(uint64_t a, uint64_t mask) {
-  return vgetq_lane_u64(
-      svget_neonq_u64(svbext_n_u64(svdup_n_u64(a), mask)), 0);
+  return vgetq_lane_u64(svget_neonq_u64(svbext_n_u64(svdup_n_u64(a), mask)), 0);
 }
 template <>
 inline uint32_t extractBits(uint32_t a, uint32_t mask) {
-  return vgetq_lane_u32(
-      svget_neonq_u32(svbext_n_u32(svdup_n_u32(a), mask)), 0);
+  return vgetq_lane_u32(svget_neonq_u32(svbext_n_u32(svdup_n_u32(a), mask)), 0);
 }
 #else
 template <typename T>

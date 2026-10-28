@@ -183,6 +183,54 @@ TEST_F(BitUtilTest, isAllSet) {
   EXPECT_EQ(findLastBit(word, 381, 600), 383);
 }
 
+TEST_F(BitUtilTest, bitmapScanBoundaries) {
+  EXPECT_TRUE(isAllSet(nullptr, 7, 7));
+  EXPECT_EQ(findFirstBit(nullptr, 7, 7), -1);
+  EXPECT_EQ(findLastBit(nullptr, 7, 7), -1);
+  EXPECT_EQ(findLastUnsetBit(nullptr, 7, 7), -1);
+
+  // Exact-sized allocations exercise partial words and partial SIMD batches.
+  for (int32_t numWords : {1, 2, 3, 4, 5, 7, 8, 9, 16, 17, 33}) {
+    std::vector<uint64_t> data(numWords);
+    const int32_t numBits = numWords * 64;
+    const auto check = [&](int32_t begin, int32_t end) {
+      SCOPED_TRACE(
+          fmt::format("words={} range=[{}, {})", numWords, begin, end));
+      int32_t first = -1;
+      int32_t last = -1;
+      int32_t lastUnset = -1;
+      for (int32_t bit = begin; bit < end; ++bit) {
+        if (isBitSet(data.data(), bit)) {
+          if (first == -1) {
+            first = bit;
+          }
+          last = bit;
+        } else {
+          lastUnset = bit;
+        }
+      }
+      EXPECT_EQ(findFirstBit(data.data(), begin, end), first);
+      EXPECT_EQ(findLastBit(data.data(), begin, end), last);
+      EXPECT_EQ(findLastUnsetBit(data.data(), begin, end), lastUnset);
+      EXPECT_EQ(isAllSet(data.data(), begin, end), lastUnset == -1);
+      EXPECT_EQ(isAllSet(data.data(), begin, end, false), first == -1);
+    };
+
+    for (bool background : {false, true}) {
+      std::fill(data.begin(), data.end(), background ? ~uint64_t{0} : 0);
+      for (int32_t position = 0; position < numBits; ++position) {
+        setBit(data.data(), position, !background);
+        // Sweep all tail offsets, including exact word boundaries. The flipped
+        // bit may lie before, inside, or after the scanned range.
+        for (int32_t offset = 0; offset < 64; ++offset) {
+          check(offset, numBits - offset);
+        }
+        setBit(data.data(), position, background);
+      }
+    }
+  }
+}
+
 TEST_F(BitUtilTest, findLastUnsetBit) {
   uint64_t allOnes = static_cast<uint64_t>(-1);
 
