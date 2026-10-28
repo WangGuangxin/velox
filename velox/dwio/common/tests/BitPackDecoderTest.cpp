@@ -16,8 +16,10 @@
 
 #include "velox/dwio/common/BitPackDecoder.h"
 #include "velox/common/base/Nulls.h"
+#include "velox/common/base/SimdUtil.h"
 #include "velox/dwio/parquet/reader/RleBpDataDecoder.h"
 
+#include <fmt/format.h>
 #include <folly/Random.h>
 #include <gflags/gflags.h>
 #include <gmock/gmock.h>
@@ -178,6 +180,53 @@ TEST_F(BitPackDecoderTest, allWidths) {
     testUnpack<int64_t>(width, oddRows_);
   }
 }
+
+#if XSIMD_WITH_SVE && VELOX_SVE_GATHER_INTRINSICS_SAFE
+TEST_F(BitPackDecoderTest, narrowSelectedRows) {
+  for (uint8_t width = 1; width <= 24; ++width) {
+    for (int32_t bitOffset = 0; bitOffset < 8; ++bitOffset) {
+      for (int32_t numRows : {1, 3, 4, 7, 8, 9, 17, 33}) {
+        SCOPED_TRACE(
+            fmt::format(
+                "width={} offset={} rows={}", width, bitOffset, numRows));
+        std::vector<int32_t> rows(numRows);
+        for (int32_t i = 0; i < numRows; ++i) {
+          rows[i] = i * 3 + 5;
+        }
+        const int32_t numValues = rows.back() + 1;
+        const auto numBytes =
+            bits::divRoundUp(bitOffset + numValues * width, 8);
+        std::vector<uint64_t> packed(bits::divRoundUp(numBytes, 8));
+        // Include values above INT16_MAX to check truncation, not saturation.
+        std::vector<uint64_t> expected(numRows);
+        for (int32_t i = 0; i < numRows; ++i) {
+          expected[i] = (i % 2 == 0 ? bits::lowMask(width) : randomInts_[i]) &
+              bits::lowMask(width);
+          bits::copyBits(
+              expected.data() + i,
+              0,
+              packed.data(),
+              bitOffset + rows[i] * width,
+              width);
+        }
+        std::vector<int16_t> result(numRows);
+        unpack(
+            packed.data(),
+            bitOffset,
+            RowSet(rows),
+            0,
+            width,
+            reinterpret_cast<const char*>(packed.data()) + numBytes,
+            result.data());
+        for (int32_t i = 0; i < numRows; ++i) {
+          EXPECT_EQ(result[i], static_cast<int16_t>(expected[i]))
+              << "row " << i;
+        }
+      }
+    }
+  }
+}
+#endif
 
 TEST_P(BitPackDecoderBmi2Test, uint8AllRows) {
   for (auto width = 1; width <= 8; ++width) {

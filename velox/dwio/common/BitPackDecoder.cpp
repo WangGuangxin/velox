@@ -286,7 +286,9 @@ void unpack(
   // Up to 24 bits plus the seven possible starting-bit positions fit in a
   // 32-bit gather. numSafeRows already excludes the buffer-end red zone.
   // Keep wider fields and the tail on the existing bounded scalar path.
-  if constexpr (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>) {
+  if constexpr (
+      std::is_same_v<T, int16_t> || std::is_same_v<T, int32_t> ||
+      std::is_same_v<T, int64_t>) {
     if (bitWidth <= 24) {
       using I = xsimd::batch<int32_t>;
       using U = xsimd::batch<uint32_t>;
@@ -299,7 +301,10 @@ void unpack(
         const auto shifts = xsimd::bitwise_cast<U>(positions & 7);
         const auto values = xsimd::bitwise_cast<I>(
             (words >> shifts) & static_cast<uint32_t>(mask));
-        if constexpr (std::is_same_v<T, int32_t>) {
+        if constexpr (std::is_same_v<T, int16_t>) {
+          // Narrowing stores preserve the scalar path's low 16 bits.
+          svst1h_s32(svptrue_b32(), result + i, values.data);
+        } else if constexpr (std::is_same_v<T, int32_t>) {
           values.store_unaligned(result + i);
         } else {
           simd::getHalf<int64_t, 0>(values).store_unaligned(result + i);
