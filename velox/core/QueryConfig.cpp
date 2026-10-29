@@ -58,6 +58,8 @@ const std::vector<config::ConfigProperty>& QueryConfig::registeredProperties() {
     VELOX_REGISTER_QUERY_CONFIG(kHashJoinAdaptiveValueIdsMinRows);
     VELOX_REGISTER_QUERY_CONFIG(kHashJoinAdaptiveValueIdsMinDistinctPct);
     VELOX_REGISTER_QUERY_CONFIG(kHashJoinBatchValueIdsEnabled);
+    VELOX_REGISTER_QUERY_CONFIG(kGroupingSetsKeyReuseEnabled);
+    VELOX_REGISTER_QUERY_CONFIG(kGroupingSetsKeyReuseMaxBytes);
 
     // Cast.
     VELOX_REGISTER_QUERY_CONFIG(kLegacyCast);
@@ -300,6 +302,7 @@ QueryConfig::QueryConfig(
 }
 
 void QueryConfig::validateConfig() {
+  VELOX_USER_CHECK_GE(groupingSetsKeyReuseMaxBytes(), 0);
   VELOX_USER_CHECK_GE(adaptivePartialAggregationMemoryLimit(), 0);
   VELOX_USER_CHECK_LE(
       adaptivePartialAggregationMemoryLimit(), int64_t{1} << 30);

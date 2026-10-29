@@ -265,6 +265,22 @@ class VectorHasher {
     return std::exchange(batchReuseStats_, BatchReuseStats{});
   }
 
+  /// Folds into 'result' a contribution that computeValueIds() previously
+  /// wrote over a zeroed buffer. Applies the same combining rule
+  /// computeValueIds() uses, so the outcome is identical to recomputing.
+  void combineValueIdContribution(
+      const SelectivityVector& rows,
+      const uint64_t* contribution,
+      raw_vector<uint64_t>& result) const;
+
+  /// Folds into 'result' a contribution that hash() previously wrote with
+  /// 'mix' false. 'mix' has the same meaning as in hash().
+  void combineHashContribution(
+      const SelectivityVector& rows,
+      const uint64_t* contribution,
+      bool mix,
+      raw_vector<uint64_t>& result) const;
+
   /// Raises the string dictionary limits used while deciding the hash mode.
   /// Has no effect on non-string keys. Must be called before any value is
   /// analyzed.

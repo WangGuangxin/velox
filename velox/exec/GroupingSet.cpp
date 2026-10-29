@@ -16,6 +16,7 @@
 #include "velox/exec/GroupingSet.h"
 #include "velox/common/base/BitUtil.h"
 #include "velox/common/testutil/TestValue.h"
+#include "velox/exec/GroupingKeyContributions.h"
 #include "velox/exec/OperatorUtils.h"
 #include "velox/exec/Task.h"
 
@@ -448,6 +449,13 @@ std::vector<Accumulator> GroupingSet::accumulators(bool excludeToIntermediate) {
   return accumulators;
 }
 
+void GroupingSet::enableKeyContributionReuse(int64_t maxBytes) {
+  VELOX_CHECK_NULL(
+      table_, "Enable key contribution reuse before the first input");
+  keyContributions_ = std::make_unique<GroupingKeyContributions>(
+      hashers_.size(), pool_, maxBytes);
+}
+
 void GroupingSet::createHashTable() {
   if (ignoreNullKeys_) {
     table_ = HashTable<true>::createForAggregation(
@@ -455,6 +463,11 @@ void GroupingSet::createHashTable() {
   } else {
     table_ = HashTable<false>::createForAggregation(
         std::move(hashers_), accumulators(false), pool_);
+  }
+
+  if (keyContributions_ != nullptr) {
+    keyContributions_->clear();
+    table_->setKeyContributions(keyContributions_.get());
   }
 
   RowContainer& rows = *table_->rows();

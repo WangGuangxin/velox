@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <optional>
 #include "velox/common/testutil/TestValue.h"
+#include "velox/exec/GroupingKeyContributions.h"
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/PartialAggregationMemoryPolicy.h"
 #include "velox/exec/PrefixSort.h"
@@ -183,6 +184,11 @@ void HashAggregation::initialize() {
       spillStats_.get());
 
   hasCompactableAggregates_ = groupingSet_->hasCompactableAggregates();
+
+  if (expandFed_ && config.groupingSetsKeyReuseEnabled()) {
+    groupingSet_->enableKeyContributionReuse(
+        config.groupingSetsKeyReuseMaxBytes());
+  }
 
   aggregationNode_.reset();
 }
@@ -355,6 +361,18 @@ void HashAggregation::updateRuntimeStats() {
     }
     if (asDistinct != VectorHasher::kRangeTooLarge) {
       runtimeStats[fmt::format("distinctKey{}", i)] = RuntimeMetric(asDistinct);
+    }
+  }
+
+  if (const auto* contributions = groupingSet_->keyContributions()) {
+    // Cumulative, so assign rather than accumulate.
+    runtimeStats["groupingKeyRowsReused"] =
+        RuntimeMetric(contributions->numReusedRows());
+    runtimeStats["groupingKeyRowsComputed"] =
+        RuntimeMetric(contributions->numComputedRows());
+    if (contributions->numUncachedRows() != 0) {
+      runtimeStats["groupingKeyRowsUncached"] =
+          RuntimeMetric(contributions->numUncachedRows());
     }
   }
 

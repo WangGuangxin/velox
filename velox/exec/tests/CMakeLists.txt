@@ -146,6 +146,8 @@ set(
   RowContainerBatchStoreTest.cpp
   RowContainerFixedExtractionTest.cpp
   VectorHasherBatchReuseTest.cpp
+  GroupingKeyContributionsTest.cpp
+  GroupingKeyReuseTest.cpp
   # group7 (~449s): IndexLookupJoinTestExtra 188
   # + MergeJoin 111 + ScaleWriter 96 + Exchange 54
   IndexLookupJoinTestExtra.cpp

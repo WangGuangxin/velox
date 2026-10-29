@@ -71,10 +71,17 @@ TEST_F(QueryConfigTest, joinEnumerationTuning) {
 TEST_F(QueryConfigTest, adaptiveJoinValueIds) {
   const QueryConfig defaults{{}};
   EXPECT_FALSE(defaults.hashJoinBatchValueIdsEnabled());
+  EXPECT_FALSE(defaults.groupingSetsKeyReuseEnabled());
   const QueryConfig reuse({
       {QueryConfig::kHashJoinBatchValueIdsEnabled, "true"},
+      {QueryConfig::kGroupingSetsKeyReuseEnabled, "true"},
   });
   EXPECT_TRUE(reuse.hashJoinBatchValueIdsEnabled());
+  EXPECT_TRUE(reuse.groupingSetsKeyReuseEnabled());
+  EXPECT_EQ(defaults.groupingSetsKeyReuseMaxBytes(), 8 << 20);
+  VELOX_ASSERT_THROW(
+      QueryConfig({{QueryConfig::kGroupingSetsKeyReuseMaxBytes, "-1"}}),
+      "(-1 vs. 0)");
   EXPECT_FALSE(defaults.hashJoinAdaptiveValueIdsEnabled());
   EXPECT_EQ(defaults.hashJoinAdaptiveValueIdsMinRows(), 32768);
   EXPECT_EQ(defaults.hashJoinAdaptiveValueIdsMinDistinctPct(), 80);

@@ -149,6 +149,23 @@ class QueryConfig {
       false,
       "Store dense append-only hash build input one column at a time.")
 
+  VELOX_QUERY_CONFIG(
+      kGroupingSetsKeyReuseEnabled,
+      groupingSetsKeyReuseEnabled,
+      "grouping_sets_key_reuse_enabled",
+      bool,
+      false,
+      "Reuse each grouping key's hash or value-ID contribution across the "
+      "grouping sets of one Expand input batch.")
+
+  VELOX_QUERY_CONFIG(
+      kGroupingSetsKeyReuseMaxBytes,
+      groupingSetsKeyReuseMaxBytes,
+      "grouping_sets_key_reuse_max_bytes",
+      int64_t,
+      8'388'608,
+      "Memory budget for cached grouping key contributions, per aggregation.")
+
   /// Maximum memory that a query can use on a single host.
   VELOX_QUERY_CONFIG_PROPERTY(
       kQueryMaxMemoryPerNode,

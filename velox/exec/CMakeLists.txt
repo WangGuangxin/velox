@@ -47,6 +47,7 @@ velox_add_library(
   FixedPointLoop.cpp
   FixedPointOperators.cpp
   GroupId.cpp
+  GroupingKeyContributions.cpp
   GroupingSet.cpp
   HashAggregation.cpp
   HashBuild.cpp
