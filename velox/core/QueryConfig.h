@@ -149,14 +149,6 @@ class QueryConfig {
       false,
       "Store dense append-only hash build input one column at a time.")
 
-  VELOX_QUERY_CONFIG(
-      kGroupingSetsBatchingEnabled,
-      groupingSetsBatchingEnabled,
-      "grouping_sets_batching_enabled",
-      bool,
-      false,
-      "Reuse raw column hashes across projections of the same Expand input batch.")
-
   /// Maximum memory that a query can use on a single host.
   VELOX_QUERY_CONFIG_PROPERTY(
       kQueryMaxMemoryPerNode,
@@ -1741,14 +1733,6 @@ class QueryConfig {
       bool,
       false,
       "Enable larger string dictionaries only for Expand-fed partial aggregation.")
-
-  VELOX_QUERY_CONFIG(
-      kGroupingSetsValueIdsReuseEnabled,
-      groupingSetsValueIdsReuseEnabled,
-      "grouping_sets_value_ids_reuse_enabled",
-      bool,
-      true,
-      "Reuse exact raw string value IDs across projections of one Expand epoch.")
 
   VELOX_QUERY_CONFIG(
       kGroupingSetsValueIdsMaxStringBytes,

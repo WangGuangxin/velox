@@ -210,9 +210,6 @@ class VectorHasher {
         type_->toString(),
         vector.type()->toString());
     decoded_.decode(vector, rows);
-    if (groupingSetHashCacheActive_ && groupingSetHashInput_.get() != &vector) {
-      groupingSetHashCacheActive_ = false;
-    }
   }
 
   DecodedVector& decodedVector() {
@@ -268,16 +265,10 @@ class VectorHasher {
     return std::exchange(batchReuseStats_, BatchReuseStats{});
   }
 
-  // The epoch identifies one Expand input batch, not an arbitrary pointer's
-  // lifetime. Null constant projections do not evict cached source hashes.
-  void setGroupingSetHashInput(
-      uint64_t epoch,
-      const VectorPtr& values,
-      memory::MemoryPool* pool = nullptr);
-
-  void finishGroupingSetHashInput() {
-    groupingSetHashCacheActive_ = false;
-  }
+  /// Raises the string dictionary limits used while deciding the hash mode.
+  /// Has no effect on non-string keys. Must be called before any value is
+  /// analyzed.
+  void setDistinctValueLimits(uint64_t maxStringBytes, int64_t maxStringValues);
 
   struct HashJoinAnalysis {
     static constexpr uint64_t kUnknownLookupCount = ~0ULL;
@@ -481,8 +472,8 @@ class VectorHasher {
     uniqueHugeintValues_.clear();
     uniqueValuesStorage_.clear();
     distinctStringsBytes_ = 0;
-    ++dictionaryGeneration_;
   }
+
   template <typename T>
   inline int64_t toInt64(T value) const {
     static_assert(
@@ -847,50 +838,15 @@ class VectorHasher {
 
   common::FilterPtr bloomFilter_;
 
-  // Keep optional experiment state after the existing hot hash-table fields.
   bool batchReuseEnabled_{false};
   BatchReuseStats batchReuseStats_;
-  std::optional<uint64_t> groupingSetHashEpoch_;
-  VectorPtr groupingSetHashInput_;
-  memory::MemoryPool* groupingSetHashPool_{nullptr};
-  raw_vector<uint64_t> groupingSetHashes_;
-  raw_vector<uint8_t> groupingSetHashValid_;
-  bool groupingSetHashCacheActive_{false};
 
-  // Epoch value IDs share the existing grouping hash buffers. Plain appended
-  // state does not change ownership of the established inline hasher members.
-  uint64_t dictionaryGeneration_{0};
-  uint64_t cachedDictionaryGeneration_{0};
-  vector_size_t cachedValueIdCount_{0};
-  bool groupingSetHashReuseEnabled_{true};
-  bool groupingSetValueIdReuseEnabled_{false};
-  bool groupingBufferContainsIds_{false};
+  // Raised from the defaults by setDistinctValueLimits().
   uint64_t maxDistinctStringBytes_{kMaxDistinctStringsBytes};
   int64_t maxDistinctStringValues_{kMaxDistinct};
-  uint64_t valueIdEpochRows_{0};
-  uint64_t valueIdEpochLookups_{0};
-  uint64_t valueIdEpochReusedRows_{0};
-  uint64_t valueIdEpochInvalidations_{0};
 
   int64_t distinctValueLimit() const;
-  bool makeGroupingSetValueIds(
-      const SelectivityVector& rows,
-      raw_vector<uint64_t>& result);
   void copyStringToLocalImpl(const UniqueValue* unique, bool enforceBudget);
-
- public:
-  struct GroupingSetValueIdStats {
-    uint64_t valueIdEpochRows;
-    uint64_t valueIdEpochLookups;
-    uint64_t valueIdEpochReusedRows;
-    uint64_t valueIdEpochInvalidations;
-  };
-  GroupingSetValueIdStats takeGroupingSetValueIdStats();
-  void configureGroupingSetReuse(
-      bool hashReuse,
-      bool valueIdReuse,
-      uint64_t stringBytes = kMaxDistinctStringsBytes,
-      int64_t stringValues = kMaxDistinct);
 };
 
 template <>

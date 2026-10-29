@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 #include "velox/exec/HashAggregation.h"
-#include "velox/exec/Expand.h"
 
 #include <algorithm>
 #include <optional>
@@ -66,6 +65,36 @@ HashAggregation::HashAggregation(
       maxPartialAggregationMemoryUsage_(
           driverCtx->queryConfig().maxPartialAggregationMemoryUsage()) {}
 
+namespace {
+
+// Returns true if 'node' reads its grouping keys straight out of an Expand,
+// possibly through projections that only rename columns. Such a plan hands the
+// aggregation the same key vector once per grouping set.
+bool isExpandFed(
+    const core::AggregationNode* node,
+    const std::vector<column_index_t>& groupingKeyInputChannels) {
+  if (!node->preGroupedKeys().empty()) {
+    return false;
+  }
+  auto source = node->sources()[0];
+  auto channels = groupingKeyInputChannels;
+  while (const auto* project =
+             dynamic_cast<const core::ProjectNode*>(source.get())) {
+    for (auto& channel : channels) {
+      const auto* field = dynamic_cast<const core::FieldAccessTypedExpr*>(
+          project->projections()[channel].get());
+      if (field == nullptr || !field->isInputColumn()) {
+        return false;
+      }
+      channel = project->sources()[0]->outputType()->getChildIdx(field->name());
+    }
+    source = project->sources()[0];
+  }
+  return dynamic_cast<const core::ExpandNode*>(source.get()) != nullptr;
+}
+
+} // namespace
+
 void HashAggregation::initialize() {
   Operator::initialize();
 
@@ -78,50 +107,18 @@ void HashAggregation::initialize() {
       groupingKeyInputChannels, groupingKeyOutputChannels);
 
   auto hashers = createVectorHashers(inputType, groupingKeyInputChannels);
-  const auto& groupingConfig = operatorCtx_->driverCtx()->queryConfig();
-  const bool valueIdGrouping = groupingConfig.groupingSetsValueIdsEnabled() &&
-      aggregationNode_->step() == core::AggregationNode::Step::kPartial;
-  if ((groupingConfig.groupingSetsBatchingEnabled() || valueIdGrouping) &&
-      aggregationNode_->preGroupedKeys().empty()) {
-    auto source = aggregationNode_->sources()[0];
-    auto channels = groupingKeyInputChannels;
-    bool passthroughKeys = true;
-    while (const auto* project =
-               dynamic_cast<const core::ProjectNode*>(source.get())) {
-      for (auto& channel : channels) {
-        const auto* field = dynamic_cast<const core::FieldAccessTypedExpr*>(
-            project->projections()[channel].get());
-        if (!field || !field->isInputColumn()) {
-          passthroughKeys = false;
-          break;
-        }
-        channel =
-            project->sources()[0]->outputType()->getChildIdx(field->name());
-      }
-      if (!passthroughKeys) {
-        break;
-      }
-      source = project->sources()[0];
-    }
-    if (passthroughKeys &&
-        dynamic_cast<const core::ExpandNode*>(source.get())) {
-      for (auto* op : operatorCtx_->driver()->operators()) {
-        if (op->planNodeId() == source->id()) {
-          groupingSetSource_ = dynamic_cast<Expand*>(op);
-          break;
-        }
-      }
-    }
-  }
-  if (groupingSetSource_) {
+  const auto& config = operatorCtx_->driverCtx()->queryConfig();
+  expandFed_ = isExpandFed(aggregationNode_.get(), groupingKeyInputChannels);
+  if (expandFed_ && config.groupingSetsValueIdsEnabled() &&
+      aggregationNode_->step() == core::AggregationNode::Step::kPartial) {
+    // One Expand input batch produces one group per distinct key combination
+    // per grouping set, so a partial aggregation under it sees several times
+    // the distinct count a plain one would. Let its dictionaries grow to
+    // match instead of falling back to generic hashing.
     for (auto& hasher : hashers) {
-      hasher->configureGroupingSetReuse(
-          groupingConfig.groupingSetsBatchingEnabled(),
-          valueIdGrouping && groupingConfig.groupingSetsValueIdsReuseEnabled(),
-          valueIdGrouping ? groupingConfig.groupingSetsValueIdsMaxStringBytes()
-                          : (1 << 20),
-          valueIdGrouping ? groupingConfig.groupingSetsValueIdsMaxStringValues()
-                          : VectorHasher::kMaxDistinct);
+      hasher->setDistinctValueLimits(
+          config.groupingSetsValueIdsMaxStringBytes(),
+          config.groupingSetsValueIdsMaxStringValues());
     }
   }
   const auto numHashers = hashers.size();
@@ -259,9 +256,6 @@ void HashAggregation::addInput(RowVectorPtr input) {
     numInputRows_ += input->size();
     return;
   }
-  if (groupingSetSource_) {
-    groupingSet_->setGroupingSetHashEpoch(groupingSetSource_->inputEpoch());
-  }
   groupingSet_->addInput(input, mayPushdown_);
   numInputRows_ += input->size();
 
@@ -304,15 +298,9 @@ void HashAggregation::addInput(RowVectorPtr input) {
   if (isPartialOutput_ && !isGlobal_ &&
       (abandonPartialEarly || partialMemoryFull)) {
     partialFull_ = true;
-    if (operatorCtx_->driverCtx()
-            ->queryConfig()
-            .groupingSetsBatchingEnabled()) {
-      auto stats = stats_.wlock();
-      stats->addRuntimeStat(
-          "partialFullLowReduction", RuntimeCounter(abandonPartialEarly));
-      stats->addRuntimeStat(
-          "partialFullMemory", RuntimeCounter(partialMemoryFull));
-    }
+    addRuntimeStat(
+        "partialFullLowReduction", RuntimeCounter(abandonPartialEarly));
+    addRuntimeStat("partialFullMemory", RuntimeCounter(partialMemoryFull));
   }
 
   if (isDistinct_) {
@@ -361,39 +349,6 @@ void HashAggregation::updateRuntimeStats() {
   auto& runtimeStats = lockedStats->runtimeStats;
 
   for (auto i = 0; i < hashers.size(); i++) {
-    if (operatorCtx_->driverCtx()
-            ->queryConfig()
-            .groupingSetsBatchingEnabled() ||
-        operatorCtx_->driverCtx()
-            ->queryConfig()
-            .groupingSetsValueIdsEnabled()) {
-      const auto reuse = hashers[i]->takeBatchReuseStats();
-      const auto epoch = hashers[i]->takeGroupingSetValueIdStats();
-      if (epoch.valueIdEpochRows || epoch.valueIdEpochInvalidations) {
-        lockedStats->addRuntimeStat(
-            "hashtable.groupingValueIdRows",
-            RuntimeCounter(epoch.valueIdEpochRows));
-        lockedStats->addRuntimeStat(
-            "hashtable.groupingValueIdLookups",
-            RuntimeCounter(epoch.valueIdEpochLookups));
-        lockedStats->addRuntimeStat(
-            "hashtable.groupingValueIdReusedRows",
-            RuntimeCounter(epoch.valueIdEpochReusedRows));
-        lockedStats->addRuntimeStat(
-            "hashtable.groupingValueIdInvalidations",
-            RuntimeCounter(epoch.valueIdEpochInvalidations));
-      }
-      if (reuse.encodedHashRows) {
-        lockedStats->addRuntimeStat(
-            "aggregationKeyHashRows", RuntimeCounter(reuse.encodedHashRows));
-        lockedStats->addRuntimeStat(
-            "aggregationKeyHashComputations",
-            RuntimeCounter(reuse.encodedHashComputations));
-        lockedStats->addRuntimeStat(
-            "aggregationKeyHashReusedRows",
-            RuntimeCounter(reuse.encodedHashReusedRows));
-      }
-    }
     hashers[i]->cardinality(0, asRange, asDistinct);
     if (asRange != VectorHasher::kRangeTooLarge) {
       runtimeStats[fmt::format("rangeKey{}", i)] = RuntimeMetric(asRange);

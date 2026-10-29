@@ -146,7 +146,6 @@ set(
   RowContainerBatchStoreTest.cpp
   RowContainerFixedExtractionTest.cpp
   VectorHasherBatchReuseTest.cpp
-  GroupingSetsBatchingTest.cpp
   # group7 (~449s): IndexLookupJoinTestExtra 188
   # + MergeJoin 111 + ScaleWriter 96 + Exchange 54
   IndexLookupJoinTestExtra.cpp
@@ -547,10 +546,6 @@ velox_add_library(velox_aggregate_registry_util INTERFACE HEADERS AggregateRegis
 add_executable(velox_hash_join_fixed_width_output_test HashJoinFixedWidthOutputTest.cpp)
 target_link_libraries(velox_hash_join_fixed_width_output_test velox_exec velox_vector_test_lib GTest::gtest GTest::gtest_main)
 add_test(velox_hash_join_fixed_width_output_test velox_hash_join_fixed_width_output_test)
-
-add_executable(velox_vector_hasher_epoch_value_ids_test VectorHasherEpochValueIdsTest.cpp)
-target_link_libraries(velox_vector_hasher_epoch_value_ids_test velox_exec velox_vector_test_lib GTest::gtest GTest::gtest_main)
-add_test(velox_vector_hasher_epoch_value_ids_test velox_vector_hasher_epoch_value_ids_test)
 
 add_executable(velox_hash_join_head_chain_drain_test HashJoinHeadChainDrainTest.cpp)
 target_link_libraries(velox_hash_join_head_chain_drain_test velox_exec velox_vector_test_lib GTest::gtest GTest::gtest_main)

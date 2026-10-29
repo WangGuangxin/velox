@@ -58,7 +58,6 @@ const std::vector<config::ConfigProperty>& QueryConfig::registeredProperties() {
     VELOX_REGISTER_QUERY_CONFIG(kHashJoinAdaptiveValueIdsMinRows);
     VELOX_REGISTER_QUERY_CONFIG(kHashJoinAdaptiveValueIdsMinDistinctPct);
     VELOX_REGISTER_QUERY_CONFIG(kHashJoinBatchValueIdsEnabled);
-    VELOX_REGISTER_QUERY_CONFIG(kGroupingSetsBatchingEnabled);
 
     // Cast.
     VELOX_REGISTER_QUERY_CONFIG(kLegacyCast);

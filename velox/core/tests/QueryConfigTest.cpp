@@ -71,13 +71,10 @@ TEST_F(QueryConfigTest, joinEnumerationTuning) {
 TEST_F(QueryConfigTest, adaptiveJoinValueIds) {
   const QueryConfig defaults{{}};
   EXPECT_FALSE(defaults.hashJoinBatchValueIdsEnabled());
-  EXPECT_FALSE(defaults.groupingSetsBatchingEnabled());
   const QueryConfig reuse({
       {QueryConfig::kHashJoinBatchValueIdsEnabled, "true"},
-      {QueryConfig::kGroupingSetsBatchingEnabled, "true"},
   });
   EXPECT_TRUE(reuse.hashJoinBatchValueIdsEnabled());
-  EXPECT_TRUE(reuse.groupingSetsBatchingEnabled());
   EXPECT_FALSE(defaults.hashJoinAdaptiveValueIdsEnabled());
   EXPECT_EQ(defaults.hashJoinAdaptiveValueIdsMinRows(), 32768);
   EXPECT_EQ(defaults.hashJoinAdaptiveValueIdsMinDistinctPct(), 80);

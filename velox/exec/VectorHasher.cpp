@@ -137,23 +137,6 @@ void VectorHasher::hashValues(
     rows.applyToSelected([&](vector_size_t row) {
       result[row] = mix ? bits::hashMix(result[row], hash) : hash;
     });
-  } else if (groupingSetHashCacheActive_) {
-    rows.applyToSelected([&](vector_size_t row) {
-      uint64_t hash;
-      if (groupingSetHashValid_[row]) {
-        hash = groupingSetHashes_[row];
-        ++batchReuseStats_.encodedHashReusedRows;
-      } else {
-        hash = decoded_.isNullAt(row)
-            ? kNullHash
-            : hashOne<typeProvidesCustomComparison, Kind>(decoded_, row);
-        groupingSetHashes_[row] = hash;
-        groupingSetHashValid_[row] = 1;
-        ++batchReuseStats_.encodedHashComputations;
-      }
-      ++batchReuseStats_.encodedHashRows;
-      result[row] = mix ? bits::hashMix(result[row], hash) : hash;
-    });
   } else if (
       !decoded_.isIdentityMapping() &&
       (rows.countSelected() > decoded_.base()->size() ||
@@ -456,11 +439,6 @@ bool VectorHasher::computeValueIds(
     raw_vector<uint64_t>& result) {
   checkTypeSupportsValueIds();
 
-  if (groupingSetValueIdReuseEnabled_ && groupingSetHashCacheActive_ &&
-      rangeSize_ > 0 && !isRange_ && !distinctOverflow_ &&
-      rows.hasSelections()) {
-    return makeGroupingSetValueIds(rows, result);
-  }
   if (batchReuseEnabled_ && rows.hasSelections()) {
     batchReuseStats_.valueIdRows += rows.countSelected();
     return VALUE_ID_TYPE_DISPATCH(
@@ -470,150 +448,25 @@ bool VectorHasher::computeValueIds(
   return VALUE_ID_TYPE_DISPATCH(makeValueIds, typeKind_, rows, result.data());
 }
 
-void VectorHasher::configureGroupingSetReuse(
-    bool hashReuse,
-    bool valueIdReuse,
-    uint64_t stringBytes,
-    int64_t stringValues) {
-  VELOX_CHECK_EQ(numDistinct(), 0, "Configure grouping reuse before analysis");
-  VELOX_CHECK_GE(stringBytes, 1 << 20);
-  VELOX_CHECK_LE(stringBytes, 64 << 20);
-  VELOX_CHECK_GE(stringValues, kMaxDistinct);
-  VELOX_CHECK_LE(stringValues, 1000000);
-  const bool string =
-      typeKind_ == TypeKind::VARCHAR || typeKind_ == TypeKind::VARBINARY;
-  groupingSetHashReuseEnabled_ = hashReuse;
-  groupingSetValueIdReuseEnabled_ = valueIdReuse && string;
-  maxDistinctStringBytes_ = string ? stringBytes : kMaxDistinctStringsBytes;
-  maxDistinctStringValues_ = string ? stringValues : kMaxDistinct;
-  finishGroupingSetHashInput();
-  groupingSetHashEpoch_.reset();
-  groupingSetHashInput_.reset();
-  cachedValueIdCount_ = 0;
-  groupingSetHashValid_.resize(0);
-  groupingBufferContainsIds_ = false;
+void VectorHasher::setDistinctValueLimits(
+    uint64_t maxStringBytes,
+    int64_t maxStringValues) {
+  VELOX_CHECK_EQ(numDistinct(), 0, "Set distinct value limits before analysis");
+  VELOX_CHECK_GE(maxStringBytes, 1 << 20);
+  VELOX_CHECK_LE(maxStringBytes, 64 << 20);
+  VELOX_CHECK_GE(maxStringValues, kMaxDistinct);
+  VELOX_CHECK_LE(maxStringValues, 1'000'000);
+  if (typeKind_ != TypeKind::VARCHAR && typeKind_ != TypeKind::VARBINARY) {
+    return;
+  }
+  maxDistinctStringBytes_ = maxStringBytes;
+  maxDistinctStringValues_ = maxStringValues;
 }
 
 int64_t VectorHasher::distinctValueLimit() const {
   return typeKind_ == TypeKind::VARCHAR || typeKind_ == TypeKind::VARBINARY
       ? maxDistinctStringValues_
       : kMaxDistinct;
-}
-
-VectorHasher::GroupingSetValueIdStats
-VectorHasher::takeGroupingSetValueIdStats() {
-  return {
-      std::exchange(valueIdEpochRows_, 0),
-      std::exchange(valueIdEpochLookups_, 0),
-      std::exchange(valueIdEpochReusedRows_, 0),
-      std::exchange(valueIdEpochInvalidations_, 0)};
-}
-
-void VectorHasher::setGroupingSetHashInput(
-    uint64_t epoch,
-    const VectorPtr& values,
-    memory::MemoryPool* pool) {
-  finishGroupingSetHashInput();
-  if (!groupingSetHashReuseEnabled_ && !groupingSetValueIdReuseEnabled_) {
-    return;
-  }
-  if (groupingSetHashEpoch_ != epoch) {
-    groupingSetHashEpoch_ = epoch;
-    groupingSetHashInput_.reset();
-    cachedValueIdCount_ = 0;
-  }
-  // Constant/null projections preserve the source cache for later projections.
-  if (values->isConstantEncoding()) {
-    return;
-  }
-  if (!groupingSetHashPool_) {
-    groupingSetHashPool_ = pool ? pool : values->pool();
-    groupingSetHashes_ = raw_vector<uint64_t>(groupingSetHashPool_);
-    groupingSetHashValid_ = raw_vector<uint8_t>(groupingSetHashPool_);
-  }
-  if (groupingSetHashInput_.get() != values.get() ||
-      groupingSetHashes_.size() != values->size()) {
-    groupingSetHashInput_ = values;
-    groupingSetHashes_.resize(values->size());
-    groupingSetHashValid_.resize(values->size());
-    std::fill(groupingSetHashValid_.begin(), groupingSetHashValid_.end(), 0);
-    cachedValueIdCount_ = 0;
-    cachedDictionaryGeneration_ = dictionaryGeneration_;
-  }
-  // Reuse the established inline decode identity guard for either buffer use.
-  groupingSetHashCacheActive_ = true;
-}
-
-bool VectorHasher::makeGroupingSetValueIds(
-    const SelectivityVector& rows,
-    raw_vector<uint64_t>& result) {
-  if (!groupingBufferContainsIds_ ||
-      cachedDictionaryGeneration_ != dictionaryGeneration_) {
-    valueIdEpochInvalidations_ += cachedValueIdCount_ != 0;
-    std::fill(groupingSetHashValid_.begin(), groupingSetHashValid_.end(), 0);
-    cachedValueIdCount_ = 0;
-    cachedDictionaryGeneration_ = dictionaryGeneration_;
-  }
-  groupingBufferContainsIds_ = true;
-  valueIdEpochRows_ += rows.countSelected();
-  auto apply = [&](vector_size_t row, uint64_t id) {
-    result[row] = multiplier_ == 1 ? id : result[row] + multiplier_ * id;
-  };
-  if (cachedValueIdCount_ == groupingSetHashes_.size()) {
-    valueIdEpochReusedRows_ += rows.countSelected();
-    rows.applyToSelected(
-        [&](vector_size_t row) { apply(row, groupingSetHashes_[row]); });
-    return true;
-  }
-  bool success = true;
-  const bool mayHaveNulls = decoded_.mayHaveNulls();
-  applyWithPrefetch(
-      rows,
-      valueIdPrefetchDistance(),
-      [&](vector_size_t row) {
-        if (!groupingSetHashValid_[row] &&
-            (!mayHaveNulls || !decoded_.isNullAt(row))) {
-          prefetchValueId(decoded_.valueAt<StringView>(row));
-        }
-      },
-      [&](vector_size_t row) {
-        if (!success) {
-          if (!mayHaveNulls || !decoded_.isNullAt(row)) {
-            analyzeValue(decoded_.valueAt<StringView>(row));
-          }
-          return;
-        }
-        uint64_t id;
-        if (groupingSetHashValid_[row]) {
-          id = groupingSetHashes_[row];
-          ++valueIdEpochReusedRows_;
-        } else {
-          if (mayHaveNulls && decoded_.isNullAt(row)) {
-            id = 0;
-          } else {
-            ++valueIdEpochLookups_;
-            const auto value = decoded_.valueAt<StringView>(row);
-            id = valueId(value);
-            if (id == kUnmappable || id >= rangeSize_) {
-              analyzeValue(value);
-              success = false;
-              return;
-            }
-          }
-          groupingSetHashes_[row] = id;
-          groupingSetHashValid_[row] = 1;
-          ++cachedValueIdCount_;
-        }
-        apply(row, id);
-      });
-  // An overflow may have cleared the codebook while analyzing this batch.
-  if (cachedDictionaryGeneration_ != dictionaryGeneration_) {
-    valueIdEpochInvalidations_ += cachedValueIdCount_ != 0;
-    std::fill(groupingSetHashValid_.begin(), groupingSetHashValid_.end(), 0);
-    cachedValueIdCount_ = 0;
-    cachedDictionaryGeneration_ = dictionaryGeneration_;
-  }
-  return success;
 }
 
 bool VectorHasher::hasRepeatedBaseIndices(const SelectivityVector& rows) const {
@@ -1145,13 +998,6 @@ void VectorHasher::hash(
     const SelectivityVector& rows,
     bool mix,
     raw_vector<uint64_t>& result) {
-  if (!groupingSetHashReuseEnabled_) {
-    groupingSetHashCacheActive_ = false;
-  } else if (groupingSetHashCacheActive_ && groupingBufferContainsIds_) {
-    std::fill(groupingSetHashValid_.begin(), groupingSetHashValid_.end(), 0);
-    groupingBufferContainsIds_ = false;
-    cachedValueIdCount_ = 0;
-  }
   if (typeKind_ == TypeKind::UNKNOWN) {
     rows.applyToSelected([&](auto row) {
       result[row] = mix ? bits::hashMix(result[row], kNullHash) : kNullHash;
@@ -1807,8 +1653,6 @@ void VectorHasher::deserializeState(std::string_view data) {
         bloomFilterData);
   }
 
-  ++dictionaryGeneration_;
-  finishGroupingSetHashInput();
   uniqueValues_.clear();
   uniqueValuesStorage_.clear();
   distinctStringsBytes_ = 0;
