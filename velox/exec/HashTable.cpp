@@ -23,6 +23,7 @@
 #include "velox/common/process/TraceContext.h"
 #include "velox/common/testutil/TestValue.h"
 #include "velox/exec/AdaptivePrefetch.h"
+#include "velox/exec/GroupingKeyContributions.h"
 #include "velox/exec/OperatorUtils.h"
 
 using facebook::velox::common::testutil::TestValue;
@@ -711,6 +712,9 @@ void HashTable<ignoreNullKeys>::allocateTables(
 
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::clear(bool freeTable) {
+  if (keyContributions_ != nullptr) {
+    keyContributions_->clear();
+  }
   for (auto* rowContainer : allRows()) {
     rowContainer->clear();
   }
@@ -1560,6 +1564,11 @@ void HashTable<ignoreNullKeys>::setHashMode(
     HashMode mode,
     int32_t numNew,
     int8_t spillInputStartPartitionBit) {
+  if (keyContributions_ != nullptr) {
+    // This reassigns value-ID multipliers and may rebuild the dictionary, so
+    // contributions computed before it cannot be folded in after it.
+    keyContributions_->clear();
+  }
   VELOX_CHECK_NE(hashMode_, HashMode::kHash);
   TestValue::adjust("facebook::velox::exec::HashTable::setHashMode", &mode);
   if (mode == HashMode::kArray) {
@@ -2589,6 +2598,39 @@ std::string BaseHashTable::RowsIterator::toString() const {
       rowContainerIterator_.toString());
 }
 
+namespace {
+
+// Decides whether reusing 'hasher's contribution across grouping sets can pay
+// for itself. Folding a cached contribution back in reads one word and
+// updates another per row, so it only wins against work that costs more than
+// that. Every case below is one the hasher already has a cheaper path for.
+bool contributionIsWorthCaching(
+    const VectorHasher& hasher,
+    const DecodedVector& decoded,
+    const SelectivityVector& rows) {
+  // A fixed-width key hashes or maps to a value ID in a few instructions.
+  if (hasher.type()->isFixedWidth()) {
+    return false;
+  }
+  // A range-mapped key is arithmetic on the value, with no lookup.
+  if (hasher.isRange()) {
+    return false;
+  }
+  // A constant is computed once and broadcast over the batch.
+  if (decoded.isConstantMapping()) {
+    return false;
+  }
+  // A dictionary is already reduced to one computation per distinct base
+  // value, which is the same saving by another route.
+  if (!decoded.isIdentityMapping() &&
+      rows.countSelected() > decoded.base()->size()) {
+    return false;
+  }
+  return true;
+}
+
+} // namespace
+
 template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::prepareForGroupProbe(
     HashLookup& lookup,
@@ -2612,9 +2654,41 @@ void HashTable<ignoreNullKeys>::prepareForGroupProbe(
 
   bool rehash = false;
   const auto mode = hashMode();
+  const bool useValueIds = mode != BaseHashTable::HashMode::kHash;
   for (auto i = 0; i < hashers.size(); ++i) {
     auto& hasher = hashers[i];
-    if (mode != BaseHashTable::HashMode::kHash) {
+    const auto& key = input->childAt(hasher->channel());
+    if (keyContributions_ != nullptr && rows.hasSelections() &&
+        contributionIsWorthCaching(*hasher, hasher->decodedVector(), rows)) {
+      if (const auto* cached =
+              keyContributions_->find(i, *key, useValueIds, rows)) {
+        if (useValueIds) {
+          hasher->combineValueIdContribution(rows, cached, lookup.hashes);
+        } else {
+          hasher->combineHashContribution(rows, cached, i > 0, lookup.hashes);
+        }
+        continue;
+      }
+      // Computing over a zeroed buffer yields this key's contribution on its
+      // own, which is what the next grouping set can fold in directly.
+      if (auto* fill = keyContributions_->prepareFill(i, rows)) {
+        if (useValueIds) {
+          if (!hasher->computeValueIds(rows, *fill)) {
+            rehash = true;
+            keyContributions_->abandonFill(i);
+            continue;
+          }
+          hasher->combineValueIdContribution(rows, fill->data(), lookup.hashes);
+        } else {
+          hasher->hash(rows, false, *fill);
+          hasher->combineHashContribution(
+              rows, fill->data(), i > 0, lookup.hashes);
+        }
+        keyContributions_->publish(i, key, useValueIds, rows);
+        continue;
+      }
+    }
+    if (useValueIds) {
       if (!hasher->computeValueIds(rows, lookup.hashes)) {
         rehash = true;
       }
@@ -2624,7 +2698,7 @@ void HashTable<ignoreNullKeys>::prepareForGroupProbe(
   }
 
   if (rehash || capacity() == 0) {
-    if (mode != BaseHashTable::HashMode::kHash) {
+    if (useValueIds) {
       decideHashMode(input->size(), spillInputStartPartitionBit);
       // Do not forward 'ignoreNullKeys' to avoid redundant evaluation of
       // deselectRowsWithNulls.

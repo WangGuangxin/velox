@@ -26,6 +26,8 @@
 #include "velox/exec/VectorHasher.h"
 
 namespace facebook::velox::exec {
+
+class GroupingKeyContributions;
 class AggregationInputSpiller;
 class AggregationOutputSpiller;
 
@@ -186,6 +188,17 @@ class GroupingSet {
   /// yet.
   BaseHashTable* table() const {
     return table_.get();
+  }
+
+  /// Reuses each grouping key's hash or value-ID contribution across probes
+  /// that are handed the same key vectors, as the grouping sets fanned out
+  /// from one Expand input batch are. Call before the first addInput().
+  void enableKeyContributionReuse(int64_t maxBytes);
+
+  /// Returns the grouping key contribution cache, or nullptr if reuse is not
+  /// enabled.
+  const GroupingKeyContributions* keyContributions() const {
+    return keyContributions_.get();
   }
 
   /// Frees hash tables and other state when giving up partial aggregation as
@@ -401,6 +414,10 @@ class GroupingSet {
   // Place for the arguments of the aggregate being updated.
   std::vector<VectorPtr> tempVectors_;
   std::unique_ptr<BaseHashTable> table_;
+
+  // Set by enableKeyContributionReuse(). Installed on 'table_' whenever the
+  // table is created, and outlives it.
+  std::unique_ptr<GroupingKeyContributions> keyContributions_;
   std::unique_ptr<HashLookup> lookup_;
   SelectivityVector activeRows_;
 

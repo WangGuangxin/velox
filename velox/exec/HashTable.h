@@ -26,6 +26,8 @@
 
 namespace facebook::velox::exec {
 
+class GroupingKeyContributions;
+
 using PartitionBoundIndexType = int64_t;
 /// Provides the partition info for parallel join table build use.
 struct TableInsertPartitionInfo {
@@ -330,6 +332,19 @@ class BaseHashTable {
       SelectivityVector& rows,
       int8_t spillInputStartPartitionBit) = 0;
 
+  /// Installs a cache of per-key hash and value-ID contributions that
+  /// successive prepareForGroupProbe() calls reuse when they are handed the
+  /// same key vectors, as happens for the grouping sets fanned out from one
+  /// Expand input batch. Not owned; must outlive this table. Nullptr, the
+  /// default, computes every key for every call.
+  ///
+  /// Only valid while value-ID numbering changes solely through setHashMode(),
+  /// which drops the cache. Do not install one on a table whose hashers are
+  /// merged or deserialized into.
+  void setKeyContributions(GroupingKeyContributions* contributions) {
+    keyContributions_ = contributions;
+  }
+
   /// Finds or creates a group for each key in 'lookup'. The keys are
   /// returned in 'lookup.hits'.
   virtual void groupProbe(
@@ -591,6 +606,9 @@ class BaseHashTable {
 
   std::vector<std::unique_ptr<VectorHasher>> hashers_;
   std::unique_ptr<RowContainer> rows_;
+
+  // Not owned. See setKeyContributions().
+  GroupingKeyContributions* keyContributions_{nullptr};
 
   ParallelJoinBuildStats parallelJoinBuildStats_;
   CpuWallTiming vectorHasherMergeTiming_;

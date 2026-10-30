@@ -49,6 +49,7 @@ velox_add_library(
   FixedPointSplit.cpp
   FixedPointVerdicts.cpp
   GroupId.cpp
+  GroupingKeyContributions.cpp
   GroupingSet.cpp
   HashAggregation.cpp
   HashBuild.cpp

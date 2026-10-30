@@ -50,6 +50,8 @@ const std::vector<config::ConfigProperty>& QueryConfig::registeredProperties() {
 
     // Operator.
     VELOX_REGISTER_QUERY_CONFIG(kOperatorTrackCpuUsage);
+    VELOX_REGISTER_QUERY_CONFIG(kGroupingSetsKeyReuseEnabled);
+    VELOX_REGISTER_QUERY_CONFIG(kGroupingSetsKeyReuseMaxBytes);
 
     // Cast.
     VELOX_REGISTER_QUERY_CONFIG(kLegacyCast);
@@ -297,6 +299,7 @@ QueryConfig::QueryConfig(
 }
 
 void QueryConfig::validateConfig() {
+  VELOX_USER_CHECK_GE(groupingSetsKeyReuseMaxBytes(), 0);
   // Validate if timezone name can be recognized.
   if (auto tz = config_->get<std::string>(QueryConfig::kSessionTimezone)) {
     VELOX_USER_CHECK(

@@ -28,6 +28,23 @@ class QueryConfigTest : public testing::Test {
   }
 };
 
+TEST_F(QueryConfigTest, groupingSetsKeyReuse) {
+  const QueryConfig defaults{{}};
+  EXPECT_FALSE(defaults.groupingSetsKeyReuseEnabled());
+  EXPECT_EQ(defaults.groupingSetsKeyReuseMaxBytes(), 8 << 20);
+
+  const QueryConfig configured({
+      {QueryConfig::kGroupingSetsKeyReuseEnabled, "true"},
+      {QueryConfig::kGroupingSetsKeyReuseMaxBytes, "1024"},
+  });
+  EXPECT_TRUE(configured.groupingSetsKeyReuseEnabled());
+  EXPECT_EQ(configured.groupingSetsKeyReuseMaxBytes(), 1024);
+
+  VELOX_ASSERT_THROW(
+      QueryConfig({{QueryConfig::kGroupingSetsKeyReuseMaxBytes, "-1"}}),
+      "(-1 vs. 0)");
+}
+
 TEST_F(QueryConfigTest, emptyConfig) {
   auto queryCtx = QueryCtx::create(nullptr, QueryConfig{{}});
   const QueryConfig& config = queryCtx->queryConfig();
