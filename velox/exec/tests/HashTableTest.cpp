@@ -1193,6 +1193,124 @@ TEST_P(HashTableTest, listJoinResultsInterleaved) {
   }
 }
 
+TEST_P(HashTableTest, listJoinResultsInterleavedLongHeadChain) {
+  if (GetParam()) {
+    GTEST_SKIP() << "No need to run this in multi-threaded mode";
+  }
+
+  // One key with a chain far longer than the others, so that the slots behind
+  // the head run out while the head is still being walked. That is when the
+  // walker stops scanning them per result and drains the head chain on its
+  // own, and a small output capacity makes it resume inside that drain.
+  constexpr int32_t kLongChain = 200;
+  constexpr int32_t kNumShortKeys =
+      BaseHashTable::JoinResultIterator::kNumParallelChains - 1;
+  constexpr int32_t kNumRows = kLongChain + kNumShortKeys;
+
+  std::vector<std::unique_ptr<VectorHasher>> keyHashers;
+  keyHashers.emplace_back(std::make_unique<VectorHasher>(BIGINT(), 0));
+  auto table = HashTable<true>::createForJoin(
+      std::move(keyHashers),
+      {BIGINT()},
+      /*allowDuplicates=*/true,
+      /*hasProbedFlag=*/false,
+      /*hasCountFlag=*/false,
+      1'000,
+      pool());
+
+  // Key 0 owns the long chain; keys 1..kNumShortKeys own one row each.
+  auto buildKeys = makeFlatVector<int64_t>(kNumRows, [&](vector_size_t row) {
+    return row < kLongChain ? 0 : row - kLongChain + 1;
+  });
+  auto buildValues =
+      makeFlatVector<int64_t>(kNumRows, [](vector_size_t row) { return row; });
+  std::vector<RowVectorPtr> batches{makeRowVector({buildKeys, buildValues})};
+  copyVectorsToTable(batches, 0, table.get());
+  table->prepareJoinTable(
+      {},
+      BaseHashTable::kNoSpillInputStartPartitionBit,
+      1'000'000,
+      false,
+      executor_.get());
+  ASSERT_TRUE(table->hasDuplicateKeys());
+
+  std::multiset<int64_t> expectedLongChain;
+  for (int32_t row = 0; row < kLongChain; ++row) {
+    expectedLongChain.insert(row);
+  }
+
+  // Probe row 0 takes the long chain and becomes the head slot; the rest are
+  // exhausted after one result each.
+  const int32_t kNumProbe = kNumShortKeys + 1;
+  auto probeVector = makeRowVector({makeFlatVector<int64_t>(
+      kNumProbe, [](vector_size_t row) { return row; })});
+  SelectivityVector selectivity(kNumProbe);
+  HashLookup lookup(table->hashers(), pool());
+  table->prepareForJoinProbe(lookup, probeVector, selectivity, false);
+  lookup.hits.resize(kNumProbe);
+  std::fill(lookup.hits.begin(), lookup.hits.end(), nullptr);
+  table->joinProbe(lookup);
+  lookup.rows.resize(kNumProbe);
+  std::iota(lookup.rows.begin(), lookup.rows.end(), 0);
+
+  for (const auto [outputCapacity, maxBytes] :
+       std::vector<std::pair<int32_t, uint64_t>>{
+           {1, std::numeric_limits<uint64_t>::max()},
+           {7, std::numeric_limits<uint64_t>::max()},
+           {64, std::numeric_limits<uint64_t>::max()},
+           {kNumRows, std::numeric_limits<uint64_t>::max()},
+           {64, 40}}) {
+    SCOPED_TRACE(
+        fmt::format("outputCapacity={} maxBytes={}", outputCapacity, maxBytes));
+    BaseHashTable::JoinResultIterator iter(
+        {}, /*fixedSizeListColumnsSizeSum=*/8, std::nullopt);
+    iter.reset(lookup);
+    std::vector<vector_size_t> probeRows;
+    std::vector<char*> hits;
+    std::vector<vector_size_t> outputProbeRows(outputCapacity);
+    std::vector<char*> outputHits(outputCapacity);
+    while (!iter.atEnd()) {
+      const auto numOutput = table->listJoinResults(
+          iter,
+          /*includeMisses=*/false,
+          folly::Range(outputProbeRows.data(), outputCapacity),
+          folly::Range(outputHits.data(), outputCapacity),
+          maxBytes);
+      if (numOutput == 0) {
+        EXPECT_TRUE(iter.atEnd());
+        break;
+      }
+      probeRows.insert(
+          probeRows.end(),
+          outputProbeRows.begin(),
+          outputProbeRows.begin() + numOutput);
+      hits.insert(
+          hits.end(), outputHits.begin(), outputHits.begin() + numOutput);
+    }
+
+    ASSERT_EQ(hits.size(), kNumRows);
+    for (size_t i = 1; i < probeRows.size(); ++i) {
+      EXPECT_LE(probeRows[i - 1], probeRows[i]);
+    }
+
+    auto valuesColumn =
+        BaseVector::create<FlatVector<int64_t>>(BIGINT(), hits.size(), pool());
+    table->rows()->extractColumn(hits.data(), hits.size(), 1, valuesColumn);
+    std::map<vector_size_t, std::multiset<int64_t>> observedByProbeRow;
+    for (size_t i = 0; i < hits.size(); ++i) {
+      observedByProbeRow[probeRows[i]].insert(valuesColumn->valueAt(i));
+    }
+
+    // The head chain comes back whole, and every short chain once.
+    EXPECT_EQ(observedByProbeRow[0], expectedLongChain);
+    for (int32_t probeRow = 1; probeRow < kNumProbe; ++probeRow) {
+      EXPECT_EQ(
+          observedByProbeRow[probeRow],
+          std::multiset<int64_t>{kLongChain + probeRow - 1});
+    }
+  }
+}
+
 TEST_P(HashTableTest, groupBySpill) {
   auto type = ROW({"k1"}, {BIGINT()});
   testGroupBySpill(5'000'000, type, 1, 1000, 1000);
