@@ -1320,8 +1320,11 @@ class RowContainer {
         Kind == TypeKind::MAP) {
       return compareComplexType(row, column.offset(), decoded, index, flags);
     } else if constexpr (is_string_kind(Kind)) {
-      auto result = compareStringAsc(
-          valueAt<StringView>(row, column.offset()), decoded, index);
+      const auto storedValue = valueAt<StringView>(row, column.offset());
+      if (flags.equalsOnly) {
+        return stringEquals(storedValue, decoded, index) ? 0 : 1;
+      }
+      auto result = compareStringAsc(storedValue, decoded, index);
       return flags.ascending ? result : result * -1;
     } else {
       auto left = valueAt<T>(row, column.offset());
@@ -1402,6 +1405,9 @@ class RowContainer {
     } else if constexpr (is_string_kind(Kind)) {
       auto leftValue = valueAt<StringView>(left, leftOffset);
       auto rightValue = valueAt<StringView>(right, rightOffset);
+      if (flags.equalsOnly) {
+        return stringEquals(leftValue, rightValue) ? 0 : 1;
+      }
       auto result = compareStringAsc(leftValue, rightValue);
       return flags.ascending ? result : result * -1;
     } else {
@@ -1491,6 +1497,26 @@ class RowContainer {
       StringView value,
       FlatVector<StringView>* values,
       vector_size_t index);
+
+  // Returns whether a string stored in this container equals another. Used
+  // where only equality matters, such as matching hash keys, which does not
+  // need the ordering compareStringAsc() produces.
+  //
+  // A stored string can span allocator blocks, in which case its bytes are
+  // not contiguous and have to be gathered before they can be compared.
+  // Values read from a vector are always contiguous, and only a stored string
+  // has an allocator header to consult.
+  static bool stringEquals(
+      StringView stored,
+      const DecodedVector& decoded,
+      vector_size_t index);
+
+  static bool stringEquals(StringView left, StringView right);
+
+  static bool storedStringIsContiguous(StringView stored) {
+    return stored.isInline() ||
+        HashStringAllocator::headerOf(stored.data())->size() >= stored.size();
+  }
 
   static int32_t compareStringAsc(
       StringView left,
