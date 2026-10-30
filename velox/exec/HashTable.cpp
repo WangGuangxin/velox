@@ -2232,6 +2232,11 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleaved(
       }
     }
 
+    // A later slot is advanced only while it has chain left to walk and room
+    // to buffer it. Neither of those comes back while this slot is the head,
+    // so once no later slot advances, none of them will again until the head
+    // chain ends.
+    bool anyAdvanced = false;
     for (int32_t i = slotHead + 1; i < numActive; ++i) {
       char* cursor = walker.slotCursors[i];
       if (cursor == nullptr || walker.bufferLength[i] >= kAheadWindow) {
@@ -2239,12 +2244,32 @@ int32_t HashTable<ignoreNullKeys>::listJoinResultsInterleaved(
       }
       walker.bufferData[i][walker.bufferLength[i]++] = cursor;
       walker.slotCursors[i] = nextRow(cursor);
+      anyAdvanced = true;
     }
 
     const auto headRow = walker.slotProbeRows[slotHead];
     walker.slotCursors[slotHead] = nextRow(headCursor);
     if (!emit(headRow, headCursor)) {
       return numOut;
+    }
+
+    if (!anyAdvanced) {
+      // Both scans above would find nothing to do for every remaining result
+      // of this chain, so walk the rest of it here instead.
+      headCursor = walker.slotCursors[slotHead];
+      while (headCursor != nullptr) {
+        char* next = nextRow(headCursor);
+        if (next != nullptr) {
+          __builtin_prefetch(next + nextOffset_);
+        }
+        // Published before emitting, so a full output batch resumes here.
+        walker.slotCursors[slotHead] = next;
+        if (!emit(headRow, headCursor)) {
+          return numOut;
+        }
+        headCursor = next;
+      }
+      ++walker.slotHead;
     }
   }
 }
