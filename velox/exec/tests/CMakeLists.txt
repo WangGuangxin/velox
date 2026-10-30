@@ -139,6 +139,8 @@ set(
   HashJoinBridgeTest.cpp
   SortBufferTest.cpp
   VectorHasherTest.cpp
+  GroupingKeyContributionsTest.cpp
+  GroupingKeyReuseTest.cpp
   # group7 (~449s): IndexLookupJoinTestExtra 188
   # + MergeJoin 111 + ScaleWriter 96 + Exchange 54
   IndexLookupJoinTestExtra.cpp

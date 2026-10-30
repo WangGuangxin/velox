@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <optional>
 #include "velox/common/testutil/TestValue.h"
+#include "velox/exec/GroupingKeyContributions.h"
 #include "velox/exec/OperatorType.h"
 #include "velox/exec/PrefixSort.h"
 #include "velox/exec/Task.h"
@@ -63,6 +64,36 @@ HashAggregation::HashAggregation(
           driverCtx->queryConfig().abandonPartialAggregationMinPct()),
       maxPartialAggregationMemoryUsage_(
           driverCtx->queryConfig().maxPartialAggregationMemoryUsage()) {}
+
+namespace {
+
+// Returns true if 'node' reads its grouping keys straight out of an Expand,
+// possibly through projections that only rename columns. Such a plan hands the
+// aggregation the same key vector once per grouping set.
+bool isExpandFed(
+    const core::AggregationNode* node,
+    const std::vector<column_index_t>& groupingKeyInputChannels) {
+  if (!node->preGroupedKeys().empty()) {
+    return false;
+  }
+  auto source = node->sources()[0];
+  auto channels = groupingKeyInputChannels;
+  while (const auto* project =
+             dynamic_cast<const core::ProjectNode*>(source.get())) {
+    for (auto& channel : channels) {
+      const auto* field = dynamic_cast<const core::FieldAccessTypedExpr*>(
+          project->projections()[channel].get());
+      if (field == nullptr || !field->isInputColumn()) {
+        return false;
+      }
+      channel = project->sources()[0]->outputType()->getChildIdx(field->name());
+    }
+    source = project->sources()[0];
+  }
+  return dynamic_cast<const core::ExpandNode*>(source.get()) != nullptr;
+}
+
+} // namespace
 
 void HashAggregation::initialize() {
   Operator::initialize();
@@ -138,6 +169,13 @@ void HashAggregation::initialize() {
       spillStats_.get());
 
   hasCompactableAggregates_ = groupingSet_->hasCompactableAggregates();
+
+  const auto& config = operatorCtx_->driverCtx()->queryConfig();
+  if (config.groupingSetsKeyReuseEnabled() &&
+      isExpandFed(aggregationNode_.get(), groupingKeyInputChannels)) {
+    groupingSet_->enableKeyContributionReuse(
+        config.groupingSetsKeyReuseMaxBytes());
+  }
 
   aggregationNode_.reset();
 }
@@ -279,6 +317,18 @@ void HashAggregation::updateRuntimeStats() {
     }
     if (asDistinct != VectorHasher::kRangeTooLarge) {
       runtimeStats[fmt::format("distinctKey{}", i)] = RuntimeMetric(asDistinct);
+    }
+  }
+
+  if (const auto* contributions = groupingSet_->keyContributions()) {
+    // Cumulative, so assign rather than accumulate.
+    runtimeStats["groupingKeyRowsReused"] =
+        RuntimeMetric(contributions->numReusedRows());
+    runtimeStats["groupingKeyRowsComputed"] =
+        RuntimeMetric(contributions->numComputedRows());
+    if (contributions->numUncachedRows() != 0) {
+      runtimeStats["groupingKeyRowsUncached"] =
+          RuntimeMetric(contributions->numUncachedRows());
     }
   }
 

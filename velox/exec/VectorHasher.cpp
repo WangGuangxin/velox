@@ -359,6 +359,37 @@ bool VectorHasher::computeValueIds(
   return VALUE_ID_TYPE_DISPATCH(makeValueIds, typeKind_, rows, result.data());
 }
 
+void VectorHasher::combineValueIdContribution(
+    const SelectivityVector& rows,
+    const uint64_t* contribution,
+    raw_vector<uint64_t>& result) const {
+  // Mirrors makeValueIdForOneRow(): the hasher with multiplier 1 seeds
+  // 'result', the rest accumulate into it. A contribution produced over a
+  // zeroed buffer already carries the multiplier.
+  if (multiplier_ == 1) {
+    rows.applyToSelected(
+        [&](vector_size_t row) { result[row] = contribution[row]; });
+  } else {
+    rows.applyToSelected(
+        [&](vector_size_t row) { result[row] += contribution[row]; });
+  }
+}
+
+void VectorHasher::combineHashContribution(
+    const SelectivityVector& rows,
+    const uint64_t* contribution,
+    bool mix,
+    raw_vector<uint64_t>& result) const {
+  if (mix) {
+    rows.applyToSelected([&](vector_size_t row) {
+      result[row] = bits::hashMix(result[row], contribution[row]);
+    });
+  } else {
+    rows.applyToSelected(
+        [&](vector_size_t row) { result[row] = contribution[row]; });
+  }
+}
+
 bool VectorHasher::computeValueIdsForRows(
     char** groups,
     int32_t numGroups,

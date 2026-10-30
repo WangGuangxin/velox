@@ -229,6 +229,22 @@ class VectorHasher {
       const SelectivityVector& rows,
       raw_vector<uint64_t>& result);
 
+  /// Folds into 'result' a contribution that computeValueIds() previously
+  /// wrote over a zeroed buffer. Applies the same combining rule
+  /// computeValueIds() uses, so the outcome is identical to recomputing.
+  void combineValueIdContribution(
+      const SelectivityVector& rows,
+      const uint64_t* contribution,
+      raw_vector<uint64_t>& result) const;
+
+  /// Folds into 'result' a contribution that hash() previously wrote with
+  /// 'mix' false. 'mix' has the same meaning as in hash().
+  void combineHashContribution(
+      const SelectivityVector& rows,
+      const uint64_t* contribution,
+      bool mix,
+      raw_vector<uint64_t>& result) const;
+
   // Same as computeValueIds, but takes input stored row-wise.
   bool computeValueIdsForRows(
       char** groups,
