@@ -835,6 +835,39 @@ void RowContainer::storeComplexType(
       reinterpret_cast<char*>(position.position), stream.size());
 }
 
+// static
+bool RowContainer::stringEquals(
+    StringView stored,
+    const DecodedVector& decoded,
+    vector_size_t index) {
+  const auto other = decoded.valueAt<StringView>(index);
+  // Strings of different sizes are unequal. Deciding that from the views alone
+  // avoids loading the allocator header of a stored string.
+  if (stored.size() != other.size()) {
+    return false;
+  }
+  if (FOLLY_LIKELY(storedStringIsContiguous(stored))) {
+    return stored == other;
+  }
+  std::string storage;
+  return HashStringAllocator::contiguousString(stored, storage) == other;
+}
+
+// static
+bool RowContainer::stringEquals(StringView left, StringView right) {
+  if (left.size() != right.size()) {
+    return false;
+  }
+  if (FOLLY_LIKELY(
+          storedStringIsContiguous(left) && storedStringIsContiguous(right))) {
+    return left == right;
+  }
+  std::string leftStorage;
+  std::string rightStorage;
+  return HashStringAllocator::contiguousString(left, leftStorage) ==
+      HashStringAllocator::contiguousString(right, rightStorage);
+}
+
 //   static
 int32_t RowContainer::compareStringAsc(
     StringView left,

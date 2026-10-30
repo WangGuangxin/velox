@@ -1590,6 +1590,78 @@ TEST_F(RowContainerTest, equalAndCompareRowTypeDouble) {
   testEqualAndCompareRowContainerTypeFloat<double>(ROW({colName}, {DOUBLE()}));
 }
 
+TEST_F(RowContainerTest, equalAndCompareVarchar) {
+  // Inline, out of line in one piece, and long enough that the allocator
+  // writes it as several blocks, which is the case where the bytes cannot be
+  // compared where they lie. Pairs that share a prefix but differ at the end
+  // keep the comparison from resting on the prefix alone.
+  const std::vector<std::string> values = {
+      "",
+      "short",
+      "exactly12chr",
+      "thirteen chars",
+      std::string(100, 'a'),
+      std::string(100, 'a') + "b",
+      std::string(100'000, 'x'),
+      std::string(100'000, 'x') + "y",
+  };
+  const vector_size_t numValues = values.size();
+
+  auto data = makeFlatVector<StringView>(numValues, [&](vector_size_t row) {
+    return StringView(values[row]);
+  });
+  auto rowContainer = makeRowContainer({VARCHAR()}, {VARCHAR()}, false);
+  DecodedVector decoded(*data);
+  auto rows = storeRows(decoded, numValues, *rowContainer);
+  const auto keyColumn = rowContainer->columnAt(0);
+
+  // At least one value has to have been written as several blocks, otherwise
+  // this would not reach the path it is here to cover.
+  bool anySpansBlocks = false;
+  for (auto row = 0; row < numValues; ++row) {
+    const auto stored =
+        *reinterpret_cast<const StringView*>(rows[row] + keyColumn.offset());
+    if (!stored.isInline() &&
+        HashStringAllocator::headerOf(stored.data())->size() < stored.size()) {
+      anySpansBlocks = true;
+    }
+  }
+  ASSERT_TRUE(anySpansBlocks);
+
+  const auto equality =
+      CompareFlags::equality(CompareFlags::NullHandlingMode::kNullAsValue);
+  const CompareFlags ordering{};
+
+  for (auto left = 0; left < numValues; ++left) {
+    for (auto right = 0; right < numValues; ++right) {
+      SCOPED_TRACE(fmt::format(
+          "left={} ({} bytes) right={} ({} bytes)",
+          left,
+          values[left].size(),
+          right,
+          values[right].size()));
+      const bool expected = values[left] == values[right];
+
+      // Two stored values, then a stored value against one read from a
+      // vector. Comparing for equality has to agree with comparing for order.
+      EXPECT_EQ(
+          rowContainer->compare(rows[left], rows[right], 0, equality) == 0,
+          expected);
+      EXPECT_EQ(
+          rowContainer->compare(rows[left], rows[right], 0, ordering) == 0,
+          expected);
+      EXPECT_EQ(
+          rowContainer->compare(
+              rows[left], keyColumn, decoded, right, equality) == 0,
+          expected);
+      EXPECT_EQ(
+          rowContainer->compare(
+              rows[left], keyColumn, decoded, right, ordering) == 0,
+          expected);
+    }
+  }
+}
+
 TEST_F(RowContainerTest, partition) {
   // We assign an arbitrary partition number to each row and iterate over the
   // rows a partition at a time.
