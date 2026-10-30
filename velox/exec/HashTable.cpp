@@ -386,7 +386,15 @@ bool HashTable<ignoreNullKeys>::compareKeys(
   auto numKeys = hashers_.size();
   int32_t i = 0;
   do {
-    if (rows_->compare(group, inserted, i, CompareFlags{true, true})) {
+    // Matching keys needs equality, not an ordering, which lets string keys
+    // skip the lexicographic comparison. This mirrors the flags the other
+    // compareKeys() overload already passes.
+    if (rows_->compare(
+            group,
+            inserted,
+            i,
+            CompareFlags::equality(
+                CompareFlags::NullHandlingMode::kNullAsValue))) {
       return false;
     }
   } while (++i < numKeys);
