@@ -381,6 +381,65 @@ TEST_F(RegexFunctionsTest, regexpReplaceBackslashEscapes) {
   assertEqualVectors(result, expected);
 }
 
+// Verifies that the replacement follows java.util.regex semantics, where a
+// backslash escapes the next character and only '$' introduces a group
+// reference.
+TEST_F(RegexFunctionsTest, regexpReplaceJavaReplacementSemantics) {
+  // '\1' is the literal character '1', not a reference to group 1.
+  EXPECT_EQ(
+      testRegexpReplace("Manufacturer#1", "^(.{3}).*$", "\\1**"), "1**");
+  // '\$1' is the literal text '$1'.
+  EXPECT_EQ(testRegexpReplace("abc", "(b)", "\\$1"), "a$1c");
+  // '\\' is a literal backslash and is followed by a reference to group 1.
+  EXPECT_EQ(testRegexpReplace("abc", "(b)", "\\\\$1"), "a\\bc");
+  // '$12' references group 1 followed by '2' when there are fewer than 12
+  // groups.
+  EXPECT_EQ(testRegexpReplace("abc", "(a)(b)", "$12"), "a2c");
+  EXPECT_EQ(testRegexpReplace("abc", "(a)(b)", "$0$0"), "ababc");
+  EXPECT_EQ(testRegexpReplace("abc", "(?<first>a)", "${first}$1"), "aabc");
+
+  {
+    auto evaluateReplace = [&](const std::string& pattern,
+                               const std::string& replacement) {
+      return evaluate(
+          "regexp_replace(c0, c1, c2)",
+          makeRowVector({
+              makeFlatVector<std::string>({"abcdefghij"}),
+              makeFlatVector<std::string>({pattern}),
+              makeFlatVector<std::string>({replacement}),
+          }));
+    };
+    VELOX_ASSERT_THROW(
+        evaluateReplace("(b)", "a\\"),
+        "Invalid replacement sequence: character to be escaped is missing.");
+    VELOX_ASSERT_THROW(
+        evaluateReplace("(b)", "a$"),
+        "Invalid replacement sequence: group index is missing.");
+    VELOX_ASSERT_THROW(
+        evaluateReplace("(b)", "$x"),
+        "Invalid replacement sequence: illegal group reference.");
+    VELOX_ASSERT_THROW(
+        evaluateReplace("(b)", "${}"),
+        "Invalid replacement sequence: named capturing group has 0 length name.");
+    VELOX_ASSERT_THROW(
+        evaluateReplace("(?<name>b)", "${name"),
+        "Invalid replacement sequence: named capturing group is missing trailing '}'.");
+    VELOX_ASSERT_THROW(
+        evaluateReplace("(b)", "${1a}"),
+        "Invalid replacement sequence: capturing group name starts with digit character: 1a");
+    VELOX_ASSERT_THROW(
+        evaluateReplace("(b)", "${other}"),
+        "Invalid replacement sequence: unknown group { other }.");
+    VELOX_ASSERT_THROW(
+        evaluateReplace("(b)", "$2"),
+        "Invalid replacement sequence: no group 2.");
+    // RE2 rewrite strings can't reference group 10 or above.
+    VELOX_ASSERT_THROW(
+        evaluateReplace("(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)", "$10"),
+        "Replacement sequence referencing a group above 9 is not supported: 10");
+  }
+}
+
 TEST_F(RegexFunctionsTest, regexpReplacePosition) {
   std::string output1 = "abc";
   std::string output2 = "bc";

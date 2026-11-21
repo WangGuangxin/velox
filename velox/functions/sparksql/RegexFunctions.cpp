@@ -31,6 +31,105 @@ void ensureRegexIsConstant(
   }
 }
 
+bool isAsciiDigit(char c) {
+  return c >= '0' && c <= '9';
+}
+
+bool isAsciiLetterOrDigit(char c) {
+  return isAsciiDigit(c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+// Converts a java.util.regex replacement string, as used by Spark's
+// regexp_replace, to an RE2 rewrite string. Follows
+// java.util.regex.Matcher#appendReplacement in a single left-to-right pass:
+// '\x' is the literal character x, '$n' references the longest group number
+// that does not exceed the number of groups, '${name}' references a named
+// group, and any other character is literal. Java only parses the replacement
+// when a match is found, while invalid replacements fail here up front.
+std::string toRe2Rewrite(const RE2& re, std::string_view replacement) {
+  std::string rewrite;
+  rewrite.reserve(replacement.size());
+  const int numGroups = re.NumberOfCapturingGroups();
+  size_t i = 0;
+  while (i < replacement.size()) {
+    const char current = replacement[i++];
+    if (current == '\\') {
+      VELOX_USER_CHECK_LT(
+          i,
+          replacement.size(),
+          "Invalid replacement sequence: character to be escaped is missing.");
+      const char escaped = replacement[i++];
+      // A backslash is the only character with a special meaning in an RE2
+      // rewrite string.
+      if (escaped == '\\') {
+        rewrite.append("\\\\");
+      } else {
+        rewrite.push_back(escaped);
+      }
+      continue;
+    }
+    if (current != '$') {
+      rewrite.push_back(current);
+      continue;
+    }
+
+    VELOX_USER_CHECK_LT(
+        i,
+        replacement.size(),
+        "Invalid replacement sequence: group index is missing.");
+    int group;
+    if (replacement[i] == '{') {
+      const size_t nameStart = ++i;
+      while (i < replacement.size() && isAsciiLetterOrDigit(replacement[i])) {
+        ++i;
+      }
+      VELOX_USER_CHECK_GT(
+          i,
+          nameStart,
+          "Invalid replacement sequence: named capturing group has 0 length name.");
+      VELOX_USER_CHECK(
+          i < replacement.size() && replacement[i] == '}',
+          "Invalid replacement sequence: named capturing group is missing trailing '}'.");
+      const std::string name(replacement.substr(nameStart, i - nameStart));
+      ++i;
+      VELOX_USER_CHECK(
+          !isAsciiDigit(name[0]),
+          "Invalid replacement sequence: capturing group name starts with digit character: {}",
+          name);
+      const auto groupIter = re.NamedCapturingGroups().find(name);
+      if (groupIter == re.NamedCapturingGroups().end()) {
+        VELOX_USER_FAIL(
+            "Invalid replacement sequence: unknown group {{ {} }}.", name);
+      }
+      group = groupIter->second;
+    } else {
+      VELOX_USER_CHECK(
+          isAsciiDigit(replacement[i]),
+          "Invalid replacement sequence: illegal group reference.");
+      group = replacement[i++] - '0';
+      while (i < replacement.size() && isAsciiDigit(replacement[i])) {
+        const int nextGroup = group * 10 + (replacement[i] - '0');
+        if (nextGroup > numGroups) {
+          break;
+        }
+        group = nextGroup;
+        ++i;
+      }
+    }
+    VELOX_USER_CHECK_LE(
+        group, numGroups, "Invalid replacement sequence: no group {}.", group);
+    // RE2 rewrite strings can only reference groups 0 to 9.
+    VELOX_USER_CHECK_LE(
+        group,
+        9,
+        "Replacement sequence referencing a group above 9 is not supported: {}",
+        group);
+    rewrite.push_back('\\');
+    rewrite.push_back(static_cast<char>('0' + group));
+  }
+  return rewrite;
+}
+
 // REGEXP_REPLACE(string, pattern, overwrite) → string
 // REGEXP_REPLACE(string, pattern, overwrite, position) → string
 //
@@ -79,7 +178,7 @@ struct RegexpReplaceFunction {
         // be processed during initialization; otherwise, each row needs to be
         // processed separately.
         constantReplacement_ =
-            prepareRegexpReplaceReplacement(re_.value(), *replacement);
+            toRe2Rewrite(re_.value(), *replacement);
       }
     }
     cache_.setMaxCompiledRegexes(config.exprMaxCompiledRegexes());
@@ -163,7 +262,7 @@ struct RegexpReplaceFunction {
     auto& re = ensurePattern(pattern);
     const auto& processedReplacement = constantReplacement_.has_value()
         ? constantReplacement_.value()
-        : prepareRegexpReplaceReplacement(re, replace);
+        : toRe2Rewrite(re, replace);
 
     std::string prefix(stringInput.data(), position);
     std::string targetString(
