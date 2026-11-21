@@ -218,11 +218,13 @@ void registerStringFunctions(const std::string& prefix) {
   using SparkUpperFunction = UpperLowerTemplateFunction<
       /*isLower=*/false,
       /*turkishCasing=*/true,
-      /*greekFinalSigma=*/true>;
+      /*greekFinalSigma=*/true,
+      /*specialCasing=*/true>;
   using SparkLowerFunction = UpperLowerTemplateFunction<
       /*isLower=*/true,
       /*turkishCasing=*/true,
-      /*greekFinalSigma=*/true>;
+      /*greekFinalSigma=*/true,
+      /*specialCasing=*/false>;
   exec::registerVectorFunction(
       prefix + "upper",
       SparkUpperFunction::signatures(),
