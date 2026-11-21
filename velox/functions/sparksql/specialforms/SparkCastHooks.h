@@ -94,6 +94,17 @@ class SparkCastHooks : public exec::CastHooks {
 
   bool decimalToFloatHighPrecisionCastEnabled() const override;
 
+  bool hasDoubleToDecimalCast() const override {
+    return true;
+  }
+
+  /// Rounds Java's Double.toString rendering of 'value' to 'scale' with
+  /// HALF_UP, as Spark's Decimal(double) does. Rounding the binary value, or
+  /// first rounding to 15 significant digits, changes the last digit when the
+  /// rendered digits beyond 'scale' are close to a half unit.
+  Expected<int128_t> castDoubleToDecimal(double value, int precision, int scale)
+      const override;
+
   exec::PolicyType getPolicy() const override;
 
   // Spark supports TIMESTAMP_UTC casts.

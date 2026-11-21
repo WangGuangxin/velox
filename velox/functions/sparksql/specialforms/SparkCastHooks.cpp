@@ -23,6 +23,8 @@
 #include "velox/functions/lib/string/StringImpl.h"
 #include "velox/functions/sparksql/SparkQueryConfig.h"
 #include "velox/functions/sparksql/TimestampUtils.h"
+#include "velox/functions/sparksql/specialforms/JavaFloatingDecimal.h"
+#include "velox/type/DecimalUtil.h"
 #include "velox/type/TimestampConversion.h"
 #include "velox/type/Type.h"
 #include "velox/type/tz/TimeZoneMap.h"
@@ -151,6 +153,89 @@ Expected<Timestamp> SparkCastHooks::castBooleanToTimestamp(bool val) const {
 
 bool SparkCastHooks::decimalToFloatHighPrecisionCastEnabled() const {
   return SparkQueryConfig{config_}.decimalToFloatHighPrecisionCastEnabled();
+}
+
+Expected<int128_t> SparkCastHooks::castDoubleToDecimal(
+    double value,
+    int precision,
+    int scale) const {
+  if (!std::isfinite(value)) {
+    return folly::makeUnexpected(
+        Status::UserError("The input value should be finite."));
+  }
+
+  std::string javaString;
+  appendJavaDouble(value, javaString);
+
+  // Java renders a finite double as [-]digits.digits[E[-]digits]. Read it as
+  // 'unscaled' * 10^'exponent'.
+  size_t position = 0;
+  const bool negative = javaString[0] == '-';
+  if (negative) {
+    ++position;
+  }
+  int128_t unscaled = 0;
+  int32_t exponent = 0;
+  int32_t numDigits = 0;
+  bool afterPoint = false;
+  for (; position < javaString.size() && javaString[position] != 'E';
+       ++position) {
+    const char character = javaString[position];
+    if (character == '.') {
+      afterPoint = true;
+      continue;
+    }
+    if (afterPoint) {
+      --exponent;
+    }
+    if (unscaled != 0 || character != '0') {
+      ++numDigits;
+    }
+    VELOX_CHECK_LE(numDigits, LongDecimalType::kMaxPrecision, "{}", javaString);
+    unscaled = unscaled * 10 + (character - '0');
+  }
+  if (position < javaString.size()) {
+    ++position;
+    const bool negativeExponent = javaString[position] == '-';
+    if (negativeExponent) {
+      ++position;
+    }
+    int32_t explicitExponent = 0;
+    for (; position < javaString.size(); ++position) {
+      explicitExponent = explicitExponent * 10 + (javaString[position] - '0');
+    }
+    exponent += negativeExponent ? -explicitExponent : explicitExponent;
+  }
+
+  const auto overflow = [] {
+    return folly::makeUnexpected(Status::UserError("Result overflows."));
+  };
+  constexpr int32_t kMaxPrecision = LongDecimalType::kMaxPrecision;
+  const int32_t shift = scale + exponent;
+  int128_t result;
+  if (unscaled == 0) {
+    result = 0;
+  } else if (shift >= 0) {
+    if (shift > kMaxPrecision ||
+        __builtin_mul_overflow(
+            unscaled, DecimalUtil::kPowersOfTen[shift], &result)) {
+      return overflow();
+    }
+  } else if (-shift > kMaxPrecision) {
+    // 'unscaled' has at most kMaxPrecision digits, so it is below half of
+    // 10^-shift.
+    result = 0;
+  } else {
+    const int128_t divisor = DecimalUtil::kPowersOfTen[-shift];
+    result = unscaled / divisor;
+    if (unscaled % divisor >= divisor / 2) {
+      ++result;
+    }
+  }
+  if (result >= DecimalUtil::kPowersOfTen[precision]) {
+    return overflow();
+  }
+  return negative ? -result : result;
 }
 
 Expected<int32_t> SparkCastHooks::castStringToDate(

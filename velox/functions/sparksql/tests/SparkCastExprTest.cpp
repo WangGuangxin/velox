@@ -1615,6 +1615,32 @@ class SparkCastExprTest : public functions::test::CastBaseTest {
     testCast(
         makeConstant<double>(std::numeric_limits<double>::min(), 1),
         makeConstant<int128_t>(0, 1, DECIMAL(38, 2)));
+
+    // Spark rounds Double.toString of the input once, with HALF_UP. Rounding
+    // to 15 significant digits first would turn 2570.115990153847 into
+    // 2570.11599015385 and then into 2570.1159901539.
+    testCast(
+        makeFlatVector<double>(
+            {2570.115990153847,
+             -2570.115990153847,
+             2342.1450521354495,
+             2570.11599015385,
+             0.125,
+             -0.125}),
+        makeFlatVector<int64_t>(
+            {25'701'159'901'538,
+             -25'701'159'901'538,
+             23'421'450'521'354,
+             25'701'159'901'539,
+             1'250'000'000,
+             -1'250'000'000},
+            DECIMAL(15, 10)));
+    testCast(
+        makeFlatVector<double>(
+            {2570.115990153847, 0.125, -0.125, 1.5e-7, 1.0e20, -0.0}),
+        makeFlatVector<int128_t>(
+            {257'012, 13, -13, 0, HugeInt::parse("1" + zeros(22)), 0},
+            DECIMAL(30, 2)));
   }
 
   // Valid real-to-decimal cases. Results are identical regardless of ANSI
@@ -1631,6 +1657,8 @@ class SparkCastExprTest : public functions::test::CastBaseTest {
          10.05,
          9.95,
          -2.12345});
+    // Spark widens the float to double before the cast, so the binary error of
+    // the float shows up in the result: 99999.9f is 99999.8984375.
     // Real to short decimal.
     testCast(
         input,
@@ -1640,42 +1668,42 @@ class SparkCastExprTest : public functions::test::CastBaseTest {
              -10'000,
              0,
              1'000'000,
-             999'999'000,
+             999'998'984,
              100'300,
              100'500,
              99'500,
-             -212'35},
+             -21'235},
             DECIMAL(10, 4)));
 
     // Real to long decimal.
     testCast(
         input,
         makeFlatVector<int128_t>(
-            {HugeInt::parse("-333303" + zeros(16)),
-             HugeInt::parse("-222202" + zeros(16)),
+            {HugeInt::parse("-3333030029296875000000"),
+             HugeInt::parse("-2222020019531250000000"),
              -1'000'000'000'000'000'000,
              0,
              HugeInt::parse("100" + zeros(18)),
-             HugeInt::parse("999999" + zeros(17)),
-             HugeInt::parse("1003" + zeros(16)),
-             HugeInt::parse("1005" + zeros(16)),
-             HugeInt::parse("995" + zeros(16)),
-             -2'123'450'000'000'000'000},
+             HugeInt::parse("99999898437500000000000"),
+             HugeInt::parse("10029999732971191000"),
+             HugeInt::parse("10050000190734863000"),
+             HugeInt::parse("9949999809265137000"),
+             -2'123'450'040'817'260'700},
             DECIMAL(38, 18)));
     testCast(
         input,
         makeFlatVector<int128_t>(
-            {-33'330, -22'220, -10, 0, 1'000, 999'999, 100, 101, 100, -21},
+            {-33'330, -22'220, -10, 0, 1'000, 999'999, 100, 101, 99, -21},
             DECIMAL(20, 1)));
     testCast(
         makeNullableFlatVector<float>(
             {0.134567, 0.000015, 0.000001, 0.999999, 0.123456, std::nullopt}),
         makeNullableFlatVector<int128_t>(
-            {134'567'000'000'000'000,
-             15'000'000'000'000,
-             1'000'000'000'000,
-             999'999'000'000'000'000,
-             123'456'000'000'000'000,
+            {134'567'007'422'447'200,
+             14'999'999'621'068,
+             999'999'997'475,
+             999'998'986'721'038'800,
+             123'456'001'281'738'280,
              std::nullopt},
             DECIMAL(38, 18)));
 
