@@ -16,6 +16,7 @@ velox_add_library(
   INTERFACE
   HEADERS
   GreekFinalSigma.h
+  SpecialUpperCasing.h
   StringCore.h
   StringImpl.h
 )
