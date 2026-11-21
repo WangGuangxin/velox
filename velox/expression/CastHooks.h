@@ -136,8 +136,9 @@ class CastHooks {
     return false;
   }
 
-  /// Returns whether DOUBLE to DECIMAL casts use castDoubleToDecimal instead of
-  /// DecimalUtil::rescaleFloatingPoint.
+  /// Returns whether DOUBLE and REAL to DECIMAL casts use castDoubleToDecimal
+  /// instead of DecimalUtil::rescaleFloatingPoint. REAL inputs are widened to
+  /// DOUBLE first.
   virtual bool hasDoubleToDecimalCast() const {
     return false;
   }
