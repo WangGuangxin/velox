@@ -210,35 +210,23 @@ class DecimalAverageAggregate {
           getDecimalPrecisionScale(*fn->resultType_.get());
       auto [sumPrecision, sumScale] =
           getDecimalPrecisionScale(*fn->sumType_.get());
+      // Spark's result scale is sum scale + 4 (capped at 38), so it is never
+      // smaller than the sum scale.
+      VELOX_DCHECK_GE(resultScale, sumScale);
 
-      // Spark use DECIMAL(20,0) to represent long value.
-      static const uint8_t countPrecision = 20;
-      static const uint8_t countScale = 0;
-
-      auto [dividePrecision, divideScale] =
-          functions::sparksql::DecimalUtil::computeDivideResultPrecisionScale<
-              true>(sumPrecision, sumScale, countPrecision, countScale);
-      divideScale = std::max<uint8_t>(divideScale, resultScale);
-      auto sumRescale = divideScale - sumScale + countScale;
+      // Spark rounds the exact sum / count HALF_UP once, at the result scale.
+      // Any intermediate rounding at a wider scale can change the last digit.
+      const uint8_t sumRescale = resultScale - sumScale;
       int128_t avg;
       bool overflow = false;
       functions::sparksql::DecimalUtil::
           divideWithRoundUp<int128_t, int128_t, int128_t>(
               avg, adjustedSum.value(), count, sumRescale, overflow);
-      if (overflow) {
+      if (overflow ||
+          !DecimalUtil::valueInPrecisionRange(avg, resultPrecision)) {
         return std::nullopt;
       }
-      TResultType rescaledValue;
-      const auto status =
-          DecimalUtil::rescaleWithRoundUp<int128_t, TResultType>(
-              avg,
-              dividePrecision,
-              divideScale,
-              resultPrecision,
-              resultScale,
-              rescaledValue);
-      return status.ok() ? std::optional<int128_t>(rescaledValue)
-                         : std::nullopt;
+      return avg;
     }
   };
 

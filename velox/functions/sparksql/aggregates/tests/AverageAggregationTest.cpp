@@ -293,6 +293,34 @@ TEST_F(AverageAggregationTest, avgDecimalWithMultipleRowVectors) {
   testGlobalAverage(inputRows, expectedResult, {DECIMAL(28, 2)});
 }
 
+TEST_F(AverageAggregationTest, avgDecimalRoundsOnce) {
+  // Sum is +/-0.01 and the result type is DECIMAL(27, 6).
+  auto makeInput = [&](int128_t first, vector_size_t size) {
+    return makeRowVector({makeFlatVector<int128_t>(
+        size,
+        [&](auto row) { return row == 0 ? first : 0; },
+        nullptr,
+        DECIMAL(23, 2))});
+  };
+  auto makeExpected = [&](int128_t value) {
+    return makeRowVector({makeFlatVector<int128_t>(
+        std::vector<int128_t>{value}, DECIMAL(27, 6))});
+  };
+
+  // 0.01 / 21000 = 0.00000047619..., which rounds to 0.000000. Rounding to 7
+  // digits first gives 0.0000005 and then 0.000001.
+  testGlobalAverage(
+      {makeInput(1, 21'000)}, {makeExpected(0)}, {DECIMAL(23, 2)});
+  testGlobalAverage(
+      {makeInput(-1, 21'000)}, {makeExpected(0)}, {DECIMAL(23, 2)});
+
+  // 0.01 / 20000 = 0.0000005 is a tie and rounds away from zero.
+  testGlobalAverage(
+      {makeInput(1, 20'000)}, {makeExpected(1)}, {DECIMAL(23, 2)});
+  testGlobalAverage(
+      {makeInput(-1, 20'000)}, {makeExpected(-1)}, {DECIMAL(23, 2)});
+}
+
 TEST_F(AverageAggregationTest, avgDecimalEmptyInput) {
   auto inputRows = {
       makeRowVector({makeFlatVector<int128_t>({}, DECIMAL(28, 2))}),
