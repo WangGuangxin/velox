@@ -20,9 +20,9 @@
 
 /// Simple WindowPartition that builds over the RowContainer used for storing
 /// the input rows in the Window Operator. This works completely in-memory.
-/// WindowPartition supports partial window partitioning to facilitate
-/// RowsStreamingWindowBuild which can start data processing with a portion set
-/// of rows without having to wait until an entire partition of rows are ready.
+/// Subclasses such as VectorWindowPartition provide partial partitions, which
+/// let RowsStreamingWindowBuild start processing a subset of a partition's
+/// rows before the rest of the partition arrives.
 
 /// TODO: This implementation will be revised for Spill to disk semantics.
 
@@ -49,20 +49,8 @@ class WindowPartition {
       const std::vector<std::pair<column_index_t, core::SortOrder>>&
           sortKeyInfo);
 
-  /// The WindowPartition is used for RowStreamingWindowBuild which allows to
-  /// start data processing with a subset of partition rows. 'partial_' flag is
-  /// set for the constructed window partition.
-  WindowPartition(
-      RowContainer* data,
-      const std::vector<column_index_t>& inputMapping,
-      const std::vector<std::pair<column_index_t, core::SortOrder>>&
-          sortKeyInfo);
-
-  /// Adds remaining input 'rows' for a partial window partition.
-  virtual void addRows(const std::vector<char*>& rows);
-
-  /// Removes the first 'numRows' in 'rows_' from a partial window partition
-  /// after been processed.
+  /// Removes the first 'numRows' processed rows from a partial window
+  /// partition. Only partial subclasses support this.
   virtual void removeProcessedRows(vector_size_t numRows);
 
   /// Returns the number of rows in the current WindowPartition.
@@ -188,46 +176,29 @@ class WindowPartition {
   }
 
  private:
-  WindowPartition(
-      RowContainer* data,
-      const folly::Range<char**>& rows,
-      const std::vector<column_index_t>& inputMapping,
-      const std::vector<std::pair<column_index_t, core::SortOrder>>&
-          sortKeyInfo,
-      bool partial,
-      bool complete);
-
   // Adapts RowContainer-backed rows to window partition computations.
   class RowContainerAccessor;
 
   bool compareRowsWithSortKeys(const char* lhs, const char* rhs) const;
 
-  // Removes 'numRows' from 'data_' and 'rows_'.
-  void eraseRows(vector_size_t numRows);
-
   void checkPartial() const {
     VELOX_CHECK(partial_, "WindowPartition should be partial");
   }
-
-  // Removes the previous row from 'data_'.
-  void removePreviousRow();
 
   // Indicates if this is a partial partition for RowStreamWindowBuild
   // processing.
   const bool partial_;
 
-  // The RowContainer associated with the partition.
-  // It is owned by the WindowBuild that creates the partition.
+  // The RowContainer associated with the partition. It is owned by the
+  // WindowBuild that creates the partition. Null for subclasses that store
+  // rows elsewhere.
   RowContainer* const data_;
-
-  // Points to the input rows for partial partition.
-  std::vector<char*> rows_;
 
   // folly::Range is for the partition rows iterator provided by the
   // Window operator. The pointers are to rows from a RowContainer owned
   // by the operator. We can assume these are valid values for the lifetime
   // of WindowPartition.
-  folly::Range<char**> partition_;
+  const folly::Range<char**> partition_;
 
   // Indicates if a partial partition has received all the input rows. For a
   // non-partial partition, this is always true.
@@ -246,15 +217,5 @@ class WindowPartition {
   // operator, in input order, for checking values row by row without looking
   // up the column each time.
   std::vector<exec::RowColumn> columns_;
-
-  // The partition offset of the first row in 'rows_'. It is updated for
-  // partial partition during the data processing but always zero for
-  // non-partial partition.
-  vector_size_t startRow_{0};
-
-  // Points to the last row from the previous processed peer group if not null.
-  // This is only set for a partial window partition and always null for a
-  // non-partial one.
-  char* previousRow_{nullptr};
 };
 } // namespace facebook::velox::exec
