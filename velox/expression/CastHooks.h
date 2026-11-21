@@ -136,6 +136,19 @@ class CastHooks {
     return false;
   }
 
+  /// Returns whether DOUBLE to DECIMAL casts use castDoubleToDecimal instead of
+  /// DecimalUtil::rescaleFloatingPoint.
+  virtual bool hasDoubleToDecimalCast() const {
+    return false;
+  }
+
+  /// Casts 'value' to the unscaled value of DECIMAL('precision', 'scale').
+  /// Called only when hasDoubleToDecimalCast() returns true.
+  virtual Expected<int128_t>
+  castDoubleToDecimal(double value, int precision, int scale) const {
+    VELOX_UNREACHABLE();
+  }
+
   virtual PolicyType getPolicy() const = 0;
 
   /// Returns true if TIMESTAMP_UTC casts are supported.

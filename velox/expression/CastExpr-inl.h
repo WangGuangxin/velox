@@ -377,14 +377,29 @@ void CastExpr::applyFloatingPointToDecimalCastKernel(
   auto rawResults =
       result->asUnchecked<FlatVector<TOutput>>()->mutableRawValues();
   const auto toPrecisionScale = getDecimalPrecisionScale(*toType);
+  const bool useHook =
+      std::is_same_v<TInput, double> && hooks_->hasDoubleToDecimalCast();
 
   applyToSelectedNoThrowLocal(context, rows, result, [&](vector_size_t row) {
     TOutput output;
-    const auto status = DecimalUtil::rescaleFloatingPoint<TInput, TOutput>(
-        floatingInput->valueAt(row),
-        toPrecisionScale.first,
-        toPrecisionScale.second,
-        output);
+    Status status;
+    if (useHook) {
+      const auto hookResult = hooks_->castDoubleToDecimal(
+          floatingInput->valueAt(row),
+          toPrecisionScale.first,
+          toPrecisionScale.second);
+      if (hookResult.hasValue()) {
+        output = static_cast<TOutput>(hookResult.value());
+      } else {
+        status = hookResult.error();
+      }
+    } else {
+      status = DecimalUtil::rescaleFloatingPoint<TInput, TOutput>(
+          floatingInput->valueAt(row),
+          toPrecisionScale.first,
+          toPrecisionScale.second,
+          output);
+    }
     if (status.ok()) {
       rawResults[row] = output;
     } else {
