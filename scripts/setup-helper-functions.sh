@@ -132,7 +132,9 @@ function get_cxx_flags {
     ;;
 
   "avx")
-    echo -n "-mavx2 -mfma -mavx -mf16c -mlzcnt  -mbmi2"
+    # -mbmi and -mpclmul are on every AVX2 CPU; simdjson needs them (with AVX2) to compile its On-Demand
+    # API for haswell instead of the scalar fallback.
+    echo -n "-mavx2 -mfma -mavx -mf16c -mlzcnt -mbmi -mbmi2 -mpclmul"
     ;;
 
   "sse")
