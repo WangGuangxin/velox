@@ -237,6 +237,11 @@ struct GetJsonObjectFunction {
       const arg_type<Varchar>* jsonPath) {
     if (jsonPath != nullptr && checkJsonPath(*jsonPath)) {
       jsonPath_ = pathNormalizer_.normalize(*jsonPath);
+      if (!jsonPath_->empty()) {
+        // document::at_path() converts the path to a JSON pointer on every
+        // call. The path is constant, so convert it once.
+        jsonPointer_ = simdjson::json_path_to_pointer_conversion(*jsonPath_);
+      }
     }
   }
 
@@ -263,11 +268,28 @@ struct GetJsonObjectFunction {
     if (hasInvalidEscapedChar(input.data(), input.size())) {
       return false;
     }
-    const auto formattedJsonPath = jsonPath_.has_value()
-        ? jsonPath_.value()
-        : pathNormalizer_.normalize(jsonPath);
+    std::string normalizedPath;
+    if (!jsonPath_.has_value()) {
+      normalizedPath = pathNormalizer_.normalize(jsonPath);
+    }
+    const std::string& formattedJsonPath =
+        jsonPath_.has_value() ? jsonPath_.value() : normalizedPath;
+    if (jsonPointer_.has_value() && *jsonPointer_ == "-1") {
+      // at_path() fails with INVALID_JSON_POINTER for such a path.
+      return false;
+    }
+    // Reuse one padded buffer across rows instead of allocating a
+    // simdjson::padded_string per row.
+    const size_t paddedSize = input.size() + simdjson::SIMDJSON_PADDING;
+    if (paddedJson_.size() < paddedSize) {
+      paddedJson_.resize(paddedSize);
+    }
+    std::memcpy(paddedJson_.data(), input.data(), input.size());
+    std::memset(
+        paddedJson_.data() + input.size(), 0, simdjson::SIMDJSON_PADDING);
+    simdjson::padded_string_view paddedJson(
+        paddedJson_.data(), input.size(), paddedJson_.size());
     simdjson::ondemand::document jsonDoc;
-    simdjson::padded_string paddedJson(input.data(), input.size());
     if (simdjsonParseIncomplete(paddedJson).get(jsonDoc)) {
       return false;
     }
@@ -288,7 +310,9 @@ struct GetJsonObjectFunction {
         return extractStringResult(std::move(root), result);
       }
       // Can return error result or throw exception possibly.
-      auto rawResult = jsonDoc.at_path(formattedJsonPath);
+      auto rawResult = jsonPointer_.has_value()
+          ? jsonDoc.at_pointer(*jsonPointer_)
+          : jsonDoc.at_path(formattedJsonPath);
       if (rawResult.error()) {
         return false;
       }
@@ -493,6 +517,13 @@ struct GetJsonObjectFunction {
 
   // Used for constant json path.
   std::optional<std::string> jsonPath_;
+
+  // JSON pointer equivalent of a constant, non-empty 'jsonPath_'. "-1" if the
+  // path cannot be converted.
+  std::optional<std::string> jsonPointer_;
+
+  // Padded copy of the input JSON, reused across rows.
+  std::string paddedJson_;
 
   detail::JsonPathNormalizer pathNormalizer_;
 

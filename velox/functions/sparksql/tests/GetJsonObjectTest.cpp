@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <stdint.h>
+#include "velox/core/Expressions.h"
 #include "velox/functions/sparksql/tests/SparkFunctionBaseTest.h"
 
 namespace facebook::velox::functions::sparksql::test {
@@ -21,13 +22,36 @@ namespace {
 
 class GetJsonObjectTest : public SparkFunctionBaseTest {
  protected:
+  // Evaluates with the path both as a column and as a constant, and expects
+  // the same result. A constant path is converted to a JSON pointer once in
+  // initialize(), so it takes a different code path from a per-row path.
   std::optional<std::string> getJsonObject(
       const std::string& json,
       const std::string& jsonPath) {
-    return evaluateOnce<std::string>(
+    const auto result = evaluateOnce<std::string>(
         "get_json_object(c0, c1)",
         std::optional<std::string>(json),
         std::optional<std::string>(jsonPath));
+    EXPECT_EQ(getJsonObjectWithConstantPath(json, jsonPath), result)
+        << "json: " << json << ", path: " << jsonPath;
+    return result;
+  }
+
+  std::optional<std::string> getJsonObjectWithConstantPath(
+      const std::string& json,
+      const std::string& jsonPath) {
+    const auto expr = std::make_shared<core::CallTypedExpr>(
+        VARCHAR(),
+        "get_json_object",
+        std::make_shared<core::FieldAccessTypedExpr>(VARCHAR(), "c0"),
+        std::make_shared<core::ConstantTypedExpr>(
+            VARCHAR(), Variant(jsonPath)));
+    const auto result = evaluate<SimpleVector<StringView>>(
+        expr, makeRowVector({makeFlatVector<std::string>({json})}));
+    if (result->isNullAt(0)) {
+      return std::nullopt;
+    }
+    return std::string(result->valueAt(0));
   }
 };
 
@@ -91,6 +115,11 @@ TEST_F(GetJsonObjectTest, basic) {
       getJsonObject(R"({"my": {"hello": true}})", "$.my.  hello"), "true");
   EXPECT_EQ(getJsonObject(R"({"a$ ": {"b": 10}})", "$.a$ .b"), "10");
   EXPECT_EQ(getJsonObject(R"({"a$. b": {"c": 10}})", "$.a$. b"), std::nullopt);
+  // '~' and '/' in a key are escaped in the JSON pointer the path converts to.
+  EXPECT_EQ(getJsonObject(R"({"a~b": 1})", "$.a~b"), "1");
+  EXPECT_EQ(getJsonObject(R"({"a/b": 1})", "$.a/b"), "1");
+  EXPECT_EQ(getJsonObject(R"({"a~b": 1})", "$['a~b']"), "1");
+  EXPECT_EQ(getJsonObject(R"({"a/b": 1})", "$['a/b']"), "1");
   // Json object as result.
   EXPECT_EQ(
       getJsonObject(
@@ -132,6 +161,32 @@ TEST_F(GetJsonObjectTest, basic) {
   EXPECT_EQ(getJsonObject(R"({"hello": "a\tb"})", "$.hello"), "a\tb");
   EXPECT_EQ(getJsonObject(R"({"hello": "\u0041"})", "$.hello"), "A");
   EXPECT_EQ(getJsonObject(R"({"hello": "\u000A"})", "$.hello"), "\n");
+}
+
+TEST_F(GetJsonObjectTest, constantPathAcrossRows) {
+  // Rows shorter than an earlier row reuse its padded buffer, so stale bytes
+  // from the longer row must not leak into the shorter row's parse.
+  const auto input = makeRowVector({
+      makeFlatVector<std::string>({
+          R"({"a": 1, "b": "a value long enough to make it the longest row"})",
+          R"({"a": 2})",
+          R"({"a": 3)",
+          R"({"b": 4})",
+          R"({"a": [1, 2]})",
+      }),
+      makeFlatVector<std::string>({"$.a", "$.a", "$.a", "$.a", "$.a"}),
+  });
+  const auto expected = makeNullableFlatVector<std::string>({
+      "1",
+      "2",
+      std::nullopt,
+      std::nullopt,
+      "[1,2]",
+  });
+  velox::test::assertEqualVectors(
+      expected, evaluate("get_json_object(c0, '$.a')", input));
+  velox::test::assertEqualVectors(
+      expected, evaluate("get_json_object(c0, c1)", input));
 }
 
 TEST_F(GetJsonObjectTest, supplementaryPlaneInObject) {
