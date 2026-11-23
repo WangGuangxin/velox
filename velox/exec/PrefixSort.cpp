@@ -26,6 +26,10 @@ namespace {
 // to bitswap32.
 static constexpr int32_t kAlignment = 8;
 
+// Longest string key that is normalized in full, regardless of
+// 'maxStringPrefixLength', when it also fits the normalized key budget.
+static constexpr uint32_t kMaxAdaptiveStringPrefixLength = 64;
+
 template <typename T>
 FOLLY_ALWAYS_INLINE void encodeRowColumn(
     const PrefixSortLayout& prefixSortLayout,
@@ -163,12 +167,28 @@ PrefixSortLayout PrefixSortLayout::generate(
 
   bool lastPrefixKeyPartial{false};
   for (auto i = 0; i < numKeys; ++i) {
+    // A string key is only partially normalized when its values may be longer
+    // than 'maxStringPrefixLength'. Then every tie on the encoded prefix falls
+    // back to comparing the full out-of-line strings and all remaining keys
+    // through the row container, which is dominated by cache misses. When the
+    // column statistics show that the longest value is short enough to fit in
+    // the remaining normalized key budget, encode the whole string so that the
+    // key, and the keys after it, are fully decided by the prefix.
+    uint32_t stringPrefixLength = maxStringLengths[i].has_value()
+        ? std::min(maxStringLengths[i].value(), maxStringPrefixLength)
+        : maxStringPrefixLength;
+    if (maxStringLengths[i].has_value() &&
+        maxStringLengths[i].value() > maxStringPrefixLength &&
+        maxStringLengths[i].value() <= kMaxAdaptiveStringPrefixLength) {
+      const auto fullSize = PrefixSortEncoder::encodedSize(
+          types[i]->kind(), maxStringLengths[i].value(), columnHasNulls[i]);
+      if (fullSize.has_value() &&
+          normalizedKeySize + fullSize.value() <= maxNormalizedKeySize) {
+        stringPrefixLength = maxStringLengths[i].value();
+      }
+    }
     const std::optional<uint32_t> encodedSize = PrefixSortEncoder::encodedSize(
-        types[i]->kind(),
-        maxStringLengths[i].has_value()
-            ? std::min(maxStringLengths[i].value(), maxStringPrefixLength)
-            : maxStringPrefixLength,
-        columnHasNulls[i]);
+        types[i]->kind(), stringPrefixLength, columnHasNulls[i]);
     if (!encodedSize.has_value() ||
         normalizedKeySize + encodedSize.value() > maxNormalizedKeySize) {
       break;
@@ -182,7 +202,7 @@ PrefixSortLayout PrefixSortLayout::generate(
     if ((types[i]->kind() == TypeKind::VARCHAR ||
          types[i]->kind() == TypeKind::VARBINARY) &&
         (!maxStringLengths[i].has_value() ||
-         maxStringPrefixLength < maxStringLengths[i].value())) {
+         stringPrefixLength < maxStringLengths[i].value())) {
       lastPrefixKeyPartial = true;
       break;
     }

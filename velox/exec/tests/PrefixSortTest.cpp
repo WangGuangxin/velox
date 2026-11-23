@@ -15,6 +15,7 @@
  */
 
 #include <fmt/ranges.h>
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #include "velox/exec/PrefixSort.h"
@@ -431,7 +432,9 @@ TEST_F(PrefixSortTest, optimizeSortKeysOrder) {
 TEST_F(PrefixSortTest, makeSortLayoutForString) {
   std::vector<TypePtr> keyTypes = {VARCHAR(), BIGINT()};
   std::vector<CompareFlags> compareFlags = {kAsc, kDesc};
-  std::vector<std::optional<uint32_t>> maxStringLengths = {9, std::nullopt};
+  // Strings longer than 64 bytes are never encoded in full, so only
+  // 'maxStringPrefixLength' bytes are in the prefix.
+  std::vector<std::optional<uint32_t>> maxStringLengths = {100, std::nullopt};
   std::vector<bool> columnHasNulls = {true, true};
 
   auto sortLayoutOneKey = PrefixSortLayout::generate(
@@ -444,6 +447,7 @@ TEST_F(PrefixSortTest, makeSortLayoutForString) {
   ASSERT_EQ(sortLayoutOneKey.encodeSizes.size(), 1);
   ASSERT_EQ(sortLayoutOneKey.encodeSizes[0], 9);
 
+  maxStringLengths = {9, std::nullopt};
   auto sortLayoutTwoCompleteKeys = PrefixSortLayout::generate(
       keyTypes, columnHasNulls, compareFlags, 26, 9, maxStringLengths);
   ASSERT_TRUE(sortLayoutTwoCompleteKeys.hasNormalizedKeys);
@@ -458,7 +462,7 @@ TEST_F(PrefixSortTest, makeSortLayoutForString) {
   // The last key type is VARBINARY, indicating that only partial data is
   // encoded in the prefix.
   std::vector<TypePtr> keyTypes1 = {BIGINT(), VARBINARY()};
-  maxStringLengths = {std::nullopt, 9};
+  maxStringLengths = {std::nullopt, 100};
   auto sortLayoutTwoKeys = PrefixSortLayout::generate(
       keyTypes1, columnHasNulls, compareFlags, 26, 8, maxStringLengths);
   ASSERT_TRUE(sortLayoutTwoKeys.hasNormalizedKeys);
@@ -469,6 +473,58 @@ TEST_F(PrefixSortTest, makeSortLayoutForString) {
   ASSERT_EQ(sortLayoutTwoKeys.encodeSizes.size(), 2);
   ASSERT_EQ(sortLayoutTwoKeys.encodeSizes[0], 9);
   ASSERT_EQ(sortLayoutTwoKeys.encodeSizes[1], 9);
+}
+
+// A string key longer than 'maxStringPrefixLength' is encoded in full when its
+// longest value is short and fits the normalized key budget.
+TEST_F(PrefixSortTest, makeSortLayoutForShortString) {
+  const std::vector<TypePtr> keyTypes = {VARCHAR(), BIGINT()};
+  const std::vector<CompareFlags> compareFlags = {kAsc, kDesc};
+  const std::vector<bool> columnHasNulls = {true, true};
+
+  {
+    // The whole string and the key after it are decided by the prefix.
+    const std::vector<std::optional<uint32_t>> maxStringLengths = {
+        20, std::nullopt};
+    auto layout = PrefixSortLayout::generate(
+        keyTypes, columnHasNulls, compareFlags, 64, 8, maxStringLengths);
+    ASSERT_TRUE(layout.hasNormalizedKeys);
+    ASSERT_FALSE(layout.hasNonNormalizedKey);
+    ASSERT_EQ(layout.nonPrefixSortStartIndex, layout.numNormalizedKeys);
+    ASSERT_THAT(layout.encodeSizes, testing::ElementsAre(21, 9));
+  }
+
+  {
+    // Strings longer than 64 bytes keep the configured prefix length.
+    const std::vector<std::optional<uint32_t>> maxStringLengths = {
+        100, std::nullopt};
+    auto layout = PrefixSortLayout::generate(
+        keyTypes, columnHasNulls, compareFlags, 256, 8, maxStringLengths);
+    ASSERT_TRUE(layout.hasNormalizedKeys);
+    ASSERT_LT(layout.nonPrefixSortStartIndex, layout.numNormalizedKeys);
+    ASSERT_THAT(layout.encodeSizes, testing::ElementsAre(9));
+  }
+
+  {
+    // The full string does not fit the budget: encode the configured prefix.
+    const std::vector<std::optional<uint32_t>> maxStringLengths = {
+        20, std::nullopt};
+    auto layout = PrefixSortLayout::generate(
+        keyTypes, columnHasNulls, compareFlags, 16, 8, maxStringLengths);
+    ASSERT_TRUE(layout.hasNormalizedKeys);
+    ASSERT_LT(layout.nonPrefixSortStartIndex, layout.numNormalizedKeys);
+    ASSERT_THAT(layout.encodeSizes, testing::ElementsAre(9));
+  }
+
+  {
+    // Unknown string length keeps the configured prefix length.
+    const std::vector<std::optional<uint32_t>> maxStringLengths = {
+        std::nullopt, std::nullopt};
+    auto layout = PrefixSortLayout::generate(
+        keyTypes, columnHasNulls, compareFlags, 64, 8, maxStringLengths);
+    ASSERT_LT(layout.nonPrefixSortStartIndex, layout.numNormalizedKeys);
+    ASSERT_THAT(layout.encodeSizes, testing::ElementsAre(9));
+  }
 }
 
 } // namespace
