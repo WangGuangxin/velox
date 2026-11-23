@@ -50,6 +50,53 @@ BufferPtr sortElements(
   }
 
   auto decodedIndices = decodedElements->indices();
+
+  // Sorting structs compares them field by field through virtual calls. When
+  // the first field is an integer without nulls, compare it directly and only
+  // fall back to the full comparison on ties. A non-zero first-field result is
+  // exactly what the full comparison returns.
+  std::optional<DecodedVector> firstField;
+  if (baseElementsVector->encoding() == VectorEncoding::Simple::ROW) {
+    const auto* rowBase = baseElementsVector->as<RowVector>();
+    if (rowBase->childrenSize() > 0 && rowBase->childAt(0) != nullptr) {
+      const auto& child = rowBase->childAt(0);
+      const auto kind = child->typeKind();
+      if ((kind == TypeKind::BIGINT || kind == TypeKind::INTEGER ||
+           kind == TypeKind::SMALLINT || kind == TypeKind::TINYINT) &&
+          !child->type()->providesCustomComparison() &&
+          child->size() >= rowBase->size()) {
+        firstField.emplace(*child);
+        if (firstField->mayHaveNulls()) {
+          firstField.reset();
+        }
+      }
+    }
+  }
+  auto compareFirstField = [&](vector_size_t a, vector_size_t b) -> int32_t {
+    int64_t left;
+    int64_t right;
+    switch (firstField->base()->typeKind()) {
+      case TypeKind::BIGINT:
+        left = firstField->valueAt<int64_t>(a);
+        right = firstField->valueAt<int64_t>(b);
+        break;
+      case TypeKind::INTEGER:
+        left = firstField->valueAt<int32_t>(a);
+        right = firstField->valueAt<int32_t>(b);
+        break;
+      case TypeKind::SMALLINT:
+        left = firstField->valueAt<int16_t>(a);
+        right = firstField->valueAt<int16_t>(b);
+        break;
+      default:
+        left = firstField->valueAt<int8_t>(a);
+        right = firstField->valueAt<int8_t>(b);
+        break;
+    }
+    const int32_t result = left < right ? -1 : (left > right ? 1 : 0);
+    return ascending ? result : -result;
+  };
+
   context.applyToSelectedNoThrow(rows, [&](vector_size_t row) {
     const auto size = inputArray.sizeAt(row);
     const auto offset = inputArray.offsetAt(row);
@@ -76,6 +123,14 @@ BufferPtr sortElements(
           }
           if (bNull) {
             return !nullsFirst;
+          }
+
+          if (firstField.has_value()) {
+            const auto first =
+                compareFirstField(decodedIndices[a], decodedIndices[b]);
+            if (first != 0) {
+              return first < 0;
+            }
           }
 
           std::optional<int32_t> result = baseElementsVector->compare(

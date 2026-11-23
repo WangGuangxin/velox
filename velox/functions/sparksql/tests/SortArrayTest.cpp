@@ -66,6 +66,40 @@ class SortArrayTest : public SparkFunctionBaseTest {
   }
 
   template <typename T>
+  void testRowWithIntegerFirstField(const TypePtr& intType) {
+    SCOPED_TRACE(intType->toString());
+    const T kMin = std::numeric_limits<T>::min();
+    const T kMax = std::numeric_limits<T>::max();
+    const variant nullRow = variant(TypeKind::ROW);
+    auto row = [](T key, const char* value) {
+      return variant::row({variant(key), variant(value)});
+    };
+    // Many ties on the first field so that the second field decides, plus the
+    // extreme values of the type.
+    NestedVector<variant> input{
+        {},
+        {row(1, "b")},
+        {row(2, "b"), row(1, "z"), row(2, "a"), row(1, "a"), row(0, "c")},
+        {row(kMax, "x"), row(kMin, "x"), row(-1, "y"), row(kMax, "a")},
+        {row(5, "q"), nullRow, row(-5, "q"), nullRow, row(5, "p")},
+        {row(3, "s"), row(3, "s"), row(3, "r")},
+    };
+    NestedVector<variant> expected{
+        {},
+        {row(1, "b")},
+        {row(0, "c"), row(1, "a"), row(1, "z"), row(2, "a"), row(2, "b")},
+        {row(kMin, "x"), row(-1, "y"), row(kMax, "a"), row(kMax, "x")},
+        {nullRow, nullRow, row(-5, "q"), row(5, "p"), row(5, "q")},
+        {row(3, "r"), row(3, "s"), row(3, "s")},
+    };
+    auto rowType = ROW({intType, VARCHAR()});
+    testSortArray(
+        makeArrayOfRowVector(rowType, input),
+        makeArrayOfRowVector(rowType, expected),
+        makeArrayOfRowVector(rowType, reverseNested(expected)));
+  }
+
+  template <typename T>
   void testFloatingPoint() {
     auto input = makeNullableArrayVector(floatingPointInput<T>());
     auto expected = floatingPointAscNullSmallest<T>();
@@ -170,6 +204,46 @@ TEST_F(SortArrayTest, row) {
   auto rowType = ROW({INTEGER(), VARCHAR()});
   auto input = makeArrayOfRowVector(rowType, rowInput());
   auto expected = rowAscNullSmallest();
+  testSortArray(
+      input,
+      makeArrayOfRowVector(rowType, expected),
+      makeArrayOfRowVector(rowType, reverseNested(expected)));
+}
+
+// Rows whose first field is a non-null integer are ordered by that field
+// directly and only compared in full on ties.
+TEST_F(SortArrayTest, rowWithIntegerFirstField) {
+  testRowWithIntegerFirstField<int8_t>(TINYINT());
+  testRowWithIntegerFirstField<int16_t>(SMALLINT());
+  testRowWithIntegerFirstField<int32_t>(INTEGER());
+  testRowWithIntegerFirstField<int64_t>(BIGINT());
+}
+
+TEST_F(SortArrayTest, dictionaryEncodedRowWithIntegerFirstField) {
+  // Elements are a dictionary over a row vector whose first field is itself
+  // a dictionary.
+  auto rowValues = makeRowVector({
+      wrapInDictionary(
+          makeIndicesInReverse(6), makeFlatVector<int64_t>({3, 1, 2, 1, 3, 0})),
+      makeFlatVector<std::string>({"a", "b", "c", "d", "e", "f"}),
+  });
+  // First field values after the reverse dictionary: 0, 3, 1, 2, 1, 3.
+  auto elements =
+      wrapInDictionary(makeIndices({5, 4, 3, 2, 1, 0, 1, 3}), rowValues);
+  auto input = makeArrayVector({0, 4}, elements);
+
+  // Array 0: (3,f) (1,e) (2,d) (1,c); array 1: (3,b) (0,a) (3,b) (2,d).
+  auto rowType = ROW({BIGINT(), VARCHAR()});
+  auto expected = NestedVector<variant>{
+      {variant::row({1L, "c"}),
+       variant::row({1L, "e"}),
+       variant::row({2L, "d"}),
+       variant::row({3L, "f"})},
+      {variant::row({0L, "a"}),
+       variant::row({2L, "d"}),
+       variant::row({3L, "b"}),
+       variant::row({3L, "b"})},
+  };
   testSortArray(
       input,
       makeArrayOfRowVector(rowType, expected),
