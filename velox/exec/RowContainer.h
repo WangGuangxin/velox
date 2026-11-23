@@ -1172,6 +1172,22 @@ class RowContainer {
       int32_t resultOffset,
       FlatVector<T>* result);
 
+  // Rows to extract are often in an order unrelated to their address (e.g.
+  // after sorting), so each value load misses the cache. Prefetches the value
+  // of a row a fixed distance ahead.
+  static inline void prefetchRowAhead(
+      const char* const* rows,
+      int32_t i,
+      int32_t numRows,
+      int32_t offset) {
+    constexpr int32_t kPrefetchDistance = 16;
+    if (i + kPrefetchDistance < numRows) {
+      if (const char* ahead = rows[i + kPrefetchDistance]) {
+        __builtin_prefetch(ahead + offset);
+      }
+    }
+  }
+
   template <bool useRowNumbers, typename T>
   static void extractValuesNoNulls(
       const char* const* rows,
@@ -1881,6 +1897,7 @@ inline void RowContainer::extractValuesWithNulls(
       row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
     } else {
       row = rows[i];
+      prefetchRowAhead(rows, i, numRows, column.offset());
     }
     auto resultIndex = resultOffset + i;
     if (row == nullptr || isNullAt(row, column)) {
@@ -1916,6 +1933,7 @@ inline void RowContainer::extractValuesNoNulls(
       row = rowNumber >= 0 ? rows[rowNumber] : nullptr;
     } else {
       row = rows[i];
+      prefetchRowAhead(rows, i, numRows, offset);
     }
     auto resultIndex = resultOffset + i;
     if (row == nullptr) {
