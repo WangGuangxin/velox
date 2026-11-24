@@ -23,6 +23,7 @@
 #include "velox/common/base/SimdUtil.h"
 #include "velox/external/utf8proc/utf8procImpl.h"
 #include "velox/functions/lib/string/GreekFinalSigma.h"
+#include "velox/functions/lib/string/SpecialUpperCasing.h"
 
 #if (ENABLE_VECTORIZATION > 0) && !defined(_DEBUG) && !defined(DEBUG)
 #if defined(__clang__) && (__clang_major__ > 7) && !defined(FOLLY_SANITIZE)
@@ -125,7 +126,11 @@ lowerAscii(char* output, const char* input, size_t length) {
 /// Perform upper for utf8 string input, output should be pre-allocated and
 /// large enough for the results. outputLength refers to the number of bytes
 /// available in the output buffer, and inputLength is the number of bytes in
-/// the input string
+/// the input string.
+/// @tparam specialCasing If true, code points whose full uppercase mapping has
+/// more than one code point are expanded as Spark does, e.g. 'ß' becomes 'SS'.
+/// If false, each code point maps to a single code point, e.g. 'ß' becomes 'ẞ'.
+template <bool specialCasing>
 FOLLY_ALWAYS_INLINE size_t upperUnicode(
     char* output,
     size_t outputLength,
@@ -147,6 +152,17 @@ FOLLY_ALWAYS_INLINE size_t upperUnicode(
       return outputIdx;
     }
     inputIdx += size;
+
+    if constexpr (specialCasing) {
+      if (auto special = specialUpperCase(nextCodePoint)) {
+        assert(
+            outputIdx + special->size() < outputLength &&
+            "access out of bound");
+        std::memcpy(&output[outputIdx], special->data(), special->size());
+        outputIdx += special->size();
+        continue;
+      }
+    }
 
     auto upperCodePoint = utf8proc_toupper(nextCodePoint);
 

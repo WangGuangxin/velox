@@ -36,9 +36,12 @@ namespace facebook::velox::functions::stringImpl {
 using namespace stringCore;
 
 /// Perform upper for a UTF8 string
+/// @tparam specialCasing If true, applies the multi code point uppercase
+/// mappings of Unicode SpecialCasing.txt, e.g. 'ß' becomes 'SS'.
 template <
     bool ascii,
     bool turkishCasing = false,
+    bool specialCasing = false,
     typename TOutString,
     typename TInString>
 FOLLY_ALWAYS_INLINE bool upper(TOutString& output, const TInString& input) {
@@ -47,8 +50,8 @@ FOLLY_ALWAYS_INLINE bool upper(TOutString& output, const TInString& input) {
     upperAscii(output.data(), input.data(), input.size());
   } else {
     output.resize(input.size() * 4);
-    auto size =
-        upperUnicode(output.data(), output.size(), input.data(), input.size());
+    auto size = upperUnicode<specialCasing>(
+        output.data(), output.size(), input.data(), input.size());
     output.resize(size);
   }
   return true;
@@ -766,7 +769,7 @@ FOLLY_ALWAYS_INLINE bool initcapUtf8Impl(
       std::memcpy(outputBytes, inputBytes, numBytesRead);
       outputBytes += numBytesRead;
     } else if (isStartOfWord) {
-      auto upperSize = upperUnicode(
+      auto upperSize = upperUnicode</*specialCasing=*/false>(
           outputBytes,
           static_cast<size_t>(outputStart + output.size() - outputBytes),
           inputBytes,

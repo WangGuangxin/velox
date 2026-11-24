@@ -658,9 +658,11 @@ String Functions
 
 .. spark:function:: upper(string) -> string
 
-    Returns string with all characters changed to uppercase. ::
+    Returns string with all characters changed to uppercase. Characters whose
+    uppercase form has several characters are expanded as Spark does. ::
 
         SELECT upper('SparkSql'); -- SPARKSQL
+        SELECT upper('Straße'); -- STRASSE
 
 .. spark:function:: varchar_type_write_side_check(string, limit) -> varchar
 

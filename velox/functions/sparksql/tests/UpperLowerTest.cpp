@@ -144,6 +144,25 @@ TEST_F(UpperLowerTest, upperUnicode) {
   EXPECT_EQ("\u1E8E", upper("\u1E8F"));
 }
 
+TEST_F(UpperLowerTest, upperSpecialCasing) {
+  EXPECT_EQ("SS", upper("\u00DF"));
+  EXPECT_EQ("STRASSE", upper("Stra\u00DFe"));
+  EXPECT_EQ("\u1E9E", upper("\u1E9E"));
+  EXPECT_EQ("FFI", upper("\uFB03"));
+  EXPECT_EQ("AFFIX", upper("a\uFB03x"));
+  EXPECT_EQ("ST", upper("\uFB06"));
+  EXPECT_EQ("\u02BCN", upper("\u0149"));
+  EXPECT_EQ("J\u030C", upper("\u01F0"));
+  EXPECT_EQ("\u0399\u0308\u0301", upper("\u0390"));
+  EXPECT_EQ("\u0535\u0552", upper("\u0587"));
+  EXPECT_EQ("\u0391\u0399", upper("\u1FB3"));
+  EXPECT_EQ("\u0391\u0399", upper("\u1FBC"));
+  EXPECT_EQ("\u1F08\u0399", upper("\u1F80"));
+  EXPECT_EQ("\u0391\u0342\u0399", upper("\u1FB7"));
+  EXPECT_EQ("\u0544\u0546", upper("\uFB13"));
+  EXPECT_EQ("\u00C0SS\u0391\u0399", upper("\u00E0\u00DF\u1FB3"));
+}
+
 TEST_F(UpperLowerTest, upperGreek) {
   EXPECT_EQ("ΠΑΣ", upper("πασ"));
   EXPECT_EQ("ΠΑΣ ", upper("πασ "));
