@@ -188,6 +188,10 @@ target_link_libraries(
   Folly::follybenchmark
 )
 
+add_executable(velox_prefixsort_string_key_benchmark PrefixSortStringKeyBenchmark.cpp)
+
+target_link_libraries(velox_prefixsort_string_key_benchmark velox_exec Folly::follybenchmark)
+
 add_executable(velox_orderby_benchmark OrderByBenchmark.cpp OrderByBenchmarkUtil.cpp)
 
 target_link_libraries(
