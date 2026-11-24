@@ -2662,7 +2662,9 @@ TEST_F(AggregationTest, spillPrefixSortOptimization) {
            .value(),
        0,
        0},
-      {true, 1'000'000, 0, 4},
+      // The fuzzed strings of the first string key are short enough to be
+      // encoded in full, so the key after it is in the prefix as well.
+      {true, 1'000'000, 0, 5},
       {false, 1'000'000, 0, 0},
       {true, 1'000'000, 1'000'000, 0},
       {false, 1'000'000, 1'000'000, 0},
