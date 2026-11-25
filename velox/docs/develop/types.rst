@@ -139,6 +139,7 @@ TIME_MICRO_UTC represents time in microseconds since midnight in UTC, not subjec
 The TIME and TIME_MICRO_UTC types are backed by BIGINT physical type.
 
 TIMESTAMP represents a timestamp subject to session timezone interpretation. TIMESTAMP_UTC represents a timestamp in UTC, not subject to session timezone adjustment. Both types are backed by TIMESTAMP physical type.
+Operators process TIMESTAMP_UTC values the same way as TIMESTAMP values. Sorting, joins, aggregations, window functions, exchanges and spilling compare and hash the physical values, and keep TIMESTAMP_UTC in their output types. The two types differ only in casts, functions and connectors, which apply the session timezone to TIMESTAMP only.
 
 VECTOR_INDEX represents a local vector index: a FAISS index over embeddings,
 with each embedding's id, serialized as ``faiss::write_index`` writes it. It is
