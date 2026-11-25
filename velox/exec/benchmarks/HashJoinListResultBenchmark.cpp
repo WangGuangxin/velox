@@ -422,24 +422,12 @@ class HashTableListJoinResultBenchmark : public VectorTestBase {
   }
 
   BaseHashTable::JoinResultIterator createResultIterator() {
-    std::vector<vector_size_t> listColumns{};
-    for (int32_t i = 0; i < topTable_->rows()->columnTypes().size(); i++) {
+    std::vector<column_index_t> listColumns;
+    for (column_index_t i = 0; i < topTable_->rows()->columnTypes().size();
+         ++i) {
       listColumns.push_back(i);
     }
-    std::vector<vector_size_t> varSizeListColumns;
-    uint64_t fixedSizeListColumnsSizeSum{0};
-    varSizeListColumns.reserve(listColumns.size());
-    for (const auto column : listColumns) {
-      if (topTable_->rows()->columnTypes()[column]->isFixedWidth()) {
-        fixedSizeListColumnsSizeSum += topTable_->rows()->fixedSizeAt(column);
-      } else {
-        varSizeListColumns.push_back(column);
-      }
-    }
-    return BaseHashTable::JoinResultIterator(
-        std::move(varSizeListColumns),
-        fixedSizeListColumnsSizeSum,
-        std::nullopt);
+    return BaseHashTable::JoinResultIterator(*topTable_, listColumns);
   }
 
   // Hash probe and list join result.

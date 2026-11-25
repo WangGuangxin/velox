@@ -24,8 +24,9 @@
 #include "velox/functions/prestosql/aggregates/RegisterAggregateFunctions.h"
 #include "velox/vector/tests/utils/VectorTestBase.h"
 
+#include <fmt/ranges.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
-#include <gmock/gmock-matchers.h>
+#include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include <memory>
 
@@ -436,6 +437,51 @@ class HashTableTest : public testing::TestWithParam<bool>,
               makeVector(buildType, batchSize, sequence)));
       sequence += batchSize;
     }
+  }
+
+  // Makes a join table keyed by BIGINT row numbers, with a BIGINT dependent
+  // column holding the row number and a VARCHAR dependent column holding
+  // 'strings'.
+  std::unique_ptr<HashTable<true>> makeJoinTable(
+      const std::vector<std::string>& strings) {
+    std::vector<std::unique_ptr<VectorHasher>> keyHashers;
+    keyHashers.emplace_back(std::make_unique<VectorHasher>(BIGINT(), 0));
+    auto table = HashTable<true>::createForJoin(
+        std::move(keyHashers),
+        {BIGINT(), VARCHAR()},
+        pool(),
+        {.allowDuplicates = true, .minTableSizeForParallelJoinBuild = 1'000});
+    const auto numRows = strings.size();
+    std::vector<RowVectorPtr> batches{makeRowVector({
+        makeFlatVector<int64_t>(numRows, [](auto row) { return row; }),
+        makeFlatVector<int64_t>(numRows, [](auto row) { return row; }),
+        makeFlatVector<std::string>(strings),
+    })};
+    copyVectorsToTable(batches, 0, table.get());
+    table->prepareJoinTable(
+        {},
+        BaseHashTable::kNoSpillInputStartPartitionBit,
+        1'000'000,
+        false,
+        executor_.get());
+    return table;
+  }
+
+  // Probes 'table' from makeJoinTable() with keys 0 to 'numKeys' - 1, so
+  // probe row i matches build row i.
+  std::unique_ptr<HashLookup> probeKeysInOrder(
+      BaseHashTable& table,
+      vector_size_t numKeys) {
+    auto probe = makeRowVector(
+        {makeFlatVector<int64_t>(numKeys, [](auto row) { return row; })});
+    auto lookup = std::make_unique<HashLookup>(table.hashers(), pool());
+    lookup->reset(numKeys);
+    SelectivityVector activeRows(numKeys);
+    table.prepareForJoinProbe(
+        *lookup, probe, activeRows, /*decodeAndRemoveNulls=*/true);
+    lookup->hits.resize(numKeys);
+    table.joinProbe(*lookup);
+    return lookup;
   }
 
   void store(RowContainer& rowContainer, const RowVectorPtr& data) {
@@ -901,106 +947,110 @@ TEST_P(HashTableTest, regularHashingTableSize) {
   }
 }
 
+TEST_P(HashTableTest, joinResultIteratorRowSize) {
+  if (GetParam()) {
+    GTEST_SKIP() << "No need to run this in multi-threaded mode";
+  }
+  // Longer than the 12 bytes a StringView inlines.
+  const std::string string(20, 'x');
+  auto table = makeJoinTable(std::vector<std::string>(100, string));
+
+  {
+    BaseHashTable::JoinResultIterator iter(
+        *table, std::vector<column_index_t>{});
+    EXPECT_THAT(iter.varSizeListColumns, testing::IsEmpty());
+    EXPECT_EQ(iter.fixedSizeListColumnsSizeSum, 0);
+    EXPECT_EQ(iter.estimatedRowSize, 0);
+  }
+  {
+    // Fixed sized columns alone give the exact size.
+    BaseHashTable::JoinResultIterator iter(
+        *table, std::vector<column_index_t>{0, 1});
+    EXPECT_THAT(iter.varSizeListColumns, testing::IsEmpty());
+    EXPECT_EQ(iter.fixedSizeListColumnsSizeSum, 16);
+    EXPECT_EQ(iter.estimatedRowSize, 16);
+  }
+  {
+    // Strings of one size: the average and the maximum are both 20.
+    BaseHashTable::JoinResultIterator iter(
+        *table, std::vector<column_index_t>{1, 2});
+    EXPECT_THAT(iter.varSizeListColumns, testing::ElementsAre(2));
+    EXPECT_EQ(iter.fixedSizeListColumnsSizeSum, 8);
+    EXPECT_EQ(iter.estimatedRowSize, 28);
+  }
+  {
+    // One string of 1000 bytes among 20 byte ones: the maximum is more than
+    // 10x the average of 29, so there is no estimate.
+    std::vector<std::string> strings(100, string);
+    strings[5] = std::string(1'000, 'x');
+    auto skewedTable = makeJoinTable(strings);
+    BaseHashTable::JoinResultIterator iter(
+        *skewedTable, std::vector<column_index_t>{1, 2});
+    EXPECT_THAT(iter.varSizeListColumns, testing::ElementsAre(2));
+    EXPECT_EQ(iter.fixedSizeListColumnsSizeSum, 8);
+    EXPECT_EQ(iter.estimatedRowSize, std::nullopt);
+  }
+
+  VELOX_ASSERT_THROW(
+      BaseHashTable::JoinResultIterator(*table, std::vector<column_index_t>{3}),
+      "Projected join column must be a column of the hash table rows");
+}
+
 TEST_P(HashTableTest, listJoinResultsSize) {
-  baseString_ =
-      "If you count carefully, you will notice there are exactly 105 characters"
-      " in this string including space.";
-  const size_t kNumRows = 1024;
-  auto buildType = ROW(
-      {"f0", "v0", "v1"}, {BIGINT(), VARCHAR(), ROW({BIGINT(), VARCHAR()})});
-  std::vector<std::unique_ptr<VectorHasher>> keyHashers;
-  for (auto i = 0; i < buildType->size(); ++i) {
-    keyHashers.emplace_back(
-        std::make_unique<VectorHasher>(buildType->childAt(i), i));
+  if (GetParam()) {
+    GTEST_SKIP() << "No need to run this in multi-threaded mode";
   }
-
-  auto table = HashTable<true>::createForJoin(
-      std::move(keyHashers),
-      {BIGINT(), VARCHAR()},
-      pool(),
-      {.allowDuplicates = true, .minTableSizeForParallelJoinBuild = kNumRows});
-  std::vector<RowVectorPtr> batches;
-  makeRows(kNumRows, 1, 0, buildType, batches);
-  auto rows = copyVectorsToTable(batches, 0, table.get());
-
-  std::vector<vector_size_t> inputRowsBuf;
-  inputRowsBuf.resize(kNumRows);
-  auto inputRows =
-      std::span(static_cast<vector_size_t*>(inputRowsBuf.data()), kNumRows);
-  std::vector<char*> outputRowsBuf;
-  outputRowsBuf.resize(kNumRows);
-  auto outputRows = std::span(outputRowsBuf.data(), kNumRows);
-
-  HashLookup lookup(table->hashers(), pool());
-  lookup.rows.reserve(kNumRows);
-  lookup.hits.reserve(kNumRows);
-  for (auto i = 0; i < kNumRows; i++) {
-    lookup.rows.push_back(i);
-    lookup.hits.push_back(rows[i]);
-  }
+  constexpr vector_size_t kNumRows = 100;
+  // Build row 5 holds 1000 bytes and every other row 20.
+  std::vector<std::string> strings(kNumRows, std::string(20, 'x'));
+  strings[5] = std::string(1'000, 'x');
+  auto skewedTable = makeJoinTable(strings);
+  auto table =
+      makeJoinTable(std::vector<std::string>(kNumRows, std::string(20, 'x')));
 
   struct TestParam {
-    std::optional<int64_t> estimatedRowSize;
-    std::vector<vector_size_t> varSizeListColumns;
-    std::vector<vector_size_t> fixedSizeListColumns;
+    bool skewed;
+    std::vector<column_index_t> projectedColumns;
     uint64_t maxBytes;
-    int64_t expectedRows;
-
-    std::string debugString() const {
-      std::stringstream ss;
-      ss << "estimatedRowSize "
-         << (estimatedRowSize.has_value()
-                 ? std::to_string(estimatedRowSize.value())
-                 : "null");
-      ss << "varSizeListColumns ";
-      ss << "[";
-      for (auto i = 0; i < varSizeListColumns.size(); i++) {
-        ss << varSizeListColumns[i];
-        if (i != varSizeListColumns.size() - 1) {
-          ss << ", ";
-        }
-      }
-      ss << "] fixedSizeListColumns [";
-      for (auto i = 0; i < fixedSizeListColumns.size(); i++) {
-        ss << fixedSizeListColumns[i];
-        if (i != fixedSizeListColumns.size() - 1) {
-          ss << ", ";
-        }
-      }
-      ss << "] maxBytes " << maxBytes;
-
-      return ss.str();
-    }
+    int32_t expectedRows;
   };
-
-  // Key types: BIGINT, VARCHAR, ROW(BIGINT, VARCHAR)
-  // Dependent types: BIGINT, VARCHAR
-  std::vector<TestParam> testParams{
-      {std::nullopt, {}, {0}, 1024, 128},
-      {std::nullopt, {1}, {}, 2048, 20},
-      {std::nullopt, {1}, {}, 1 << 20, 1024},
-      {std::nullopt, {1}, {}, 1 << 14, 154},
-      {std::nullopt, {1}, {0}, 2048, 18},
-      {std::nullopt, {}, {0, 3}, 1024, 64},
-      {std::nullopt, {2}, {}, 2048, 17},
-      {std::nullopt, {1, 2, 4}, {0, 3}, 1 << 14, 66},
-      {std::nullopt, {2}, {}, 2048, 17},
-      {std::make_optional(128), {}, {0}, 1024, 8},
-      {std::make_optional(0), {1}, {0}, 1024, 1024}};
+  const std::vector<TestParam> testParams{
+      // Results of no bytes never reach the budget.
+      {false, {}, 1, kNumRows},
+      // 8 bytes per result.
+      {false, {1}, 80, 10},
+      // 20 bytes per result, from the estimate.
+      {false, {2}, 100, 5},
+      // A budget smaller than one result still lists one.
+      {false, {2}, 1, 1},
+      // Without an estimate each result is sized as listed: rows 0 to 4 take
+      // 100 bytes and row 5 crosses the budget.
+      {true, {2}, 200, 6},
+      // The skewed column is not listed, so the size is exact.
+      {true, {1}, 80, 10},
+  };
+  std::vector<vector_size_t> inputRows(kNumRows);
+  std::vector<char*> hits(kNumRows);
   for (const auto& testParam : testParams) {
-    SCOPED_TRACE(testParam.debugString());
-    uint64_t fixedColumnSizeSum{0};
-    for (const auto column : testParam.fixedSizeListColumns) {
-      fixedColumnSizeSum += table->rows()->fixedSizeAt(column);
-    }
+    SCOPED_TRACE(
+        fmt::format(
+            "skewed {} projectedColumns [{}] maxBytes {}",
+            testParam.skewed,
+            fmt::join(testParam.projectedColumns, ", "),
+            testParam.maxBytes));
+    auto& probedTable = testParam.skewed ? *skewedTable : *table;
+    auto lookup = probeKeysInOrder(probedTable, kNumRows);
     BaseHashTable::JoinResultIterator iter(
-        std::vector<vector_size_t>(testParam.varSizeListColumns),
-        fixedColumnSizeSum,
-        testParam.estimatedRowSize);
-    iter.reset(lookup);
-    auto numRows = table->listJoinResults(
-        iter, true, inputRows, outputRows, testParam.maxBytes);
-    ASSERT_EQ(numRows, testParam.expectedRows);
+        probedTable, testParam.projectedColumns);
+    iter.reset(*lookup);
+    EXPECT_EQ(
+        probedTable.listJoinResults(
+            iter,
+            /*includeMisses=*/false,
+            std::span(inputRows),
+            std::span(hits),
+            testParam.maxBytes),
+        testParam.expectedRows);
   }
 }
 
@@ -1095,8 +1145,9 @@ TEST_P(HashTableTest, listJoinResultsInterleaved) {
               includeMisses,
               maxBytes));
 
+      // Lists the BIGINT value column, 8 bytes per result.
       BaseHashTable::JoinResultIterator iter(
-          {}, /*fixedSizeListColumnsSizeSum=*/8, std::nullopt);
+          *table, std::vector<column_index_t>{1});
       iter.reset(lookup);
       std::vector<vector_size_t> probeRows;
       std::vector<char*> hits;

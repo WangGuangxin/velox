@@ -367,15 +367,6 @@ class HashProbe : public Operator {
   // memory reclamation or operator close.
   void clearBuffers();
 
-  // Returns the estimated row size of the projected output columns. nullopt
-  // will be returned if insufficient column stats is presented in 'table_', or
-  // the row size variation is too large. The row size is too large if ratio of
-  // max row size and avg row size is larger than 'kToleranceRatio' which is set
-  // to 10.
-  std::optional<uint64_t> estimatedRowSize(
-      const std::vector<vector_size_t>& varColumnsStats,
-      uint64_t totalFixedColumnsBytes);
-
   // TODO: Define batch size as bytes based on RowContainer row sizes.
   const vector_size_t outputBatchSize_;
 

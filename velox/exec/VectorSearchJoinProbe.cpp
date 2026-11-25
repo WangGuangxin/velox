@@ -118,8 +118,10 @@ BlockingReason BaseVectorSearchJoinProbe::isBlocked(ContinueFuture* future) {
   buildRowSize_ = estimateBuildRowSize(*table_, buildProjections_);
   if (table_->hashTable() != nullptr) {
     lookup_ = std::make_unique<HashLookup>(hashers_, pool());
+    // Lists no build columns: setMaxOutputRows() already bounds the matches
+    // by count, with 'buildRowSize_' for the build columns.
     joinResults_ = std::make_unique<BaseHashTable::JoinResultIterator>(
-        std::vector<vector_size_t>{}, 0, std::nullopt);
+        *table_->hashTable(), std::span<const column_index_t>());
   }
   if (!table_->rows().empty()) {
     setResultRows(table_->rows().front(), table_->numKeys());

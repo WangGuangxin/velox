@@ -214,6 +214,15 @@ class StateHashJoinOperator : public exec::Operator {
     VELOX_CHECK(
         entry_.has_value(), "No hash table state registered: {}", stateName_);
     table_ = entry_->table.get();
+    // Sizes each match by the dependent columns makeOutput() extracts, so the
+    // byte budget of listJoinResults() bounds the output.
+    std::vector<column_index_t> dependentColumns;
+    for (column_index_t column = entry_->numKeys;
+         column < entry_->buildType->size();
+         ++column) {
+      dependentColumns.push_back(column);
+    }
+    iterator_.emplace(*table_, dependentColumns);
   }
 
   void initialize() override {
@@ -247,7 +256,7 @@ class StateHashJoinOperator : public exec::Operator {
       }
       lookup_->hits.resize(lookup_->rows.back() + 1);
       table_->joinProbe(*lookup_);
-      iterator_.reset(*lookup_);
+      iterator_->reset(*lookup_);
     }
 
     // One output vector per call, sized by the configured batch: a high-fanout
@@ -257,7 +266,7 @@ class StateHashJoinOperator : public exec::Operator {
     indexBuffer_.resize(maxRows);
     rowBuffer_.resize(maxRows);
     const auto numMatches = table_->listJoinResults(
-        iterator_,
+        *iterator_,
         /*includeMisses=*/false,
         std::span(indexBuffer_.data(), maxRows),
         std::span(rowBuffer_.data(), maxRows),
@@ -268,7 +277,7 @@ class StateHashJoinOperator : public exec::Operator {
       return nullptr;
     }
     auto output = makeOutput(probe_, numMatches);
-    if (iterator_.atEnd()) {
+    if (iterator_->atEnd()) {
       probe_ = nullptr;
     }
     return output;
@@ -344,7 +353,7 @@ class StateHashJoinOperator : public exec::Operator {
   // Both outlive a getOutput() call: one probe batch can yield many output
   // vectors.
   RowVectorPtr probe_;
-  exec::BaseHashTable::JoinResultIterator iterator_{{}, 0, std::nullopt};
+  std::optional<exec::BaseHashTable::JoinResultIterator> iterator_;
 
   // Matches listed by the current getOutput() call: probe-row indices and the
   // build rows they matched.

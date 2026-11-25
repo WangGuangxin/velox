@@ -327,72 +327,18 @@ void HashProbe::maybeSetupSpillInputReader(
   inputSpillPartitionSet_.erase(iter);
 }
 
-std::optional<uint64_t> HashProbe::estimatedRowSize(
-    const std::vector<vector_size_t>& varSizedColumns,
-    uint64_t totalFixedColumnsBytes) {
-  static const double kToleranceRatio = 10.0;
-  const auto rowContainers = table_->allRows();
-  std::vector<RowColumnStats> varSizeListColumnsStats;
-  varSizeListColumnsStats.reserve(varSizedColumns.size());
-  for (const auto column : varSizedColumns) {
-    varSizeListColumnsStats.push_back(
-        RowContainer::columnStats(rowContainers, column));
-  }
-
-  uint64_t numRows{0};
-  for (const auto* rowContainer : rowContainers) {
-    numRows += rowContainer->numRows();
-  }
-  uint64_t totalAvgBytes{totalFixedColumnsBytes};
-  uint64_t totalMaxBytes{totalFixedColumnsBytes};
-  for (const auto& stats : varSizeListColumnsStats) {
-    totalAvgBytes += stats.avgBytes(numRows);
-    totalMaxBytes += stats.maxBytes();
-  }
-  if (totalAvgBytes == 0) {
-    if (totalMaxBytes == 0) {
-      return 0;
-    }
-    // Return nullopt to prevent memory exploding in extreme size skew cases:
-    // e.g. 1 row very large and all other rows of size 0.
-    return std::nullopt;
-  }
-  if (totalMaxBytes / totalAvgBytes >= kToleranceRatio) {
-    return std::nullopt;
-  }
-  // Make the total per batch size to be bounded by 2x 'outputBatchSize_':
-  // worst case size = (outputBatchSize_ / estimated size) * totalMaxBytes
-  return (totalMaxBytes + totalAvgBytes) / 2;
-}
-
 void HashProbe::initializeResultIter() {
   VELOX_CHECK_NOT_NULL(table_);
   if (resultIter_ != nullptr) {
     return;
   }
-  std::vector<vector_size_t> listColumns;
-  listColumns.reserve(tableOutputProjections_.size());
+  std::vector<column_index_t> projectedColumns;
+  projectedColumns.reserve(tableOutputProjections_.size());
   for (const auto& projection : tableOutputProjections_) {
-    listColumns.push_back(projection.inputChannel);
+    projectedColumns.push_back(projection.inputChannel);
   }
-  std::vector<vector_size_t> varSizeListColumns;
-  uint64_t fixedSizeListColumnsSizeSum{0};
-  varSizeListColumns.reserve(tableOutputProjections_.size());
-  for (const auto column : listColumns) {
-    if (table_->rows()->columnTypes()[column]->isFixedWidth()) {
-      fixedSizeListColumnsSizeSum += table_->rows()->fixedSizeAt(column);
-    } else {
-      varSizeListColumns.push_back(column);
-    }
-  }
-
-  auto rowSizeEstimation =
-      estimatedRowSize(varSizeListColumns, fixedSizeListColumnsSizeSum);
-  // TODO: Make tolerance ratio configurable if needed.
   resultIter_ = std::make_unique<BaseHashTable::JoinResultIterator>(
-      std::move(varSizeListColumns),
-      fixedSizeListColumnsSizeSum,
-      rowSizeEstimation);
+      *table_, projectedColumns);
 }
 
 void HashProbe::pushdownDynamicFilters() {
