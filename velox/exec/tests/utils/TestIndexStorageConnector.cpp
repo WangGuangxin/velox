@@ -381,7 +381,7 @@ TestIndexSource::ResultIterator::ResultIterator(
       executor_(executor) {
   // Initialize the lookup result iterator.
   lookupResultIter_ = std::make_unique<BaseHashTable::JoinResultIterator>(
-      std::vector<vector_size_t>{}, 0, /*estimatedRowSize=*/1);
+      *source_->indexTable()->table, std::span<const column_index_t>());
   lookupResultIter_->reset(*lookupResult_);
 }
 

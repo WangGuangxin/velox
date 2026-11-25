@@ -275,13 +275,16 @@ class BaseHashTable {
       }
     };
 
+    /// Makes an iterator over the join results of 'table' that sizes each
+    /// result by 'projectedColumns': the columns of the table's rows that the
+    /// caller extracts for each result. Passing no columns makes every result
+    /// zero bytes, so the 'maxBytes' of listJoinResults() never stops the
+    /// listing. The sizes come from the column types and the stats of all the
+    /// table's row containers, so make the iterator once the build is
+    /// complete.
     JoinResultIterator(
-        std::vector<vector_size_t>&& _varSizeListColumns,
-        uint64_t _fixedSizeListColumnsSizeSum,
-        std::optional<uint64_t> _estimatedRowSize)
-        : estimatedRowSize(_estimatedRowSize),
-          varSizeListColumns(std::move(_varSizeListColumns)),
-          fixedSizeListColumnsSizeSum(_fixedSizeListColumnsSizeSum) {}
+        const BaseHashTable& table,
+        std::span<const column_index_t> projectedColumns);
 
     void reset(const HashLookup& lookup) {
       rows = &lookup.rows;
@@ -305,13 +308,16 @@ class BaseHashTable {
       return true;
     }
 
-    /// The row size estimation of the projected output columns, if applicable.
-    const std::optional<uint64_t> estimatedRowSize;
     /// The indexes of the build side projected columns that are variable sized.
-    const std::vector<vector_size_t> varSizeListColumns;
+    const std::vector<column_index_t> varSizeListColumns;
     /// The per row total bytes of the build side projected columns that are
     /// fixed sized.
-    const uint64_t fixedSizeListColumnsSizeSum{0};
+    const uint64_t fixedSizeListColumnsSizeSum;
+    /// The size of every result, used in place of its actual size. Exact when
+    /// all projected columns are fixed sized. Otherwise an estimate from the
+    /// column stats, or nullopt when the variable sized columns are too skewed
+    /// for one, and then each result is sized as it is listed.
+    const std::optional<uint64_t> estimatedRowSize;
 
     const raw_vector<vector_size_t>* rows{nullptr};
     const raw_vector<char*>* hits{nullptr};
@@ -1108,11 +1114,8 @@ class HashTable : public BaseHashTable {
   void joinNormalizedKeyProbe(HashLookup& lookup);
 
   // Returns the total size of the variable size 'columns' in 'row'.
-  // NOTE: No checks are done in the method for performance considerations.
-  // Caller needs to make sure only variable size columns are inside of
-  // 'columns'.
   inline uint64_t joinProjectedVarColumnsSize(
-      const std::vector<vector_size_t>& columns,
+      const std::vector<column_index_t>& columns,
       const char* row) const;
 
   // Adds a row to a hash join table in kArray hash mode. Returns true

@@ -44,6 +44,88 @@ std::string BaseHashTable::modeString(HashMode mode) {
   }
 }
 
+namespace {
+
+void checkProjectedColumn(const RowContainer& rows, column_index_t column) {
+  VELOX_CHECK_LT(
+      column,
+      rows.columnTypes().size(),
+      "Projected join column must be a column of the hash table rows");
+}
+
+std::vector<column_index_t> varSizeColumns(
+    const RowContainer& rows,
+    std::span<const column_index_t> projectedColumns) {
+  std::vector<column_index_t> columns;
+  for (const auto column : projectedColumns) {
+    checkProjectedColumn(rows, column);
+    if (!rows.columnTypes()[column]->isFixedWidth()) {
+      columns.push_back(column);
+    }
+  }
+  return columns;
+}
+
+uint64_t fixedSizeColumnsBytes(
+    const RowContainer& rows,
+    std::span<const column_index_t> projectedColumns) {
+  uint64_t bytes{0};
+  for (const auto column : projectedColumns) {
+    checkProjectedColumn(rows, column);
+    if (rows.columnTypes()[column]->isFixedWidth()) {
+      bytes += rows.fixedSizeAt(column);
+    }
+  }
+  return bytes;
+}
+
+// Returns the size to charge for every result, or nullopt when the variable
+// sized columns are too skewed for one size to stand for all results.
+std::optional<uint64_t> estimateRowSize(
+    const std::vector<RowContainer*>& rowContainers,
+    const std::vector<column_index_t>& varSizeColumns,
+    uint64_t fixedSizeBytes) {
+  constexpr uint64_t kToleranceRatio{10};
+  uint64_t numRows{0};
+  for (const auto* rowContainer : rowContainers) {
+    numRows += rowContainer->numRows();
+  }
+  uint64_t totalAvgBytes{fixedSizeBytes};
+  uint64_t totalMaxBytes{fixedSizeBytes};
+  for (const auto column : varSizeColumns) {
+    const auto stats = RowContainer::columnStats(rowContainers, column);
+    totalAvgBytes += stats.avgBytes(numRows);
+    totalMaxBytes += stats.maxBytes();
+  }
+  if (totalAvgBytes == 0) {
+    if (totalMaxBytes == 0) {
+      return 0;
+    }
+    // Return nullopt to prevent memory exploding in extreme size skew cases:
+    // e.g. 1 row very large and all other rows of size 0.
+    return std::nullopt;
+  }
+  if (totalMaxBytes / totalAvgBytes >= kToleranceRatio) {
+    return std::nullopt;
+  }
+  // Bounds the bytes of a batch by 2x 'maxBytes': the worst case is
+  // (maxBytes / estimate) * totalMaxBytes.
+  return (totalMaxBytes + totalAvgBytes) / 2;
+}
+
+} // namespace
+
+BaseHashTable::JoinResultIterator::JoinResultIterator(
+    const BaseHashTable& table,
+    std::span<const column_index_t> projectedColumns)
+    : varSizeListColumns(varSizeColumns(*table.rows(), projectedColumns)),
+      fixedSizeListColumnsSizeSum(
+          fixedSizeColumnsBytes(*table.rows(), projectedColumns)),
+      estimatedRowSize(estimateRowSize(
+          table.allRows(),
+          varSizeListColumns,
+          fixedSizeListColumnsSizeSum)) {}
+
 template <bool ignoreNullKeys>
 HashTable<ignoreNullKeys>::HashTable(
     std::vector<std::unique_ptr<VectorHasher>>&& hashers,
@@ -2031,13 +2113,11 @@ void HashTable<ignoreNullKeys>::prepareJoinTable(
 
 template <bool ignoreNullKeys>
 inline uint64_t HashTable<ignoreNullKeys>::joinProjectedVarColumnsSize(
-    const std::vector<vector_size_t>& columns,
+    const std::vector<column_index_t>& columns,
     const char* row) const {
   uint64_t totalBytes{0};
-  for (const auto& column : columns) {
-    if (!rows_->columnTypes()[column]->isFixedWidth()) {
-      totalBytes += rows_->variableSizeAt(row, column);
-    }
+  for (const auto column : columns) {
+    totalBytes += rows_->variableSizeAt(row, column);
   }
   return totalBytes;
 }
