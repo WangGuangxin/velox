@@ -32,6 +32,15 @@
 #include <x86intrin.h>
 #endif
 
+// SVE2 BEXT and BDEP are the AArch64 counterparts of BMI2 PEXT and PDEP.
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE2_BITPERM) && \
+    __has_include(<arm_neon_sve_bridge.h>)
+#include <arm_neon_sve_bridge.h>
+#define VELOX_ARM_BITPERM 1
+#else
+#define VELOX_ARM_BITPERM 0
+#endif
+
 // Remove once we upgrade folly.
 #ifndef FOLLY_BUILTIN_MEMCPY
 #if FOLLY_HAS_BUILTIN(__builtin_memcpy_inline)
@@ -914,6 +923,16 @@ inline uint32_t extractBits(uint32_t a, uint32_t mask) {
 template <>
 inline uint64_t extractBits(uint64_t a, uint64_t mask) {
   return _pext_u64(a, mask);
+}
+#elif VELOX_ARM_BITPERM
+// BEXT works on vector lanes. Every lane holds 'a', and lane 0 is the result.
+template <>
+inline uint32_t extractBits(uint32_t a, uint32_t mask) {
+  return vgetq_lane_u32(svget_neonq_u32(svbext_n_u32(svdup_n_u32(a), mask)), 0);
+}
+template <>
+inline uint64_t extractBits(uint64_t a, uint64_t mask) {
+  return vgetq_lane_u64(svget_neonq_u64(svbext_n_u64(svdup_n_u64(a), mask)), 0);
 }
 #else
 template <typename T>
