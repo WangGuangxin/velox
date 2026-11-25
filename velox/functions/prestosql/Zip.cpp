@@ -21,6 +21,64 @@ namespace facebook::velox::functions {
 
 namespace {
 
+// Returns the arguments as array vectors if all are flat and use the offsets
+// and sizes buffers of the first one. Otherwise, returns an empty vector. Field
+// projections of one array of structs (e.g. Spark's get_array_struct_fields)
+// share that array's buffers this way, so every row has equal arrays at equal
+// offsets.
+std::vector<const ArrayVector*> flatArraysWithSharedLayout(
+    const std::vector<VectorPtr>& args) {
+  std::vector<const ArrayVector*> arrays;
+  arrays.reserve(args.size());
+  for (const auto& arg : args) {
+    if (arg->encoding() != VectorEncoding::Simple::ARRAY) {
+      return {};
+    }
+    arrays.push_back(arg->asUnchecked<ArrayVector>());
+    if (arrays.back()->offsets() != arrays[0]->offsets() ||
+        arrays.back()->sizes() != arrays[0]->sizes()) {
+      return {};
+    }
+  }
+  return arrays;
+}
+
+// Makes the result from the element vectors of 'baseVectors' as is, without
+// padding or copying. Requires that in every row all arrays start at the same
+// offset and have the same size.
+VectorPtr zipElements(
+    const std::vector<const ArrayVector*>& baseVectors,
+    BufferPtr offsets,
+    BufferPtr sizes,
+    vector_size_t size,
+    const TypePtr& outputType,
+    memory::MemoryPool* pool) {
+  std::vector<VectorPtr> elements;
+  elements.reserve(baseVectors.size());
+  // Since the offsets and sizes are all the same, using the minimum size is
+  // big enough to contain all elements, while also guaranteeing all child
+  // Vectors in the RowVector are at least this big.
+  vector_size_t minElementsSize = std::numeric_limits<vector_size_t>::max();
+  for (const auto* baseVector : baseVectors) {
+    elements.push_back(baseVector->elements());
+    minElementsSize = std::min(minElementsSize, elements.back()->size());
+  }
+  auto rowVector = std::make_shared<RowVector>(
+      pool,
+      outputType->childAt(0),
+      BufferPtr(nullptr),
+      minElementsSize,
+      std::move(elements));
+  return std::make_shared<ArrayVector>(
+      pool,
+      outputType,
+      BufferPtr(nullptr),
+      size,
+      std::move(offsets),
+      std::move(sizes),
+      std::move(rowVector));
+}
+
 class ZipFunction : public exec::VectorFunction {
   static const auto kMinArity = 2;
   static const auto kMaxArity = 7;
@@ -56,6 +114,22 @@ class ZipFunction : public exec::VectorFunction {
       VectorPtr& result) const override {
     const vector_size_t numInputArrays = args.size();
 
+    auto* pool = context.pool();
+
+    if (const auto arrays = flatArraysWithSharedLayout(args); !arrays.empty()) {
+      context.moveOrCopyResult(
+          zipElements(
+              arrays,
+              arrays[0]->offsets(),
+              arrays[0]->sizes(),
+              rows.end(),
+              outputType,
+              pool),
+          rows,
+          result);
+      return;
+    }
+
     exec::DecodedArgs decodedArgs(rows, args, context);
     std::vector<const ArrayVector*> baseVectors(numInputArrays);
     std::vector<const vector_size_t*> rawSizes(numInputArrays);
@@ -71,7 +145,6 @@ class ZipFunction : public exec::VectorFunction {
 
     // Size of elements in result vector.
     vector_size_t resultElementsSize = 0;
-    auto* pool = context.pool();
     // This is true if for all rows, all the arrays within a row are the same
     // size.
     bool allSameSize = true;
@@ -104,52 +177,37 @@ class ZipFunction : public exec::VectorFunction {
     });
 
     if (allSameSize && allSameOffsets) {
-      // This is true if all input vectors have the "flat" Array encoding.
+      // For all rows, all arrays within a row are the same size and start at
+      // the same offset. In this case we don't have to add nulls, we can just
+      // pass in the element Vectors as is to be the fields of the output Rows.
+      // If all input Vectors are flat, they also share the offsets of the
+      // first one.
       bool allFlat = true;
       for (const auto& arg : args) {
         allFlat &= arg->encoding() == VectorEncoding::Simple::ARRAY;
       }
 
+      BufferPtr offsets;
       if (allFlat) {
-        // Fast path if all input Vectors are flat and for all rows, all arrays
-        // within a row are the same size and start at the same offset.  In this
-        // case we don't have to add nulls, or decode the arrays, we can just
-        // pass in the element Vectors as is to be the fields of the output
-        // Rows.
-        std::vector<VectorPtr> elements;
-        elements.reserve(args.size());
-        // Since the offsets and sizes are all the same, using the minimum size
-        // is big enough to contain all elements, while also guaranteeing all
-        // child Vectors in the RowVector are at least this big.
-        vector_size_t minElementsSize =
-            std::numeric_limits<vector_size_t>::max();
-        for (const auto& arg : args) {
-          elements.push_back(arg->as<ArrayVector>()->elements());
-          minElementsSize = std::min(minElementsSize, elements.back()->size());
-        }
-
-        auto rowType = outputType->childAt(0);
-        auto rowVector = std::make_shared<RowVector>(
-            pool,
-            rowType,
-            BufferPtr(nullptr),
-            minElementsSize,
-            std::move(elements));
-
-        // Now convert these to an Array
-        auto arrayVector = std::make_shared<ArrayVector>(
-            pool,
-            outputType,
-            BufferPtr(nullptr),
-            rows.end(),
-            baseVectors[0]->offsets(),
-            resultArraySizesBuffer,
-            std::move(rowVector));
-
-        context.moveOrCopyResult(arrayVector, rows, result);
-
-        return;
+        offsets = baseVectors[0]->offsets();
+      } else {
+        offsets = allocateOffsets(rows.end(), pool);
+        auto* rawResultOffsets = offsets->asMutable<vector_size_t>();
+        rows.applyToSelected([&](auto row) {
+          rawResultOffsets[row] = rawOffsets[0][indices[0][row]];
+        });
       }
+      context.moveOrCopyResult(
+          zipElements(
+              baseVectors,
+              std::move(offsets),
+              resultArraySizesBuffer,
+              rows.end(),
+              outputType,
+              pool),
+          rows,
+          result);
+      return;
     }
 
     // Create individual result vectors for each input Array vector.
