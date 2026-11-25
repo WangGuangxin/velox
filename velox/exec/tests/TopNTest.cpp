@@ -290,6 +290,68 @@ TEST_F(TopNTest, onlyKeys) {
   testTwoKeys(vectors, "c0", "c1", 200);
 }
 
+TEST_F(TopNTest, timestampUtc) {
+  // 2024-03-10 02:30:00 does not exist and 2024-11-03 01:30:00.123456 is
+  // ambiguous in America/Los_Angeles.
+  const Timestamp earliest{-62'135'596'800, 0};
+  const Timestamp beforeEpoch{-1, 999'999'000};
+  const Timestamp skipped{1'710'037'800, 0};
+  const Timestamp repeated{1'730'597'400, 123'456'000};
+  const Timestamp latest{253'402'300'799, 999'999'000};
+
+  const auto data = makeRowVector(
+      {"id", "ts"},
+      {
+          makeFlatVector<int32_t>({0, 1, 2, 3, 4, 5, 6}),
+          makeNullableFlatVector<Timestamp>(
+              {repeated,
+               std::nullopt,
+               beforeEpoch,
+               latest,
+               skipped,
+               earliest,
+               skipped},
+              TIMESTAMP_UTC()),
+      });
+
+  struct {
+    std::vector<std::string> keys;
+    RowVectorPtr expected;
+  } testSettings[] = {
+      {{"ts ASC NULLS LAST", "id"},
+       makeRowVector(
+           {"id", "ts"},
+           {
+               makeFlatVector<int32_t>({5, 2, 4, 6}),
+               makeFlatVector<Timestamp>(
+                   {earliest, beforeEpoch, skipped, skipped}, TIMESTAMP_UTC()),
+           })},
+      {{"ts DESC NULLS FIRST", "id"},
+       makeRowVector(
+           {"id", "ts"},
+           {
+               makeFlatVector<int32_t>({1, 3, 0, 4}),
+               makeNullableFlatVector<Timestamp>(
+                   {std::nullopt, latest, repeated, skipped}, TIMESTAMP_UTC()),
+           })},
+  };
+
+  for (const auto& testData : testSettings) {
+    SCOPED_TRACE(folly::join(", ", testData.keys));
+    const auto plan =
+        PlanBuilder().values({data}).topN(testData.keys, 4, false).planNode();
+    for (const auto* timeZone : {"UTC", "America/Los_Angeles"}) {
+      SCOPED_TRACE(timeZone);
+      const auto actual =
+          AssertQueryBuilder(plan)
+              .config(core::QueryConfig::kSessionTimezone, timeZone)
+              .config(core::QueryConfig::kAdjustTimestampToTimezone, true)
+              .copyResults(pool());
+      facebook::velox::test::assertEqualVectors(testData.expected, actual);
+    }
+  }
+}
+
 TEST_F(TopNTest, planNodeValidation) {
   auto data = makeRowVector(
       ROW({"a", "b"},
