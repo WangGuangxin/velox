@@ -248,6 +248,7 @@ add_executable(
   PrestoQueryRunnerTest.cpp
   QueryAssertionsTest.cpp
   TaskTest.cpp
+  TimestampUtcAssertionsTest.cpp
   TreeOfLosersTest.cpp
 )
 

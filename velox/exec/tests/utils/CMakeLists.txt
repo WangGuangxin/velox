@@ -39,6 +39,7 @@ add_library(
   VectorTestUtil.cpp
   Ports.cpp
   SerializedPageUtil.cpp
+  TimestampUtcAssertions.cpp
 )
 velox_add_test_headers(
   velox_exec_test_lib
@@ -65,6 +66,7 @@ velox_add_test_headers(
   TableWriterTestBase.h
   TaskMonitor.h
   TestIndexStorageConnector.h
+  TimestampUtcAssertions.h
   TpchQueryBuilder.h
   TpcdsQueryBuilder.h
   VectorTestUtil.h
