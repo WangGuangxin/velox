@@ -1074,6 +1074,20 @@ TEST_P(PrestoSerializerTest, timestampWithTimeZone) {
   testRoundTrip(timestamp);
 }
 
+TEST_P(PrestoSerializerTest, timestampUtc) {
+  auto timestamps = makeNullableFlatVector<Timestamp>(
+      {Timestamp::fromMicros(1704067200000000),
+       std::nullopt,
+       Timestamp::fromMicros(-1),
+       Timestamp::fromMicros(253402300799999999),
+       Timestamp::fromMicros(0)},
+      TIMESTAMP_UTC());
+
+  serializer::presto::PrestoVectorSerde::PrestoOptions opts;
+  opts.useLosslessTimestamp = true;
+  testRoundTrip(timestamps, &opts);
+}
+
 TEST_P(PrestoSerializerTest, intervalDayTime) {
   auto vector = makeFlatVector<int64_t>(
       100,
