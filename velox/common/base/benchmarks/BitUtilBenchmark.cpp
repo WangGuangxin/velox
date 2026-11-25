@@ -15,6 +15,7 @@
  */
 
 #include <folly/Benchmark.h>
+#include <folly/Random.h>
 #include <folly/init/Init.h>
 
 #include <optional>
@@ -141,6 +142,50 @@ BENCHMARK(BM_scatterBitsSimple, n) {
 
 BENCHMARK_RELATIVE(BM_scatterBits, n) {
   runScatterBits(n, false);
+}
+
+// Extracts bits from random words with runtime masks that have 'numMaskBits'
+// bits set. Each iteration is one pass over all words.
+void runExtractBits(uint32_t iterations, int32_t numMaskBits) {
+  constexpr int32_t kNumWords = 4096;
+  std::vector<uint64_t> values(kNumWords);
+  std::vector<uint64_t> masks(kNumWords);
+  BENCHMARK_SUSPEND {
+    folly::Random::DefaultGenerator rng;
+    rng.seed(1);
+    for (int32_t i = 0; i < kNumWords; ++i) {
+      values[i] = folly::Random::rand64(rng);
+      uint64_t mask = 0;
+      while (__builtin_popcountll(mask) < numMaskBits) {
+        mask |= uint64_t{1} << (folly::Random::rand32(rng) % 64);
+      }
+      masks[i] = mask;
+    }
+  }
+  for (uint32_t iteration = 0; iteration < iterations; ++iteration) {
+    // Hides the input from the optimizer so that each pass reloads it.
+    const uint64_t* valuesData = values.data();
+    folly::makeUnpredictable(valuesData);
+    uint64_t sum = 0;
+    for (int32_t i = 0; i < kNumWords; ++i) {
+      sum += bits::extractBits<uint64_t>(valuesData[i], masks[i]);
+    }
+    folly::doNotOptimizeAway(sum);
+  }
+}
+
+BENCHMARK_DRAW_LINE();
+
+BENCHMARK(extractBits8, n) {
+  runExtractBits(n, 8);
+}
+
+BENCHMARK(extractBits32, n) {
+  runExtractBits(n, 32);
+}
+
+BENCHMARK(extractBits56, n) {
+  runExtractBits(n, 56);
 }
 
 void BM_forEachBit(
