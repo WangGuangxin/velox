@@ -17,6 +17,7 @@
 #include "velox/dwio/common/BitPackDecoder.h"
 
 #include <cstring>
+#include <limits>
 
 namespace facebook::velox::dwio::common {
 
@@ -177,9 +178,14 @@ int32_t decode1To24(
   return i;
 }
 
-#define WIDTH_CASE(width)                                                      \
-  case width:                                                                  \
-    i = decode1To24<width>(bits, bitOffset, rows.data(), numSafeRows, result); \
+#define WIDTH_CASE(width)                \
+  case width:                            \
+    i = decode1To24<width>(              \
+        bits,                            \
+        static_cast<int32_t>(bitOffset), \
+        rows.data(),                     \
+        numSafeRows,                     \
+        result);                         \
     break;
 
 } // namespace
@@ -189,7 +195,7 @@ int32_t decode1To24(
 template <typename T>
 void unpack(
     const uint64_t* bits,
-    int32_t bitOffset,
+    int32_t inputBitOffset,
     RowSet rows,
     int32_t rowBias,
     uint8_t bitWidth,
@@ -205,7 +211,7 @@ void unpack(
   VELOX_DCHECK_NOT_NULL(bits);
 
   // We subtract rowBias * bitWidth bits from the starting position.
-  bitOffset -= rowBias * bitWidth;
+  int64_t bitOffset = int64_t{inputBitOffset} - int64_t{rowBias} * bitWidth;
   if (bitOffset < 0) {
     // Decrement the pointer by enough bytes to have a non-negative bitOffset.
     auto bytes = bits::divRoundUp(-bitOffset, 8);
@@ -213,10 +219,17 @@ void unpack(
     bits = reinterpret_cast<const uint64_t*>(
         reinterpret_cast<const char*>(bits) - bytes);
   }
+  // Bit positions are 64-bit because row * bitWidth can exceed the int32
+  // range. Rows and the normalized offset are non-negative, so positions are
+  // unsigned and '/ 8' and '& 7' compile to a shift and a mask.
+  const uint64_t firstBit = bitOffset;
+  const auto bitPosition = [&](int32_t row) {
+    return firstBit + static_cast<uint64_t>(row) * bitWidth;
+  };
   auto numRows = rows.size();
   if (bitWidth > 56) {
     for (auto i = 0; i < numRows; ++i) {
-      auto bit = bitOffset + (rows[i]) * bitWidth;
+      auto bit = bitPosition(rows[i]);
       result[i] = bits::detail::loadBits<T>(bits, bit, bitWidth) & mask;
     }
     return;
@@ -225,7 +238,7 @@ void unpack(
   bool anyUnsafe = false;
   if (bufferEnd) {
     const char* endByte = reinterpret_cast<const char*>(bits) +
-        bits::divRoundUp(bitOffset + (rows.back() + 1) * bitWidth, 8);
+        bits::divRoundUp(bitPosition(rows.back()) + bitWidth, 8);
     // redzone is the number of bytes at the end of the accessed range that
     // could overflow the buffer if accessed 64 its wide.
     int64_t redZone =
@@ -245,39 +258,44 @@ void unpack(
   int32_t i = 0;
 
 #if XSIMD_WITH_AVX2
-  // Use AVX2 for specific widths.
-  switch (bitWidth) {
-    WIDTH_CASE(1);
-    WIDTH_CASE(2);
-    WIDTH_CASE(3);
-    WIDTH_CASE(4);
-    WIDTH_CASE(5);
-    WIDTH_CASE(6);
-    WIDTH_CASE(7);
-    WIDTH_CASE(8);
-    WIDTH_CASE(9);
-    WIDTH_CASE(10);
-    WIDTH_CASE(11);
-    WIDTH_CASE(12);
-    WIDTH_CASE(13);
-    WIDTH_CASE(14);
-    WIDTH_CASE(15);
-    WIDTH_CASE(16);
-    WIDTH_CASE(17);
-    WIDTH_CASE(18);
-    WIDTH_CASE(19);
-    WIDTH_CASE(20);
-    WIDTH_CASE(21);
-    WIDTH_CASE(22);
-    WIDTH_CASE(23);
-    WIDTH_CASE(24);
-    default:
-      break;
+  // Use AVX2 for specific widths. These kernels compute bit positions in int32
+  // lanes, so larger positions stay on the 64-bit scalar path below.
+  if (numSafeRows > 0 &&
+      bitPosition(rows[numSafeRows - 1]) <=
+          std::numeric_limits<int32_t>::max()) {
+    switch (bitWidth) {
+      WIDTH_CASE(1);
+      WIDTH_CASE(2);
+      WIDTH_CASE(3);
+      WIDTH_CASE(4);
+      WIDTH_CASE(5);
+      WIDTH_CASE(6);
+      WIDTH_CASE(7);
+      WIDTH_CASE(8);
+      WIDTH_CASE(9);
+      WIDTH_CASE(10);
+      WIDTH_CASE(11);
+      WIDTH_CASE(12);
+      WIDTH_CASE(13);
+      WIDTH_CASE(14);
+      WIDTH_CASE(15);
+      WIDTH_CASE(16);
+      WIDTH_CASE(17);
+      WIDTH_CASE(18);
+      WIDTH_CASE(19);
+      WIDTH_CASE(20);
+      WIDTH_CASE(21);
+      WIDTH_CASE(22);
+      WIDTH_CASE(23);
+      WIDTH_CASE(24);
+      default:
+        break;
+    }
   }
 #endif
 
   for (; i < numSafeRows; ++i) {
-    auto bit = bitOffset + (rows[i]) * bitWidth;
+    auto bit = bitPosition(rows[i]);
     auto byte = bit / 8;
     auto shift = bit & 7;
     uint64_t word;
@@ -289,7 +307,7 @@ void unpack(
     auto lastSafeWord = bufferEnd - sizeof(uint64_t);
     VELOX_DCHECK(lastSafeWord);
     for (auto i_2 = numSafeRows; i_2 < numRows; ++i_2) {
-      auto bit = bitOffset + (rows[i_2]) * bitWidth;
+      auto bit = bitPosition(rows[i_2]);
       auto byte = bit / 8;
       auto shift = bit & 7;
       result[i_2] = safeLoadBits(

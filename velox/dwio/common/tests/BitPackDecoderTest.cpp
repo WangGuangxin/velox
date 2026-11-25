@@ -22,6 +22,7 @@
 #include <gflags/gflags.h>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include <sys/mman.h>
 #include <cstring>
 
 DECLARE_bool(bmi2); // NOLINT
@@ -177,6 +178,76 @@ TEST_F(BitPackDecoderTest, allWidths) {
     testUnpack<int32_t>(width, oddRows_);
     testUnpack<int64_t>(width, oddRows_);
   }
+}
+
+TEST_F(BitPackDecoderTest, bitPositionsBeyondInt32) {
+  // 200M rows of 24 bits start beyond bit 2^32, so row * bitWidth and
+  // rowBias * bitWidth overflow 32-bit arithmetic.
+  constexpr int32_t kFirstRow{200'000'000};
+  constexpr int32_t kNumRows{33};
+  constexpr uint8_t kBitWidth{24};
+  constexpr int32_t kBitOffset{7};
+  const uint64_t numBytes{
+      (uint64_t{kFirstRow + kNumRows} * kBitWidth + kBitOffset) / 8 +
+      sizeof(uint64_t)};
+  // Anonymous pages read as zero. Only the pages written below are touched.
+  void* mapping = mmap(
+      nullptr,
+      numBytes,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+      -1,
+      0);
+  ASSERT_NE(mapping, MAP_FAILED);
+  auto* data = static_cast<uint64_t*>(mapping);
+
+  std::vector<uint64_t> expected(kNumRows);
+  std::vector<int32_t> rowNumbers(kNumRows);
+  for (int32_t i = 0; i < kNumRows; ++i) {
+    expected[i] = 0x80'0000 | (i * 0x1'3579);
+    rowNumbers[i] = kFirstRow + i;
+    bits::copyBits(
+        &expected[i],
+        0,
+        data,
+        uint64_t{rowNumbers[i]} * kBitWidth + kBitOffset,
+        kBitWidth);
+  }
+  const RowSet rows(rowNumbers);
+  const auto* bufferEnd = reinterpret_cast<const char*>(data) + numBytes;
+
+  auto checkResult = [&](const auto& result) {
+    for (int32_t i = 0; i < kNumRows; ++i) {
+      ASSERT_EQ(static_cast<uint64_t>(result[i]), expected[i]) << "at " << i;
+    }
+  };
+
+  // Bit positions relative to the start of the buffer.
+  for (const char* end : {bufferEnd, static_cast<const char*>(nullptr)}) {
+    std::vector<int32_t> result32(kNumRows);
+    unpack(data, kBitOffset, rows, 0, kBitWidth, end, result32.data());
+    checkResult(result32);
+    std::vector<int64_t> result64(kNumRows);
+    unpack(data, kBitOffset, rows, 0, kBitWidth, end, result64.data());
+    checkResult(result64);
+  }
+
+  // Bit positions relative to the first row, cancelled by rowBias.
+  const uint64_t firstBit{uint64_t{kFirstRow} * kBitWidth + kBitOffset};
+  const auto* biasedData = reinterpret_cast<const uint64_t*>(
+      reinterpret_cast<const char*>(data) + firstBit / 8);
+  std::vector<int64_t> result(kNumRows);
+  unpack(
+      biasedData,
+      static_cast<int32_t>(firstBit % 8),
+      rows,
+      kFirstRow,
+      kBitWidth,
+      bufferEnd,
+      result.data());
+  checkResult(result);
+
+  ASSERT_EQ(munmap(mapping, numBytes), 0);
 }
 
 TEST_P(BitPackDecoderBmi2Test, uint8AllRows) {
