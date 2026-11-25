@@ -17,6 +17,7 @@
 #include "velox/dwio/parquet/reader/PageReader.h"
 
 #include <thrift/lib/cpp2/protocol/Serializer.h>
+#include <zstd.h>
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/dwio/parquet/common/ParquetRuntimeStats.h"
 #include "velox/dwio/parquet/tests/ParquetTestBase.h"
@@ -224,6 +225,46 @@ std::string snappyLiteral(std::string_view data) {
   stream.push_back(static_cast<char>((data.size() - 1) << 2));
   stream.append(data);
   return stream;
+}
+
+// Returns a bit-packed run of the RLE/bit-packing hybrid encoding holding
+// 1-bit levels, 8 per byte of 'levelBits', least significant bit first.
+std::string bitPackedLevels(std::string_view levelBits) {
+  std::string run;
+  auto header = (static_cast<uint64_t>(levelBits.size()) << 1) | 1;
+  while (header >= 0x80) {
+    run.push_back(static_cast<char>((header & 0x7F) | 0x80));
+    header >>= 7;
+  }
+  run.push_back(static_cast<char>(header));
+  run.append(levelBits);
+  return run;
+}
+
+// Returns the uncompressed body of a data page V1: each level section prefixed
+// by its 4-byte length, followed by 'values'.
+std::string dataPageV1Body(
+    std::string_view repetitionLevels,
+    std::string_view definitionLevels,
+    std::string_view values) {
+  std::string body;
+  for (const auto section : {repetitionLevels, definitionLevels}) {
+    const auto length = static_cast<uint32_t>(section.size());
+    body.append(reinterpret_cast<const char*>(&length), sizeof(length));
+    body.append(section);
+  }
+  body.append(values);
+  return body;
+}
+
+// Returns 'data' compressed into a single ZSTD frame.
+std::string zstdCompress(std::string_view data) {
+  std::string compressed(ZSTD_compressBound(data.size()), '\0');
+  const auto size = ZSTD_compress(
+      compressed.data(), compressed.size(), data.data(), data.size(), 1);
+  VELOX_CHECK(!ZSTD_isError(size), "{}", ZSTD_getErrorName(size));
+  compressed.resize(size);
+  return compressed;
 }
 
 } // namespace
@@ -622,6 +663,116 @@ TEST_F(ParquetPageReaderTest, corruptUncompressedSizeNoneV1) {
   VELOX_ASSERT_THROW(
       pageReader->skip(1),
       "Uncompressed page size 40 exceeds compressed page size 20");
+}
+
+// Preloading the levels of a ZSTD data page V1 decompresses the page only up
+// to the end of its level sections. Here those sections span several ZSTD
+// blocks of at most 128KB.
+TEST_F(ParquetPageReaderTest, zstdLevelsAcrossBlocksV1) {
+  // Each byte of repetition levels holds 8 levels, and a 0 starts a row:
+  // - 0xFE is one row of 8 elements.
+  // - 0xAA is 4 rows of 2 elements.
+  // - 0x00 is 8 rows of 1 element, where definition levels 0x0F make the last
+  //   4 rows empty.
+  // The repetition level section is a 4-byte length, a 3-byte run header and
+  // 'kNumLevelBytes' bytes. The definition level length then takes bytes
+  // 131'070 to 131'073, across the end of the first 128KB block.
+  constexpr int32_t kNumLevelBytes = 131'063;
+  std::string repetitionBits;
+  std::string definitionBits;
+  std::vector<int32_t> expectedLengths;
+  for (auto i = 0; i < kNumLevelBytes; ++i) {
+    switch (i % 3) {
+      case 0:
+        repetitionBits.push_back('\xFE');
+        definitionBits.push_back('\xFF');
+        expectedLengths.push_back(8);
+        break;
+      case 1:
+        repetitionBits.push_back('\xAA');
+        definitionBits.push_back('\xFF');
+        expectedLengths.insert(expectedLengths.end(), {2, 2, 2, 2});
+        break;
+      default:
+        repetitionBits.push_back('\x00');
+        definitionBits.push_back('\x0F');
+        expectedLengths.insert(expectedLengths.end(), {1, 1, 1, 1, 0, 0, 0, 0});
+        break;
+    }
+  }
+  const auto body = dataPageV1Body(
+      bitPackedLevels(repetitionBits),
+      bitPackedLevels(definitionBits),
+      std::string(64 * 1024, '\0'));
+  const auto compressed = zstdCompress(body);
+  const int32_t numLevels = kNumLevelBytes * 8;
+  const auto data = serializePageHeader(createDataPageV1Header(
+                        static_cast<int32_t>(body.size()),
+                        static_cast<int32_t>(compressed.size()),
+                        numLevels)) +
+      compressed;
+
+  dwio::common::ColumnRuntimeStats stats{TypeKind::ARRAY};
+  PageReader pageReader(
+      std::make_unique<SeekableArrayInputStream>(data.data(), data.size()),
+      *leafPool_,
+      CompressionKind_ZSTD,
+      data.size(),
+      stats,
+      /*sessionTimezone=*/nullptr,
+      /*maxRepeat=*/1,
+      /*maxDefine=*/1);
+
+  const auto numRows = static_cast<int32_t>(expectedLengths.size());
+  pageReader.decodeRepDefs(numRows);
+  EXPECT_EQ(pageReader.repDefRange(), std::make_pair(0, numLevels));
+
+  // Offsets of 'numRows' lists, converted to lengths in place.
+  std::vector<int32_t> lengths(numRows + 1);
+  std::vector<uint64_t> nulls(bits::nwords(numRows));
+  EXPECT_EQ(
+      pageReader.getLengthsAndNulls(
+          LevelMode::kList,
+          LevelInfo(
+              /*null_slots=*/1,
+              /*definitionLevel=*/1,
+              /*repetitionLevel=*/1,
+              /*repeatedAncestorDefinitionLevel=*/0),
+          0,
+          numLevels,
+          numRows,
+          lengths.data(),
+          nulls.data(),
+          0),
+      numRows);
+  lengths.resize(numRows);
+  EXPECT_EQ(lengths, expectedLengths);
+}
+
+// A ZSTD data page V1 whose frame ends before its level sections fails while
+// preloading levels.
+TEST_F(ParquetPageReaderTest, truncatedZstdLevelsV1) {
+  // The page claims 100 bytes, but its frame holds only 2, which is less than
+  // the 4-byte repetition level length.
+  const auto compressed = zstdCompress(std::string(2, '\0'));
+  const auto data = serializePageHeader(createDataPageV1Header(
+                        100, static_cast<int32_t>(compressed.size()), 10)) +
+      compressed;
+
+  dwio::common::ColumnRuntimeStats stats{TypeKind::ARRAY};
+  PageReader pageReader(
+      std::make_unique<SeekableArrayInputStream>(data.data(), data.size()),
+      *leafPool_,
+      CompressionKind_ZSTD,
+      data.size(),
+      stats,
+      /*sessionTimezone=*/nullptr,
+      /*maxRepeat=*/1,
+      /*maxDefine=*/1);
+
+  VELOX_ASSERT_THROW(
+      pageReader.decodeRepDefs(1),
+      "ZSTD data page is truncated (corrupt data page?): decompressed 2 of 4 bytes");
 }
 
 // Test that prepareDataPageV2 rejects pages where repetition + definition

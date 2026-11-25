@@ -32,6 +32,9 @@
 #include "velox/dwio/parquet/reader/RleBpDataDecoder.h"
 #include "velox/dwio/parquet/reader/StringDecoder.h"
 
+// Declared in <zstd.h>, which this header does not include.
+struct ZSTD_DCtx_s;
+
 namespace facebook::velox::parquet {
 
 /// Manages access to pages inside a ColumnChunk. Interprets page headers and
@@ -501,6 +504,17 @@ class PageReader {
 
   // decompressed data for the page. Rep-def-data in V1, data alone in V2.
   BufferPtr decompressedData_;
+
+  // Frees a ZSTD decompression context.
+  struct ZstdContextDeleter {
+    void operator()(ZSTD_DCtx_s* context) const;
+  };
+
+  // Decompresses the levels of ZSTD data pages V1 in preloadRepDefs().
+  // Streaming decompression keeps a window buffer of up to a page plus a ZSTD
+  // block that the memory pool does not track, so preloadRepDefs() frees the
+  // context when it is done instead of holding it while the values are read.
+  std::unique_ptr<ZSTD_DCtx_s, ZstdContextDeleter> repDefZstdContext_;
 
   // First byte of decompressed encoded data. Contains the encoded data as a
   // contiguous run of bytes.
