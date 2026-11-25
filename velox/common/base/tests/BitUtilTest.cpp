@@ -727,17 +727,66 @@ TEST_F(BitUtilTest, scatterBits) {
   std::vector<char> test(kSize * 8);
   std::vector<char> reference(kSize * 8);
   auto sourceAsChar = reinterpret_cast<char*>(source.data());
+  // Generate the reference output one bit at a time, from the top down.
+  int32_t sourceBit = numInMask - 1;
+  for (int32_t targetBit = kNumBits - 1; targetBit >= 0; --targetBit) {
+    if (isBitSet(maskData, targetBit)) {
+      setBit(reference.data(), targetBit, isBitSet(sourceAsChar, sourceBit--));
+    }
+  }
   scatterBits(numInMask, kNumBits, sourceAsChar, maskData, test.data());
-  // Generate the reference output with the non-BMI implementation.
-  FLAGS_bmi2 = false; // NOLINT
-  scatterBits(numInMask, kNumBits, sourceAsChar, maskData, reference.data());
-  FLAGS_bmi2 = true; // NOLINT
   EXPECT_EQ(reference, test);
+  // Repeat with the non-BMI implementation.
+  std::vector<char> simple(kSize * 8);
+  FLAGS_bmi2 = false; // NOLINT
+  scatterBits(numInMask, kNumBits, sourceAsChar, maskData, simple.data());
+  FLAGS_bmi2 = true; // NOLINT
+  EXPECT_EQ(reference, simple);
   // Repeat the same in place.
   scatterBits(numInMask, kNumBits, sourceAsChar, maskData, sourceAsChar);
   for (int32_t i = kNumBits - 1; i >= 0; --i) {
     EXPECT_EQ(
         bits::isBitSet(reference.data(), i), bits::isBitSet(sourceAsChar, i));
+  }
+}
+
+TEST_F(BitUtilTest, extractBits) {
+  // Collects the bits of 'value' selected by 'mask' one bit position at a time.
+  auto reference = [](uint64_t value, uint64_t mask) {
+    uint64_t result = 0;
+    int numExtracted = 0;
+    for (int bit = 0; bit < 64; ++bit) {
+      if ((mask >> bit) & 1) {
+        result |= ((value >> bit) & 1) << numExtracted++;
+      }
+    }
+    return result;
+  };
+
+  constexpr uint64_t kValue = 0x1234'5678'9abc'def0;
+  EXPECT_EQ(bits::extractBits<uint64_t>(kValue, 0), 0);
+  EXPECT_EQ(bits::extractBits<uint64_t>(kValue, ~uint64_t{0}), kValue);
+  EXPECT_EQ(
+      bits::extractBits<uint64_t>(~uint64_t{0}, 0x8000'0000'0000'0001), 3);
+  EXPECT_EQ(bits::extractBits<uint32_t>(~uint32_t{0}, 0x8000'0001), 3);
+  EXPECT_EQ(bits::extractBits<uint64_t>(kValue, 0x8080'8080'8080'8080), 0x0F);
+
+  folly::Random::DefaultGenerator rng;
+  rng.seed(1);
+  for (int i = 0; i < 10'000; ++i) {
+    const uint64_t value = folly::Random::rand64(rng);
+    const uint64_t random = folly::Random::rand64(rng);
+    // Sparse, half-full and dense masks.
+    const uint64_t mask = i % 3 == 0 ? random & folly::Random::rand64(rng)
+        : i % 3 == 1                 ? random
+                                     : random | folly::Random::rand64(rng);
+    ASSERT_EQ(bits::extractBits<uint64_t>(value, mask), reference(value, mask))
+        << std::hex << value << " " << mask;
+    ASSERT_EQ(
+        bits::extractBits<uint32_t>(
+            static_cast<uint32_t>(value), static_cast<uint32_t>(mask)),
+        reference(static_cast<uint32_t>(value), static_cast<uint32_t>(mask)))
+        << std::hex << value << " " << mask;
   }
 }
 

@@ -32,6 +32,15 @@
 #include <x86intrin.h>
 #endif
 
+// SVE2 BEXT and BDEP are the AArch64 counterparts of BMI2 PEXT and PDEP.
+#if defined(__aarch64__) && defined(__ARM_FEATURE_SVE2_BITPERM) && \
+    __has_include(<arm_neon_sve_bridge.h>)
+#include <arm_neon_sve_bridge.h>
+#define VELOX_ARM_BITPERM 1
+#else
+#define VELOX_ARM_BITPERM 0
+#endif
+
 // Remove once we upgrade folly.
 #ifndef FOLLY_BUILTIN_MEMCPY
 #if FOLLY_HAS_BUILTIN(__builtin_memcpy_inline)
@@ -915,18 +924,32 @@ template <>
 inline uint64_t extractBits(uint64_t a, uint64_t mask) {
   return _pext_u64(a, mask);
 }
+#elif VELOX_ARM_BITPERM
+// BEXT works on vector lanes. Every lane holds 'a', and lane 0 is the result.
+template <>
+inline uint32_t extractBits(uint32_t a, uint32_t mask) {
+  return vgetq_lane_u32(svget_neonq_u32(svbext_n_u32(svdup_n_u32(a), mask)), 0);
+}
+template <>
+inline uint64_t extractBits(uint64_t a, uint64_t mask) {
+  return vgetq_lane_u64(svget_neonq_u64(svbext_n_u64(svdup_n_u64(a), mask)), 0);
+}
 #else
 template <typename T>
 T extractBits(T a, T mask) {
-  constexpr int kBitsCount = 8 * sizeof(T);
+  // Copies one run of consecutive set bits of 'mask' per iteration, so the
+  // loop runs once per run instead of once per bit of T.
   T dst = 0;
-  for (int i = 0, k = 0; i < kBitsCount; ++i) {
-    if (mask & 1) {
-      dst |= ((a & 1) << k);
-      ++k;
-    }
-    a >>= 1;
-    mask >>= 1;
+  int numExtracted = 0;
+  while (mask != 0) {
+    const T lowestBit = mask & static_cast<T>(~mask + 1);
+    // Adding the lowest set bit clears the lowest run. The sum is zero when
+    // the run reaches the top bit.
+    const T aboveRun = static_cast<T>(mask + lowestBit);
+    const T run = mask & static_cast<T>(~aboveRun);
+    dst |= ((a & run) >> __builtin_ctzll(mask)) << numExtracted;
+    numExtracted += __builtin_popcountll(run);
+    mask &= aboveRun;
   }
   return dst;
 }

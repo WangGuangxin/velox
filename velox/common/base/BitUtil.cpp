@@ -40,7 +40,19 @@ void scatterBitsSimple(
   }
 }
 
+#if defined(__BMI2__) || VELOX_ARM_BITPERM
+// Scatters the low bits of 'bits' to the set bit positions of 'mask'. BDEP is
+// the AArch64 counterpart of PDEP. It works on vector lanes, so 'bits' goes
+// into every lane and lane 0 holds the result.
+inline uint64_t depositBits(uint64_t bits, uint64_t mask) {
 #ifdef __BMI2__
+  return _pdep_u64(bits, mask);
+#else
+  return vgetq_lane_u64(
+      svget_neonq_u64(svbdep_n_u64(svdup_n_u64(bits), mask)), 0);
+#endif
+}
+
 // Fetches 'numBits' bits of data, from data starting at lastBit -
 // numbits (inclusive) and ending at lastBit (exclusive). 'lastBit' is
 // updated to be the bit offset of the lowest returned bit. Successive
@@ -114,11 +126,13 @@ void scatterBits(
     const char* source,
     const uint64_t* targetMask,
     char* target) {
+#ifdef __BMI2__
   if (!process::hasBmi2()) {
     scatterBitsSimple(numSource, numTarget, source, targetMask, target);
     return;
   }
-#ifdef __BMI2__
+#endif
+#if defined(__BMI2__) || VELOX_ARM_BITPERM
   int32_t highByte = numTarget / 8;
   int32_t highBit = numTarget & 7;
   int lowByte = std::max(0, highByte - 7);
@@ -136,7 +150,7 @@ void scatterBits(
   // Loop from top to bottom of 'targetMask' up to 64 bits at a time,
   // with a partial word at either end. Count the set bits and fetch
   // as many consecutive bits of source data. Scatter the source bits
-  // over the set bits of the target mask with pdep and write the
+  // over the set bits of the target mask with PDEP or BDEP and write the
   // result into 'target'.
   for (;;) {
     auto numBitsToWrite = (highByte - lowByte) * 8 + highBit;
@@ -145,7 +159,7 @@ void scatterBits(
           *(reinterpret_cast<const uint64_t*>(maskAsBytes + lowByte));
       int32_t consume = __builtin_popcountll(mask);
       uint64_t bits = getBitField(source, consume, numSource);
-      *reinterpret_cast<uint64_t*>(target + lowByte) = _pdep_u64(bits, mask);
+      *reinterpret_cast<uint64_t*>(target + lowByte) = depositBits(bits, mask);
     } else {
       auto writeMask = bits::lowMask(numBitsToWrite);
       uint64_t mask =
@@ -154,7 +168,7 @@ void scatterBits(
       int32_t consume = __builtin_popcountll(mask);
       uint64_t bits = getBitField(source, consume, numSource);
       auto targetPtr = reinterpret_cast<uint64_t*>(target + lowByte);
-      uint64_t newBits = _pdep_u64(bits, mask);
+      uint64_t newBits = depositBits(bits, mask);
       *targetPtr = (*targetPtr & ~writeMask) | (newBits & writeMask);
     }
     VELOX_DCHECK_GE(numSource, 0);
@@ -170,7 +184,7 @@ void scatterBits(
       0,
       "scatterBits expects to have numSource bits set in targetMask");
 #else
-  VELOX_UNREACHABLE();
+  scatterBitsSimple(numSource, numTarget, source, targetMask, target);
 #endif
 }
 
