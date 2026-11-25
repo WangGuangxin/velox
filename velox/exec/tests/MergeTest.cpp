@@ -889,6 +889,124 @@ TEST_F(MergeTest, offByOne) {
           std::vector<uint32_t>{0});
 }
 
+TEST_F(MergeTest, timestampUtc) {
+  // 2024-03-10 02:30:00 does not exist and 2024-11-03 01:30:00.123456 is
+  // ambiguous in America/Los_Angeles.
+  const Timestamp earliest{-62'135'596'800, 0};
+  const Timestamp beforeEpoch{-1, 999'999'000};
+  const Timestamp skipped{1'710'037'800, 0};
+  const Timestamp repeated{1'730'597'400, 123'456'000};
+  const Timestamp latest{253'402'300'799, 999'999'000};
+
+  // Three sources, so that merging at most two sources at a time spills.
+  const std::vector<RowVectorPtr> inputs = {
+      makeRowVector(
+          {"id", "ts"},
+          {
+              makeFlatVector<int32_t>({0, 1, 2}),
+              makeNullableFlatVector<Timestamp>(
+                  {repeated, std::nullopt, beforeEpoch}, TIMESTAMP_UTC()),
+          }),
+      makeRowVector(
+          {"id", "ts"},
+          {
+              makeFlatVector<int32_t>({3, 4, 5}),
+              makeFlatVector<Timestamp>(
+                  {latest, skipped, earliest}, TIMESTAMP_UTC()),
+          }),
+      makeRowVector(
+          {"id", "ts"},
+          {
+              makeFlatVector<int32_t>({6, 7}),
+              makeNullableFlatVector<Timestamp>(
+                  {skipped, std::nullopt}, TIMESTAMP_UTC()),
+          }),
+  };
+
+  struct {
+    std::vector<std::string> keys;
+    RowVectorPtr expected;
+  } testSettings[] = {
+      {{"ts ASC NULLS LAST", "id"},
+       makeRowVector(
+           {"id", "ts"},
+           {
+               makeFlatVector<int32_t>({5, 2, 4, 6, 0, 3, 1, 7}),
+               makeNullableFlatVector<Timestamp>(
+                   {earliest,
+                    beforeEpoch,
+                    skipped,
+                    skipped,
+                    repeated,
+                    latest,
+                    std::nullopt,
+                    std::nullopt},
+                   TIMESTAMP_UTC()),
+           })},
+      {{"ts DESC NULLS FIRST", "id"},
+       makeRowVector(
+           {"id", "ts"},
+           {
+               makeFlatVector<int32_t>({1, 7, 3, 0, 4, 6, 2, 5}),
+               makeNullableFlatVector<Timestamp>(
+                   {std::nullopt,
+                    std::nullopt,
+                    latest,
+                    repeated,
+                    skipped,
+                    skipped,
+                    beforeEpoch,
+                    earliest},
+                   TIMESTAMP_UTC()),
+           })},
+  };
+
+  for (const auto& testData : testSettings) {
+    SCOPED_TRACE(folly::join(", ", testData.keys));
+    PlanBuilder builder;
+    std::vector<core::PlanNodePtr> sources;
+    for (const auto& input : inputs) {
+      sources.push_back(builder.newPlan()
+                            .values({input})
+                            .orderBy(testData.keys, true)
+                            .planNode());
+    }
+    core::PlanNodeId mergeNodeId;
+    const auto plan = builder.localMerge(testData.keys, std::move(sources))
+                          .capturePlanNodeId(mergeNodeId)
+                          .planNode();
+    for (const auto* timeZone : {"UTC", "America/Los_Angeles"}) {
+      for (const bool spill : {false, true}) {
+        SCOPED_TRACE(fmt::format("{}, spill {}", timeZone, spill));
+        const auto spillDirectory = TempDirectoryPath::create();
+        TaskPtr task;
+        const auto actual =
+            AssertQueryBuilder(plan)
+                .queryCtx(createQueryCtx({
+                    {core::QueryConfig::kSessionTimezone, timeZone},
+                    {core::QueryConfig::kAdjustTimestampToTimezone, "true"},
+                    {core::QueryConfig::kSpillEnabled,
+                     folly::to<std::string>(spill)},
+                    {core::QueryConfig::kLocalMergeSpillEnabled,
+                     folly::to<std::string>(spill)},
+                    {core::QueryConfig::kLocalMergeMaxNumMergeSources, "2"},
+                }))
+                .spillDirectory(spillDirectory->getPath())
+                .copyResults(pool(), task);
+        facebook::velox::test::assertEqualVectors(testData.expected, actual);
+
+        const auto mergeStats =
+            PlanNodeStats::extract(task->taskStats(), mergeNodeId);
+        if (spill) {
+          ASSERT_GT(mergeStats.spilledRows, 0);
+        } else {
+          ASSERT_EQ(mergeStats.spilledRows, 0);
+        }
+      }
+    }
+  }
+}
+
 TEST_F(MergeTest, localMergeOutputSizeWithoutSpill) {
   struct TestParam {
     int numSources;
