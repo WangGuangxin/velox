@@ -554,6 +554,122 @@ TEST_F(NestedLoopJoinTest, allTypes) {
   runSingleAndMultiDriverTest(probeVectors, buildVectors);
 }
 
+TEST_F(NestedLoopJoinTest, timestampUtc) {
+  // 2024-03-10 02:30:00 does not exist in America/Los_Angeles.
+  const Timestamp earliest{-62'135'596'800, 0};
+  const Timestamp beforeEpoch{-1, 999'999'000};
+  const Timestamp skipped{1'710'037'800, 0};
+  const Timestamp latest{253'402'300'799, 999'999'000};
+
+  const auto probe = makeRowVector(
+      {"t_id", "t_ts"},
+      {
+          makeFlatVector<int32_t>({0, 1, 2}),
+          makeNullableFlatVector<Timestamp>(
+              {beforeEpoch, skipped, std::nullopt}, TIMESTAMP_UTC()),
+      });
+  const auto build = makeRowVector(
+      {"u_id", "u_ts"},
+      {
+          makeFlatVector<int32_t>({10, 11, 12}),
+          makeFlatVector<Timestamp>(
+              {earliest, skipped, latest}, TIMESTAMP_UTC()),
+      });
+
+  const std::vector<std::string> allColumns{"t_id", "t_ts", "u_id", "u_ts"};
+  const auto makeJoinResult =
+      [&](const std::vector<std::optional<int32_t>>& probeIds,
+          const std::vector<std::optional<Timestamp>>& probeTimestamps,
+          const std::vector<std::optional<int32_t>>& buildIds,
+          const std::vector<std::optional<Timestamp>>& buildTimestamps) {
+        return makeRowVector(
+            allColumns,
+            {
+                makeNullableFlatVector<int32_t>(probeIds),
+                makeNullableFlatVector<Timestamp>(
+                    probeTimestamps, TIMESTAMP_UTC()),
+                makeNullableFlatVector<int32_t>(buildIds),
+                makeNullableFlatVector<Timestamp>(
+                    buildTimestamps, TIMESTAMP_UTC()),
+            });
+      };
+
+  // Pairs that satisfy 't_ts < u_ts'.
+  const auto innerResult = makeJoinResult(
+      {0, 0, 1},
+      {beforeEpoch, beforeEpoch, skipped},
+      {11, 12, 12},
+      {skipped, latest, latest});
+
+  struct {
+    core::JoinType joinType;
+    std::vector<std::string> outputLayout;
+    RowVectorPtr expected;
+  } testSettings[] = {
+      {core::JoinType::kInner, allColumns, innerResult},
+      {core::JoinType::kLeft,
+       allColumns,
+       makeJoinResult(
+           {0, 0, 1, 2},
+           {beforeEpoch, beforeEpoch, skipped, std::nullopt},
+           {11, 12, 12, std::nullopt},
+           {skipped, latest, latest, std::nullopt})},
+      {core::JoinType::kRight,
+       allColumns,
+       makeJoinResult(
+           {0, 0, 1, std::nullopt},
+           {beforeEpoch, beforeEpoch, skipped, std::nullopt},
+           {11, 12, 12, 10},
+           {skipped, latest, latest, earliest})},
+      {core::JoinType::kFull,
+       allColumns,
+       makeJoinResult(
+           {0, 0, 1, 2, std::nullopt},
+           {beforeEpoch, beforeEpoch, skipped, std::nullopt, std::nullopt},
+           {11, 12, 12, std::nullopt, 10},
+           {skipped, latest, latest, std::nullopt, earliest})},
+      {core::JoinType::kLeftSemiFilter,
+       {"t_id", "t_ts"},
+       makeRowVector(
+           {"t_id", "t_ts"},
+           {
+               makeFlatVector<int32_t>({0, 1}),
+               makeFlatVector<Timestamp>(
+                   {beforeEpoch, skipped}, TIMESTAMP_UTC()),
+           })},
+      {core::JoinType::kAnti,
+       {"t_id", "t_ts"},
+       makeRowVector(
+           {"t_id", "t_ts"},
+           {
+               makeFlatVector<int32_t>({2}),
+               makeNullableFlatVector<Timestamp>(
+                   {std::nullopt}, TIMESTAMP_UTC()),
+           })},
+  };
+
+  for (const auto& testData : testSettings) {
+    SCOPED_TRACE(core::JoinTypeName::toName(testData.joinType));
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    const auto plan =
+        PlanBuilder(planNodeIdGenerator)
+            .values({probe})
+            .nestedLoopJoin(
+                PlanBuilder(planNodeIdGenerator).values({build}).planNode(),
+                "t_ts < u_ts",
+                testData.outputLayout,
+                testData.joinType)
+            .planNode();
+    for (const auto* timeZone : {"UTC", "America/Los_Angeles"}) {
+      SCOPED_TRACE(timeZone);
+      AssertQueryBuilder(plan)
+          .config(core::QueryConfig::kSessionTimezone, timeZone)
+          .config(core::QueryConfig::kAdjustTimestampToTimezone, true)
+          .assertResults(testData.expected);
+    }
+  }
+}
+
 TEST_F(NestedLoopJoinTest, outputOrderWithSingleBuildVector) {
   auto probeVector = makeOutputOrderProbeVector();
   auto buildVectors = makeOutputOrderMultiVectorBuild();

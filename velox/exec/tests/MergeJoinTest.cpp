@@ -1313,6 +1313,145 @@ TEST_F(MergeJoinTest, nullKeys) {
       .assertResults("SELECT * FROM t LEFT JOIN u ON t.t0 = u.u0");
 }
 
+TEST_F(MergeJoinTest, timestampUtc) {
+  // 2024-03-10 02:30:00 does not exist and 2024-11-03 01:30:00.123456 is
+  // ambiguous in America/Los_Angeles.
+  const Timestamp earliest{-62'135'596'800, 0};
+  const Timestamp beforeEpoch{-1, 999'999'000};
+  const Timestamp skipped{1'710'037'800, 0};
+  const Timestamp repeated{1'730'597'400, 123'456'000};
+  const Timestamp latest{253'402'300'799, 999'999'000};
+
+  // Both sides are sorted on the join key. The rows with key 'skipped' span
+  // the two left batches.
+  const auto left = makeRowVector(
+      {"t_id", "t_ts"},
+      {
+          makeFlatVector<int32_t>({0, 1, 2, 3, 4, 5}),
+          makeNullableFlatVector<Timestamp>(
+              {earliest, beforeEpoch, skipped, skipped, latest, std::nullopt},
+              TIMESTAMP_UTC()),
+      });
+  const auto right = makeRowVector(
+      {"u_id", "u_ts"},
+      {
+          makeFlatVector<int32_t>({10, 11, 12, 13}),
+          makeNullableFlatVector<Timestamp>(
+              {beforeEpoch, skipped, repeated, std::nullopt}, TIMESTAMP_UTC()),
+      });
+
+  const std::vector<std::string> allColumns{"t_id", "t_ts", "u_id", "u_ts"};
+  const auto makeJoinResult =
+      [&](const std::vector<std::optional<int32_t>>& leftIds,
+          const std::vector<std::optional<Timestamp>>& leftTimestamps,
+          const std::vector<std::optional<int32_t>>& rightIds,
+          const std::vector<std::optional<Timestamp>>& rightTimestamps) {
+        return makeRowVector(
+            allColumns,
+            {
+                makeNullableFlatVector<int32_t>(leftIds),
+                makeNullableFlatVector<Timestamp>(
+                    leftTimestamps, TIMESTAMP_UTC()),
+                makeNullableFlatVector<int32_t>(rightIds),
+                makeNullableFlatVector<Timestamp>(
+                    rightTimestamps, TIMESTAMP_UTC()),
+            });
+      };
+
+  struct {
+    core::JoinType joinType;
+    std::vector<std::string> outputLayout;
+    RowVectorPtr expected;
+  } testSettings[] = {
+      {core::JoinType::kInner,
+       allColumns,
+       makeJoinResult(
+           {1, 2, 3},
+           {beforeEpoch, skipped, skipped},
+           {10, 11, 11},
+           {beforeEpoch, skipped, skipped})},
+      {core::JoinType::kLeft,
+       allColumns,
+       makeJoinResult(
+           {0, 1, 2, 3, 4, 5},
+           {earliest, beforeEpoch, skipped, skipped, latest, std::nullopt},
+           {std::nullopt, 10, 11, 11, std::nullopt, std::nullopt},
+           {std::nullopt,
+            beforeEpoch,
+            skipped,
+            skipped,
+            std::nullopt,
+            std::nullopt})},
+      {core::JoinType::kRight,
+       allColumns,
+       makeJoinResult(
+           {1, 2, 3, std::nullopt, std::nullopt},
+           {beforeEpoch, skipped, skipped, std::nullopt, std::nullopt},
+           {10, 11, 11, 12, 13},
+           {beforeEpoch, skipped, skipped, repeated, std::nullopt})},
+      {core::JoinType::kFull,
+       allColumns,
+       makeJoinResult(
+           {0, 1, 2, 3, 4, 5, std::nullopt, std::nullopt},
+           {earliest,
+            beforeEpoch,
+            skipped,
+            skipped,
+            latest,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt},
+           {std::nullopt, 10, 11, 11, std::nullopt, std::nullopt, 12, 13},
+           {std::nullopt,
+            beforeEpoch,
+            skipped,
+            skipped,
+            std::nullopt,
+            std::nullopt,
+            repeated,
+            std::nullopt})},
+      {core::JoinType::kLeftSemiFilter,
+       {"t_id", "t_ts"},
+       makeRowVector(
+           {"t_id", "t_ts"},
+           {
+               makeFlatVector<int32_t>({1, 2, 3}),
+               makeFlatVector<Timestamp>(
+                   {beforeEpoch, skipped, skipped}, TIMESTAMP_UTC()),
+           })},
+      {core::JoinType::kAnti,
+       {"t_id", "t_ts"},
+       makeRowVector(
+           {"t_id", "t_ts"},
+           {
+               makeFlatVector<int32_t>({0, 4, 5}),
+               makeNullableFlatVector<Timestamp>(
+                   {earliest, latest, std::nullopt}, TIMESTAMP_UTC()),
+           })},
+  };
+
+  for (const auto& testData : testSettings) {
+    SCOPED_TRACE(core::JoinTypeName::toName(testData.joinType));
+    PlanBuilder builder;
+    const auto plan = builder.values(split(left))
+                          .mergeJoin(
+                              {"t_ts"},
+                              {"u_ts"},
+                              builder.newPlan().values({right}).planNode(),
+                              "",
+                              testData.outputLayout,
+                              testData.joinType)
+                          .planNode();
+    for (const auto* timeZone : {"UTC", "America/Los_Angeles"}) {
+      SCOPED_TRACE(timeZone);
+      AssertQueryBuilder(plan)
+          .config(core::QueryConfig::kSessionTimezone, timeZone)
+          .config(core::QueryConfig::kAdjustTimestampToTimezone, true)
+          .assertResults(testData.expected);
+    }
+  }
+}
+
 TEST_F(MergeJoinTest, antiJoinWithFilter) {
   auto left = makeNamedRowVector(
       "t0",
