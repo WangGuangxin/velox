@@ -414,6 +414,110 @@ TEST_F(OrderByTest, unknown) {
       {0});
 }
 
+TEST_F(OrderByTest, timestampUtc) {
+  // 2024-03-10 02:30:00 does not exist and 2024-11-03 01:30:00.123456 is
+  // ambiguous in America/Los_Angeles.
+  const Timestamp earliest{-62'135'596'800, 0};
+  const Timestamp beforeEpoch{-1, 999'999'000};
+  const Timestamp skipped{1'710'037'800, 0};
+  const Timestamp repeated{1'730'597'400, 123'456'000};
+  const Timestamp latest{253'402'300'799, 999'999'000};
+
+  const auto data = makeRowVector(
+      {"id", "ts"},
+      {
+          makeFlatVector<int32_t>({0, 1, 2, 3, 4, 5, 6}),
+          makeNullableFlatVector<Timestamp>(
+              {repeated,
+               std::nullopt,
+               beforeEpoch,
+               latest,
+               skipped,
+               earliest,
+               skipped},
+              TIMESTAMP_UTC()),
+      });
+
+  struct {
+    std::vector<std::string> keys;
+    RowVectorPtr expected;
+  } testSettings[] = {
+      {{"ts ASC NULLS LAST", "id"},
+       makeRowVector(
+           {"id", "ts"},
+           {
+               makeFlatVector<int32_t>({5, 2, 4, 6, 0, 3, 1}),
+               makeNullableFlatVector<Timestamp>(
+                   {earliest,
+                    beforeEpoch,
+                    skipped,
+                    skipped,
+                    repeated,
+                    latest,
+                    std::nullopt},
+                   TIMESTAMP_UTC()),
+           })},
+      {{"ts DESC NULLS FIRST", "id"},
+       makeRowVector(
+           {"id", "ts"},
+           {
+               makeFlatVector<int32_t>({1, 3, 0, 4, 6, 2, 5}),
+               makeNullableFlatVector<Timestamp>(
+                   {std::nullopt,
+                    latest,
+                    repeated,
+                    skipped,
+                    skipped,
+                    beforeEpoch,
+                    earliest},
+                   TIMESTAMP_UTC()),
+           })},
+  };
+
+  for (const auto& testData : testSettings) {
+    SCOPED_TRACE(folly::join(", ", testData.keys));
+    core::PlanNodeId orderById;
+    const auto plan = PlanBuilder()
+                          .values({data})
+                          .orderBy(testData.keys, false)
+                          .capturePlanNodeId(orderById)
+                          .planNode();
+    for (const auto* timeZone : {"UTC", "America/Los_Angeles"}) {
+      SCOPED_TRACE(timeZone);
+      for (const auto* prefixSortMaxBytes : {"0", "1024"}) {
+        SCOPED_TRACE(fmt::format("prefixSortMaxBytes {}", prefixSortMaxBytes));
+        for (bool spill : {false, true}) {
+          SCOPED_TRACE(fmt::format("spill {}", spill));
+          auto spillDirectory = TempDirectoryPath::create();
+          TestScopedSpillInjection scopedSpillInjection(spill ? 100 : 0);
+          std::shared_ptr<Task> task;
+          const auto actual =
+              AssertQueryBuilder(plan)
+                  .config(core::QueryConfig::kSessionTimezone, timeZone)
+                  .config(core::QueryConfig::kAdjustTimestampToTimezone, true)
+                  .config(
+                      core::QueryConfig::kPrefixSortNormalizedKeyMaxBytes,
+                      prefixSortMaxBytes)
+                  .config(core::QueryConfig::kSpillEnabled, spill)
+                  .config(core::QueryConfig::kOrderBySpillEnabled, spill)
+                  .config(core::QueryConfig::kSpillPrefixSortEnabled, true)
+                  .spillDirectory(spillDirectory->getPath())
+                  .copyResults(pool(), task);
+          velox::test::assertEqualVectors(testData.expected, actual);
+
+          const auto planStats =
+              exec::PlanNodeStats::extract(task->taskStats(), orderById);
+          if (spill) {
+            ASSERT_GT(planStats.spilledRows, 0);
+          } else {
+            ASSERT_EQ(planStats.spilledRows, 0);
+          }
+        }
+      }
+    }
+  }
+}
+
 /// Verifies output batch rows of OrderBy
 TEST_F(OrderByTest, outputBatchRows) {
   struct {
