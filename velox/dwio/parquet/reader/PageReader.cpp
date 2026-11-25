@@ -334,6 +334,72 @@ void PageReader::updateRowInfoAfterPageSkipped() {
   }
 }
 
+void PageReader::ZstdContextDeleter::operator()(ZSTD_DCtx_s* context) const {
+  ZSTD_freeDCtx(context);
+}
+
+namespace {
+
+// Decompresses a ZSTD page on demand, so a reader that needs only its leading
+// bytes leaves the rest compressed. ZSTD decodes whole blocks of up to 128KB,
+// so the block holding the last requested byte is decoded in full.
+class ZstdPrefixDecompressor {
+ public:
+  // Decompresses 'compressedSize' bytes at 'compressed' into 'destination',
+  // which holds 'capacity' bytes. Restarts 'context' at a new frame.
+  ZstdPrefixDecompressor(
+      ZSTD_DCtx* context,
+      const char* compressed,
+      uint32_t compressedSize,
+      char* destination,
+      uint32_t capacity)
+      : context_(context),
+        input_{compressed, compressedSize, 0},
+        output_{destination, 0, 0},
+        capacity_(capacity) {
+    const auto result = ZSTD_DCtx_reset(context_, ZSTD_reset_session_only);
+    VELOX_CHECK(
+        !ZSTD_isError(result),
+        "ZSTD context reset failed: {}",
+        ZSTD_getErrorName(result));
+  }
+
+  // Decompresses until the first 'numBytes' bytes are in 'destination'.
+  void decompressTo(uint64_t numBytes) {
+    VELOX_CHECK_LE(numBytes, capacity_);
+    if (numBytes <= output_.pos) {
+      return;
+    }
+    // Capping the output at 'numBytes' makes ZSTD stop after the block that
+    // holds them.
+    output_.size = numBytes;
+    while (output_.pos < numBytes) {
+      const auto inputPos = input_.pos;
+      const auto outputPos = output_.pos;
+      const auto result = ZSTD_decompressStream(context_, &output_, &input_);
+      VELOX_CHECK(
+          !ZSTD_isError(result),
+          "ZSTD decompression failed: {}",
+          ZSTD_getErrorName(result));
+      // A call that neither consumes input nor produces output means the
+      // compressed data ended early.
+      VELOX_CHECK(
+          input_.pos != inputPos || output_.pos != outputPos,
+          "ZSTD data page is truncated (corrupt data page?): decompressed {} of {} bytes",
+          output_.pos,
+          numBytes);
+    }
+  }
+
+ private:
+  ZSTD_DCtx* const context_;
+  ZSTD_inBuffer input_;
+  ZSTD_outBuffer output_;
+  const uint64_t capacity_;
+};
+
+} // namespace
+
 void PageReader::prepareDataPageV1(const PageHeader& pageHeader, int64_t row) {
   VELOX_CHECK(
       *pageHeader.type() == thrift::PageType::DATA_PAGE &&
@@ -355,7 +421,26 @@ void PageReader::prepareDataPageV1(const PageHeader& pageHeader, int64_t row) {
     return;
   }
   pageData_ = readBytes(static_cast<int32_t>(compressedPageSize), pageBuffer_);
-  if (codec_ != common::CompressionKind::CompressionKind_NONE) {
+  // A V1 page compresses levels and values together. When only the levels are
+  // wanted, decompress no further than them: the values are decompressed when
+  // they are read, so decompressing them here too would be wasted.
+  std::optional<ZstdPrefixDecompressor> levelDecompressor;
+  if (row == kRepDefOnly &&
+      codec_ == common::CompressionKind::CompressionKind_ZSTD) {
+    if (!repDefZstdContext_) {
+      repDefZstdContext_.reset(ZSTD_createDCtx());
+      VELOX_CHECK_NOT_NULL(repDefZstdContext_);
+    }
+    dwio::common::ensureCapacity<char>(
+        decompressedData_, uncompressedPageSize, &pool_);
+    levelDecompressor.emplace(
+        repDefZstdContext_.get(),
+        pageData_,
+        compressedPageSize,
+        decompressedData_->asMutable<char>(),
+        uncompressedPageSize);
+    pageData_ = decompressedData_->as<char>();
+  } else if (codec_ != common::CompressionKind::CompressionKind_NONE) {
     pageData_ =
         decompressData(pageData_, compressedPageSize, uncompressedPageSize);
   } else {
@@ -372,11 +457,20 @@ void PageReader::prepareDataPageV1(const PageHeader& pageHeader, int64_t row) {
   }
   auto pageEnd = pageData_ + uncompressedPageSize;
   auto remainingBytes = uncompressedPageSize;
+  // Makes the next 'numBytes' at 'pageData_' readable.
+  auto decompressNext = [&](uint32_t numBytes) {
+    if (levelDecompressor) {
+      levelDecompressor->decompressTo(
+          static_cast<uint64_t>(uncompressedPageSize - remainingBytes) +
+          numBytes);
+    }
+  };
   if (maxRepeat_ > 0) {
     VELOX_CHECK_GE(
         remainingBytes,
         sizeof(int32_t),
         "Insufficient bytes for repetition level length (corrupt data page?)");
+    decompressNext(sizeof(int32_t));
     uint32_t repeatLength = readField<int32_t>(pageData_);
     remainingBytes -= sizeof(int32_t);
     VELOX_CHECK_LE(
@@ -385,6 +479,7 @@ void PageReader::prepareDataPageV1(const PageHeader& pageHeader, int64_t row) {
         "Repetition level length {} exceeds remaining page size {} (corrupt data page?)",
         repeatLength,
         remainingBytes);
+    decompressNext(repeatLength);
     repeatDecoder_ = std::make_unique<RleDecoder>(
         reinterpret_cast<const uint8_t*>(pageData_),
         repeatLength,
@@ -399,6 +494,7 @@ void PageReader::prepareDataPageV1(const PageHeader& pageHeader, int64_t row) {
         remainingBytes,
         sizeof(uint32_t),
         "Insufficient bytes for definition level length (corrupt data page?)");
+    decompressNext(sizeof(uint32_t));
     auto defineLength = readField<uint32_t>(pageData_);
     remainingBytes -= sizeof(uint32_t);
     VELOX_CHECK_LE(
@@ -407,6 +503,7 @@ void PageReader::prepareDataPageV1(const PageHeader& pageHeader, int64_t row) {
         "Definition level length {} exceeds remaining page size {} (corrupt data page?)",
         defineLength,
         remainingBytes);
+    decompressNext(defineLength);
     if (maxDefine_ == 1) {
       defineDecoder_ = std::make_unique<RleBpDecoder>(
           pageData_, pageData_ + defineLength, levelBitWidth(maxDefine_));
@@ -789,6 +886,8 @@ void PageReader::preloadRepDefs() {
     leafNullsSize_ += numLeaves;
     numLeavesInPage_.push_back(numLeaves);
   }
+
+  repDefZstdContext_.reset();
 
   // Reset the input to start of column chunk.
   std::vector<uint64_t> rewind = {0};

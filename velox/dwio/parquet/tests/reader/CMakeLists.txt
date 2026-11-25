@@ -22,6 +22,7 @@ target_link_libraries(
   velox_dwio_parquet_page_reader_test
   velox_dwio_native_parquet_reader
   velox_link_libs
+  zstd::zstd
   ${TEST_LINK_LIBS}
 )
 

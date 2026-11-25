@@ -689,18 +689,30 @@ TEST_F(E2EFilterTest, filterStruct) {
 }
 
 TEST_F(E2EFilterTest, list) {
-  // Break up the leaf data in small pages to cover coalescing repdefs.
+  // Break up the leaf data in small pages to cover coalescing repdefs. The
+  // reader preloads the repdefs of all pages before it decodes their values,
+  // which takes a separate path for each codec.
   options_.dataPageSize = 4 * 1024;
 
   batchCount_ = 2;
   batchSize_ = 12000;
-  testWithTypes(
-      "long_val:bigint, array_val:array<int>,"
-      "struct_array: struct<a: array<struct<k:int, v:int, va: array<smallint>>>>",
-      nullptr,
-      false,
-      {"long_val", "array_val"},
-      10);
+  for (const auto compression :
+       {common::CompressionKind_NONE,
+        common::CompressionKind_ZSTD,
+        common::CompressionKind_SNAPPY}) {
+    if (!facebook::velox::parquet::Writer::isCodecAvailable(compression)) {
+      continue;
+    }
+    SCOPED_TRACE(fmt::format("compression: {}", compression));
+    commonOptions_.compressionKind = compression;
+    testWithTypes(
+        "long_val:bigint, array_val:array<int>,"
+        "struct_array: struct<a: array<struct<k:int, v:int, va: array<smallint>>>>",
+        nullptr,
+        false,
+        {"long_val", "array_val"},
+        10);
+  }
 }
 
 TEST_F(E2EFilterTest, metadataFilter) {
