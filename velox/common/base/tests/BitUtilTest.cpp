@@ -741,6 +741,46 @@ TEST_F(BitUtilTest, scatterBits) {
   }
 }
 
+TEST_F(BitUtilTest, extractBits) {
+  // Collects the bits of 'value' selected by 'mask' one bit position at a time.
+  auto reference = [](uint64_t value, uint64_t mask) {
+    uint64_t result = 0;
+    int numExtracted = 0;
+    for (int bit = 0; bit < 64; ++bit) {
+      if ((mask >> bit) & 1) {
+        result |= ((value >> bit) & 1) << numExtracted++;
+      }
+    }
+    return result;
+  };
+
+  constexpr uint64_t kValue = 0x1234'5678'9abc'def0;
+  EXPECT_EQ(bits::extractBits<uint64_t>(kValue, 0), 0);
+  EXPECT_EQ(bits::extractBits<uint64_t>(kValue, ~uint64_t{0}), kValue);
+  EXPECT_EQ(
+      bits::extractBits<uint64_t>(~uint64_t{0}, 0x8000'0000'0000'0001), 3);
+  EXPECT_EQ(bits::extractBits<uint32_t>(~uint32_t{0}, 0x8000'0001), 3);
+  EXPECT_EQ(bits::extractBits<uint64_t>(kValue, 0x8080'8080'8080'8080), 0x0F);
+
+  folly::Random::DefaultGenerator rng;
+  rng.seed(1);
+  for (int i = 0; i < 10'000; ++i) {
+    const uint64_t value = folly::Random::rand64(rng);
+    const uint64_t random = folly::Random::rand64(rng);
+    // Sparse, half-full and dense masks.
+    const uint64_t mask = i % 3 == 0 ? random & folly::Random::rand64(rng)
+        : i % 3 == 1                 ? random
+                                     : random | folly::Random::rand64(rng);
+    ASSERT_EQ(bits::extractBits<uint64_t>(value, mask), reference(value, mask))
+        << std::hex << value << " " << mask;
+    ASSERT_EQ(
+        bits::extractBits<uint32_t>(
+            static_cast<uint32_t>(value), static_cast<uint32_t>(mask)),
+        reference(static_cast<uint32_t>(value), static_cast<uint32_t>(mask)))
+        << std::hex << value << " " << mask;
+  }
+}
+
 TEST_F(BitUtilTest, hashMix) {
   EXPECT_NE(bits::hashMix(123, 321), bits::hashMix(321, 123));
   EXPECT_EQ(
