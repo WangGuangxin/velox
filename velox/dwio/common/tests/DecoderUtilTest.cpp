@@ -26,6 +26,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstring>
 #include <functional>
 
 using namespace facebook::velox;
@@ -540,6 +541,39 @@ FilterRunResult runFilterRun(
   result.values.assign(
       values.begin() + startNumValues, values.begin() + returnedNumValues);
   return result;
+}
+
+// Dictionary indices stored in 16-bit columns are sign-extended. Indices
+// stored in 8-byte columns are the low 32 bits of each value.
+TEST(LoadIndicesTest, convertsToInt32) {
+  std::vector<int16_t> shorts(kSimdWidth);
+  std::vector<int64_t> longs(kSimdWidth);
+  std::vector<double> doubles(kSimdWidth);
+  std::vector<int32_t> expectedShorts(kSimdWidth);
+  std::vector<int32_t> expectedLongs(kSimdWidth);
+  std::vector<int32_t> expectedDoubles(kSimdWidth);
+  for (int32_t i = 0; i < kSimdWidth; ++i) {
+    shorts[i] = static_cast<int16_t>(i % 2 == 0 ? -1'000 * i - 1 : 1'000 * i);
+    expectedShorts[i] = shorts[i];
+    longs[i] = (int64_t{i + 1} << 32) | (i % 2 == 0 ? 0xFFFF'FFF0 - i : i);
+    expectedLongs[i] = static_cast<int32_t>(longs[i]);
+    doubles[i] = 0.1 * (i + 1);
+    uint64_t doubleBits;
+    std::memcpy(&doubleBits, &doubles[i], sizeof(doubleBits));
+    expectedDoubles[i] = static_cast<int32_t>(doubleBits);
+  }
+
+  auto toVector = [](xsimd::batch<int32_t> indices) {
+    std::vector<int32_t> result(kSimdWidth);
+    indices.store_unaligned(result.data());
+    return result;
+  };
+  EXPECT_THAT(
+      toVector(loadIndices(shorts.data())), ElementsAreArray(expectedShorts));
+  EXPECT_THAT(
+      toVector(loadIndices(longs.data())), ElementsAreArray(expectedLongs));
+  EXPECT_THAT(
+      toVector(loadIndices(doubles.data())), ElementsAreArray(expectedDoubles));
 }
 
 // Every entry passes on a cold cache: all rows/indices flow through and each
