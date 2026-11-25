@@ -245,6 +245,71 @@ TEST_P(LocalPartitionTestParametrized, partition) {
   verifyExchangeSourceOperatorStats(task, 300, 6, 2);
 }
 
+TEST_P(LocalPartitionTestParametrized, timestampUtc) {
+  // 2024-03-10 02:30:00 does not exist and 2024-11-03 01:30:00.123456 is
+  // ambiguous in America/Los_Angeles.
+  const Timestamp earliest{-62'135'596'800, 0};
+  const Timestamp beforeEpoch{-1, 999'999'000};
+  const Timestamp skipped{1'710'037'800, 0};
+  const Timestamp repeated{1'730'597'400, 123'456'000};
+  const Timestamp latest{253'402'300'799, 999'999'000};
+
+  const auto data = makeRowVector(
+      {"id", "ts"},
+      {
+          makeFlatVector<int32_t>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}),
+          makeNullableFlatVector<Timestamp>(
+              {repeated,
+               std::nullopt,
+               beforeEpoch,
+               skipped,
+               latest,
+               skipped,
+               earliest,
+               repeated,
+               std::nullopt,
+               skipped},
+              TIMESTAMP_UTC()),
+      });
+
+  // Rows with the same ts go to the same partition, so the partial
+  // aggregation after the exchange returns one row per ts.
+  const auto expectedCounts = makeRowVector({
+      makeNullableFlatVector<Timestamp>(
+          {earliest, beforeEpoch, skipped, repeated, latest, std::nullopt},
+          TIMESTAMP_UTC()),
+      makeFlatVector<int64_t>({1, 1, 3, 2, 1, 2}),
+  });
+
+  struct {
+    std::vector<std::string> keys;
+    std::vector<std::string> aggregates;
+    RowVectorPtr expected;
+  } testSettings[] = {
+      {{}, {}, data},
+      {{"ts"}, {"count(1)"}, expectedCounts},
+  };
+
+  for (const auto& testData : testSettings) {
+    SCOPED_TRACE(folly::join(", ", testData.keys));
+    PlanBuilder builder;
+    builder.values(split(data)).localPartition(testData.keys);
+    if (!testData.aggregates.empty()) {
+      builder.partialAggregation(testData.keys, testData.aggregates);
+    }
+    const auto plan = builder.planNode();
+    for (const auto* timeZone : {"UTC", "America/Los_Angeles"}) {
+      SCOPED_TRACE(timeZone);
+      AssertQueryBuilder queryBuilder(plan);
+      applyTestParameters(queryBuilder);
+      queryBuilder.maxDrivers(4)
+          .config(core::QueryConfig::kSessionTimezone, timeZone)
+          .config(core::QueryConfig::kAdjustTimestampToTimezone, true)
+          .assertResults(testData.expected);
+    }
+  }
+}
+
 TEST_F(LocalPartitionTest, planNodeStats) {
   // A LocalPartition node is implemented by two operators sharing its plan node
   // id: the LocalPartition producer and the LocalExchange consumer.
