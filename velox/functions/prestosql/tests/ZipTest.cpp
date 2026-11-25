@@ -276,6 +276,81 @@ TEST_F(ZipTest, dictionaryArrays) {
   assertEqualVectors(expected, result);
 }
 
+/// Test zipping arrays that share offsets and sizes buffers, as field
+/// projections of one array of structs do.
+TEST_F(ZipTest, sharedLayout) {
+  auto ints = makeFlatVector<int32_t>({0, 1, 2, 3, 4});
+  auto strings = makeFlatVector<std::string>({"a", "b", "c", "d", "e"});
+  // Row 1 is null and row 2 is empty.
+  auto structs =
+      makeArrayVector({0, 3, 3, 3}, makeRowVector({ints, strings}), {1});
+  auto makeField = [&](const VectorPtr& elements) {
+    return std::make_shared<ArrayVector>(
+        pool_.get(),
+        ARRAY(elements->type()),
+        structs->nulls(),
+        structs->size(),
+        structs->offsets(),
+        structs->sizes(),
+        elements);
+  };
+  auto firstVector = makeField(ints);
+  auto secondVector = makeField(strings);
+
+  auto expected =
+      makeArrayVector({0, 3, 3, 3}, makeRowVector({ints, strings}), {1});
+  auto result = evaluate<ArrayVector>(
+      "zip(c0, c1)", makeRowVector({firstVector, secondVector}));
+  assertEqualVectors(expected, result);
+  // The result reuses the input elements.
+  auto* resultElements = result->elements()->as<RowVector>();
+  EXPECT_EQ(resultElements->childAt(0), ints);
+  EXPECT_EQ(resultElements->childAt(1), strings);
+
+  // Projections of a dictionary encoded array share its wrapping too.
+  auto indices = makeIndices({3, 0, 0, 2});
+  assertEqualVectors(
+      wrapInDictionary(indices, 4, expected),
+      evaluate(
+          "zip(c0, c1)",
+          makeRowVector({
+              wrapInDictionary(indices, 4, firstVector),
+              wrapInDictionary(indices, 4, secondVector),
+          })));
+}
+
+/// Test zipping dictionary encoded arrays that have the same offset and size in
+/// every row without sharing their buffers.
+TEST_F(ZipTest, dictionaryArraysWithSameLayout) {
+  auto firstElements = makeFlatVector<int32_t>({0, 1, 2, 3, 4, 5, 6, 7, 8});
+  auto firstVector = wrapInDictionary(
+      makeIndices({2, 0, 1}), 3, makeArrayVector({0, 3, 6}, firstElements));
+
+  auto secondElements =
+      makeFlatVector<int32_t>({10, 11, 12, 13, 14, 15, 16, 17, 18});
+  auto secondVector = wrapInDictionary(
+      makeIndices({2, 0, 1}), 3, makeArrayVector({0, 3, 6}, secondElements));
+
+  auto result = evaluate<ArrayVector>(
+      "zip(c0, c1)",
+      makeRowVector({
+          firstVector,
+          secondVector,
+      }));
+
+  auto expected = makeArrayVector(
+      {0, 3, 6},
+      makeRowVector({
+          makeFlatVector<int32_t>({6, 7, 8, 0, 1, 2, 3, 4, 5}),
+          makeFlatVector<int32_t>({16, 17, 18, 10, 11, 12, 13, 14, 15}),
+      }));
+  assertEqualVectors(expected, result);
+  // The result reuses the input elements.
+  auto* resultElements = result->elements()->as<RowVector>();
+  EXPECT_EQ(resultElements->childAt(0), firstElements);
+  EXPECT_EQ(resultElements->childAt(1), secondElements);
+}
+
 /// Test if we can zip two flat vectors of arrays with rows starting at
 /// different offsets
 TEST_F(ZipTest, flatArraysWithDifferentOffsets) {
