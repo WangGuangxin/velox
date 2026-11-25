@@ -143,6 +143,96 @@ TEST_F(RowNumberTest, noPartitionKeys) {
   testLimit(50);
 }
 
+TEST_F(RowNumberTest, timestampUtc) {
+  // 2024-03-10 02:30:00 does not exist in America/Los_Angeles.
+  const Timestamp beforeEpoch{-1, 999'999'000};
+  const Timestamp skipped{1'710'037'800, 0};
+  const Timestamp latest{253'402'300'799, 999'999'000};
+
+  // Rows with the same key are identical, so the row numbers they get do not
+  // depend on the order of rows within a partition.
+  const auto data = makeRowVector(
+      {"ts"},
+      {
+          makeNullableFlatVector<Timestamp>(
+              {skipped,
+               std::nullopt,
+               beforeEpoch,
+               skipped,
+               latest,
+               std::nullopt,
+               skipped},
+              TIMESTAMP_UTC()),
+      });
+
+  struct {
+    std::optional<int32_t> limit;
+    RowVectorPtr expected;
+  } testSettings[] = {
+      {std::nullopt,
+       makeRowVector({
+           makeNullableFlatVector<Timestamp>(
+               {skipped,
+                skipped,
+                skipped,
+                std::nullopt,
+                std::nullopt,
+                beforeEpoch,
+                latest},
+               TIMESTAMP_UTC()),
+           makeFlatVector<int64_t>({1, 2, 3, 1, 2, 1, 1}),
+       })},
+      {2,
+       makeRowVector({
+           makeNullableFlatVector<Timestamp>(
+               {skipped,
+                skipped,
+                std::nullopt,
+                std::nullopt,
+                beforeEpoch,
+                latest},
+               TIMESTAMP_UTC()),
+           makeFlatVector<int64_t>({1, 2, 1, 2, 1, 1}),
+       })},
+  };
+
+  for (const auto& testData : testSettings) {
+    SCOPED_TRACE(fmt::format("limit {}", testData.limit.value_or(-1)));
+    core::PlanNodeId rowNumberId;
+    // Splits the input, so that spilling before the second batch has rows to
+    // spill.
+    const auto plan = PlanBuilder()
+                          .values(split(data))
+                          .rowNumber({"ts"}, testData.limit)
+                          .capturePlanNodeId(rowNumberId)
+                          .planNode();
+    for (const auto* timeZone : {"UTC", "America/Los_Angeles"}) {
+      SCOPED_TRACE(timeZone);
+      for (bool spill : {false, true}) {
+        SCOPED_TRACE(fmt::format("spill {}", spill));
+        const auto spillDirectory = TempDirectoryPath::create();
+        TestScopedSpillInjection scopedSpillInjection(spill ? 100 : 0);
+        const auto task =
+            AssertQueryBuilder(plan)
+                .config(core::QueryConfig::kSessionTimezone, timeZone)
+                .config(core::QueryConfig::kAdjustTimestampToTimezone, true)
+                .config(core::QueryConfig::kSpillEnabled, spill)
+                .config(core::QueryConfig::kRowNumberSpillEnabled, spill)
+                .spillDirectory(spillDirectory->getPath())
+                .assertResults(testData.expected);
+
+        const auto planStats =
+            PlanNodeStats::extract(task->taskStats(), rowNumberId);
+        if (spill) {
+          ASSERT_GT(planStats.spilledRows, 0);
+        } else {
+          ASSERT_EQ(planStats.spilledRows, 0);
+        }
+      }
+    }
+  }
+}
+
 TEST_F(RowNumberTest, largeInput) {
   auto data = makeRowVector({
       makeFlatVector<int64_t>(10'000, [](auto row) { return row % 7; }),
