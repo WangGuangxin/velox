@@ -173,6 +173,121 @@ TEST_P(MultiTopNRowNumberTest, basicWithPeers) {
   testLimit(5);
 }
 
+TEST_P(MultiTopNRowNumberTest, timestampUtc) {
+  // 2024-03-10 02:30:00 does not exist and 2024-11-03 01:30:00.123456 is
+  // ambiguous in America/Los_Angeles.
+  const std::vector<std::optional<Timestamp>> timestamps{
+      Timestamp{1'710'037'800, 0},
+      Timestamp{-1, 999'999'000},
+      std::nullopt,
+      Timestamp{1'710'037'800, 0},
+      Timestamp{253'402'300'799, 999'999'000},
+      Timestamp{-62'135'596'800, 0},
+      Timestamp{1'730'597'400, 123'456'000},
+  };
+  const auto data = makeRowVector(
+      {"id", "p", "ts"},
+      {
+          makeFlatVector<int32_t>({0, 1, 2, 3, 4, 5, 6}),
+          makeFlatVector<int32_t>({0, 0, 0, 0, 0, 1, 1}),
+          makeNullableFlatVector<Timestamp>(timestamps, TIMESTAMP_UTC()),
+      });
+
+  // Returns the rows of 'data' with the given ids, and their ranks.
+  const auto makeExpected = [&](const std::vector<int32_t>& ids,
+                                const std::vector<int64_t>& ranks) {
+    std::vector<int32_t> partitions;
+    std::vector<std::optional<Timestamp>> expectedTimestamps;
+    for (auto id : ids) {
+      partitions.push_back(id < 5 ? 0 : 1);
+      expectedTimestamps.push_back(timestamps[id]);
+    }
+    return makeRowVector({
+        makeFlatVector<int32_t>(ids),
+        makeFlatVector<int32_t>(partitions),
+        makeNullableFlatVector<Timestamp>(expectedTimestamps, TIMESTAMP_UTC()),
+        makeFlatVector<int64_t>(ranks),
+    });
+  };
+
+  // Partitions by 'p' and sorts by 'ts'. In partition 0, rows 0 and 3 are
+  // peers. row_number breaks the tie by 'id'.
+  const auto rank = GetParam();
+  const bool rowNumber =
+      rank == core::TopNRowNumberNode::RankFunction::kRowNumber;
+  RowVectorPtr expectedByTimestamp;
+  switch (rank) {
+    case core::TopNRowNumberNode::RankFunction::kRowNumber:
+      expectedByTimestamp = makeExpected({1, 0, 3, 5, 6}, {1, 2, 3, 1, 2});
+      break;
+    case core::TopNRowNumberNode::RankFunction::kRank:
+      expectedByTimestamp = makeExpected({1, 0, 3, 5, 6}, {1, 2, 2, 1, 2});
+      break;
+    case core::TopNRowNumberNode::RankFunction::kDenseRank:
+      expectedByTimestamp =
+          makeExpected({1, 0, 3, 4, 5, 6}, {1, 2, 2, 3, 1, 2});
+      break;
+  }
+
+  struct {
+    std::string name;
+    std::vector<std::string> partitionKeys;
+    std::vector<std::string> sortingKeys;
+    RowVectorPtr expected;
+  } testSettings[] = {
+      {"Sort by ts",
+       {"p"},
+       rowNumber ? std::vector<std::string>{"ts", "id"}
+                 : std::vector<std::string>{"ts"},
+       expectedByTimestamp},
+      {"Partition by ts",
+       {"ts"},
+       {"id"},
+       makeExpected({0, 3, 1, 2, 4, 5, 6}, {1, 2, 1, 1, 1, 1, 1})},
+  };
+
+  for (const auto& testData : testSettings) {
+    SCOPED_TRACE(testData.name);
+    core::PlanNodeId topNId;
+    // Splits the input, so that spilling before the second batch has rows to
+    // spill.
+    const auto plan = PlanBuilder()
+                          .values(split(data))
+                          .topNRank(
+                              functionName_,
+                              testData.partitionKeys,
+                              testData.sortingKeys,
+                              /*limit=*/3,
+                              /*generateRowNumber=*/true)
+                          .capturePlanNodeId(topNId)
+                          .planNode();
+    for (const auto* timeZone : {"UTC", "America/Los_Angeles"}) {
+      SCOPED_TRACE(timeZone);
+      for (bool spill : {false, true}) {
+        SCOPED_TRACE(fmt::format("spill {}", spill));
+        auto spillDirectory = TempDirectoryPath::create();
+        TestScopedSpillInjection scopedSpillInjection(spill ? 100 : 0);
+        const auto task =
+            AssertQueryBuilder(plan)
+                .config(core::QueryConfig::kSessionTimezone, timeZone)
+                .config(core::QueryConfig::kAdjustTimestampToTimezone, true)
+                .config(core::QueryConfig::kSpillEnabled, spill)
+                .config(core::QueryConfig::kTopNRowNumberSpillEnabled, spill)
+                .spillDirectory(spillDirectory->getPath())
+                .assertResults(testData.expected);
+
+        const auto planStats =
+            exec::PlanNodeStats::extract(task->taskStats(), topNId);
+        if (spill) {
+          ASSERT_GT(planStats.spilledRows, 0);
+        } else {
+          ASSERT_EQ(planStats.spilledRows, 0);
+        }
+      }
+    }
+  }
+}
+
 TEST_P(MultiTopNRowNumberTest, peersAtRankLimit) {
   // The partitions contain tied peers, mixed peer groups, and a boundary row
   // displaced by a later peer, respectively.
