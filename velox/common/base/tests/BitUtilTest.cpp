@@ -727,12 +727,21 @@ TEST_F(BitUtilTest, scatterBits) {
   std::vector<char> test(kSize * 8);
   std::vector<char> reference(kSize * 8);
   auto sourceAsChar = reinterpret_cast<char*>(source.data());
+  // Generate the reference output one bit at a time, from the top down.
+  int32_t sourceBit = numInMask - 1;
+  for (int32_t targetBit = kNumBits - 1; targetBit >= 0; --targetBit) {
+    if (isBitSet(maskData, targetBit)) {
+      setBit(reference.data(), targetBit, isBitSet(sourceAsChar, sourceBit--));
+    }
+  }
   scatterBits(numInMask, kNumBits, sourceAsChar, maskData, test.data());
-  // Generate the reference output with the non-BMI implementation.
-  FLAGS_bmi2 = false; // NOLINT
-  scatterBits(numInMask, kNumBits, sourceAsChar, maskData, reference.data());
-  FLAGS_bmi2 = true; // NOLINT
   EXPECT_EQ(reference, test);
+  // Repeat with the non-BMI implementation.
+  std::vector<char> simple(kSize * 8);
+  FLAGS_bmi2 = false; // NOLINT
+  scatterBits(numInMask, kNumBits, sourceAsChar, maskData, simple.data());
+  FLAGS_bmi2 = true; // NOLINT
+  EXPECT_EQ(reference, simple);
   // Repeat the same in place.
   scatterBits(numInMask, kNumBits, sourceAsChar, maskData, sourceAsChar);
   for (int32_t i = kNumBits - 1; i >= 0; --i) {
