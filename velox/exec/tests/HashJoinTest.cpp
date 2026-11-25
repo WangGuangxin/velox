@@ -863,6 +863,177 @@ TEST_P(MultiThreadedHashJoinTest, nullAsValueSemiJoin) {
        makeNullableFlatVector<int32_t>({std::nullopt})}));
 }
 
+TEST_P(HashJoinTest, timestampUtc) {
+  // 2024-03-10 02:30:00 does not exist and 2024-11-03 01:30:00.123456 is
+  // ambiguous in America/Los_Angeles.
+  const Timestamp earliest{-62'135'596'800, 0};
+  const Timestamp beforeEpoch{-1, 999'999'000};
+  const Timestamp skipped{1'710'037'800, 0};
+  const Timestamp repeated{1'730'597'400, 123'456'000};
+  const Timestamp latest{253'402'300'799, 999'999'000};
+
+  const auto probe = makeRowVector(
+      {"t_id", "t_ts"},
+      {
+          makeFlatVector<int32_t>({0, 1, 2, 3, 4}),
+          makeNullableFlatVector<Timestamp>(
+              {repeated, std::nullopt, beforeEpoch, skipped, latest},
+              TIMESTAMP_UTC()),
+      });
+  const auto build = makeRowVector(
+      {"u_id", "u_ts"},
+      {
+          makeFlatVector<int32_t>({10, 11, 12, 13, 14}),
+          makeNullableFlatVector<Timestamp>(
+              {skipped, std::nullopt, beforeEpoch, skipped, earliest},
+              TIMESTAMP_UTC()),
+      });
+
+  const std::vector<std::string> allColumns{"t_id", "t_ts", "u_id", "u_ts"};
+  const auto makeJoinResult =
+      [&](const std::vector<std::optional<int32_t>>& probeIds,
+          const std::vector<std::optional<Timestamp>>& probeTimestamps,
+          const std::vector<std::optional<int32_t>>& buildIds,
+          const std::vector<std::optional<Timestamp>>& buildTimestamps) {
+        return makeRowVector(
+            allColumns,
+            {
+                makeNullableFlatVector<int32_t>(probeIds),
+                makeNullableFlatVector<Timestamp>(
+                    probeTimestamps, TIMESTAMP_UTC()),
+                makeNullableFlatVector<int32_t>(buildIds),
+                makeNullableFlatVector<Timestamp>(
+                    buildTimestamps, TIMESTAMP_UTC()),
+            });
+      };
+
+  struct {
+    core::JoinType joinType;
+    std::vector<std::string> outputLayout;
+    RowVectorPtr expected;
+  } testSettings[] = {
+      {core::JoinType::kInner,
+       allColumns,
+       makeJoinResult(
+           {2, 3, 3},
+           {beforeEpoch, skipped, skipped},
+           {12, 10, 13},
+           {beforeEpoch, skipped, skipped})},
+      {core::JoinType::kLeft,
+       allColumns,
+       makeJoinResult(
+           {0, 1, 2, 3, 3, 4},
+           {repeated, std::nullopt, beforeEpoch, skipped, skipped, latest},
+           {std::nullopt, std::nullopt, 12, 10, 13, std::nullopt},
+           {std::nullopt,
+            std::nullopt,
+            beforeEpoch,
+            skipped,
+            skipped,
+            std::nullopt})},
+      {core::JoinType::kRight,
+       allColumns,
+       makeJoinResult(
+           {2, 3, 3, std::nullopt, std::nullopt},
+           {beforeEpoch, skipped, skipped, std::nullopt, std::nullopt},
+           {12, 10, 13, 11, 14},
+           {beforeEpoch, skipped, skipped, std::nullopt, earliest})},
+      {core::JoinType::kFull,
+       allColumns,
+       makeJoinResult(
+           {0, 1, 2, 3, 3, 4, std::nullopt, std::nullopt},
+           {repeated,
+            std::nullopt,
+            beforeEpoch,
+            skipped,
+            skipped,
+            latest,
+            std::nullopt,
+            std::nullopt},
+           {std::nullopt, std::nullopt, 12, 10, 13, std::nullopt, 11, 14},
+           {std::nullopt,
+            std::nullopt,
+            beforeEpoch,
+            skipped,
+            skipped,
+            std::nullopt,
+            std::nullopt,
+            earliest})},
+      {core::JoinType::kLeftSemiFilter,
+       {"t_id", "t_ts"},
+       makeRowVector(
+           {"t_id", "t_ts"},
+           {
+               makeFlatVector<int32_t>({2, 3}),
+               makeFlatVector<Timestamp>(
+                   {beforeEpoch, skipped}, TIMESTAMP_UTC()),
+           })},
+      {core::JoinType::kAnti,
+       {"t_id", "t_ts"},
+       makeRowVector(
+           {"t_id", "t_ts"},
+           {
+               makeFlatVector<int32_t>({0, 1, 4}),
+               makeNullableFlatVector<Timestamp>(
+                   {repeated, std::nullopt, latest}, TIMESTAMP_UTC()),
+           })},
+      {core::JoinType::kRightSemiFilter,
+       {"u_id", "u_ts"},
+       makeRowVector(
+           {"u_id", "u_ts"},
+           {
+               makeFlatVector<int32_t>({10, 12, 13}),
+               makeFlatVector<Timestamp>(
+                   {skipped, beforeEpoch, skipped}, TIMESTAMP_UTC()),
+           })},
+  };
+
+  for (const auto& testData : testSettings) {
+    SCOPED_TRACE(core::JoinTypeName::toName(testData.joinType));
+    auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+    core::PlanNodeId joinId;
+    const auto plan =
+        PlanBuilder(planNodeIdGenerator)
+            .values({probe})
+            .hashJoin(
+                {"t_ts"},
+                {"u_ts"},
+                PlanBuilder(planNodeIdGenerator).values({build}).planNode(),
+                "",
+                testData.outputLayout,
+                testData.joinType)
+            .capturePlanNodeId(joinId)
+            .planNode();
+    for (const auto* timeZone : {"UTC", "America/Los_Angeles"}) {
+      SCOPED_TRACE(timeZone);
+      for (bool spill : {false, true}) {
+        SCOPED_TRACE(fmt::format("spill {}", spill));
+        auto spillDirectory = TempDirectoryPath::create();
+        TestScopedSpillInjection scopedSpillInjection(spill ? 100 : 0);
+        const auto task =
+            AssertQueryBuilder(plan)
+                .config(core::QueryConfig::kSessionTimezone, timeZone)
+                .config(core::QueryConfig::kAdjustTimestampToTimezone, true)
+                .config(
+                    core::QueryConfig::kParallelOutputJoinBuildRowsEnabled,
+                    parallelBuildSideRowsEnabled_)
+                .config(core::QueryConfig::kSpillEnabled, spill)
+                .config(core::QueryConfig::kJoinSpillEnabled, spill)
+                .spillDirectory(spillDirectory->getPath())
+                .assertResults(testData.expected);
+
+        const auto planStats =
+            exec::PlanNodeStats::extract(task->taskStats(), joinId);
+        if (spill) {
+          ASSERT_GT(planStats.spilledRows, 0);
+        } else {
+          ASSERT_EQ(planStats.spilledRows, 0);
+        }
+      }
+    }
+  }
+}
+
 TEST_P(MultiThreadedHashJoinTest, rightSemiJoinFilterWithLargeOutput) {
   // Build the identical left and right vectors to generate large join
   // outputs.
