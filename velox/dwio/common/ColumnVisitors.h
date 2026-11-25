@@ -658,14 +658,35 @@ struct LoadIndices<int16_t, A> {
 #endif
 };
 
+#if XSIMD_WITH_NEON64
+// Returns the low 32 bits of four consecutive 8-byte values. NEON has no
+// gather instruction, so two loads and two narrowing moves replace a scalar
+// gather of four 32-bit words.
+inline int32x4_t loadLowWords(const void* values) {
+  const auto* words = static_cast<const int64_t*>(values);
+  return vcombine_s32(
+      vmovn_s64(vld1q_s64(words)), vmovn_s64(vld1q_s64(words + 2)));
+}
+#endif
+
 template <typename A>
 struct LoadIndices<int64_t, A> {
-  static xsimd::batch<int32_t, A> apply(const int64_t* values, const A& arch) {
+  static xsimd::batch<int32_t, A> apply(
+      const int64_t* values,
+      const xsimd::generic&) {
     return simd::gather<int32_t, int32_t, 8>(
         reinterpret_cast<const int32_t*>(values),
-        simd::iota<int32_t>(arch),
-        arch);
+        simd::iota<int32_t>(A{}),
+        A{});
   }
+
+#if XSIMD_WITH_NEON64
+  static xsimd::batch<int32_t, A> apply(
+      const int64_t* values,
+      const xsimd::neon&) {
+    return loadLowWords(values);
+  }
+#endif
 };
 
 template <typename A>
@@ -677,12 +698,22 @@ struct LoadIndices<int128_t, A> {
 
 template <typename A>
 struct LoadIndices<double, A> {
-  static xsimd::batch<int32_t, A> apply(const double* values, const A& arch) {
+  static xsimd::batch<int32_t, A> apply(
+      const double* values,
+      const xsimd::generic&) {
     return simd::gather<int32_t, int32_t, 8>(
         reinterpret_cast<const int32_t*>(values),
-        simd::iota<int32_t>(arch),
-        arch);
+        simd::iota<int32_t>(A{}),
+        A{});
   }
+
+#if XSIMD_WITH_NEON64
+  static xsimd::batch<int32_t, A> apply(
+      const double* values,
+      const xsimd::neon&) {
+    return loadLowWords(values);
+  }
+#endif
 };
 
 } // namespace detail
