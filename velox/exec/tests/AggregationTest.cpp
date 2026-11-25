@@ -838,6 +838,110 @@ TEST_F(AggregationTest, singleTimestampKeyDistinct) {
   testSingleKey<StringView>(vectors, "c7", true, true);
 }
 
+TEST_F(AggregationTest, timestampUtcKey) {
+  // 2024-03-10 02:30:00 does not exist and 2024-11-03 01:30:00.123456 is
+  // ambiguous in America/Los_Angeles.
+  const Timestamp earliest{-62'135'596'800, 0};
+  const Timestamp beforeEpoch{-1, 999'999'000};
+  const Timestamp skipped{1'710'037'800, 0};
+  const Timestamp repeated{1'730'597'400, 123'456'000};
+  const Timestamp latest{253'402'300'799, 999'999'000};
+
+  // Presto min and max truncate timestamps to milliseconds, so the aggregated
+  // values have millisecond precision.
+  const Timestamp repeatedMillis{1'730'597'400, 123'000'000};
+  const Timestamp latestMillis{253'402'300'799, 999'000'000};
+
+  const auto data = makeRowVector(
+      {"ts", "v"},
+      {
+          makeNullableFlatVector<Timestamp>(
+              {skipped,
+               std::nullopt,
+               beforeEpoch,
+               skipped,
+               latest,
+               std::nullopt,
+               beforeEpoch},
+              TIMESTAMP_UTC()),
+          makeNullableFlatVector<Timestamp>(
+              {repeatedMillis,
+               earliest,
+               latestMillis,
+               earliest,
+               skipped,
+               std::nullopt,
+               repeatedMillis},
+              TIMESTAMP_UTC()),
+      });
+
+  const std::vector<std::string> aggregates{"count(1)", "min(v)", "max(v)"};
+  const auto expectedGroups = makeRowVector({
+      makeNullableFlatVector<Timestamp>(
+          {skipped, std::nullopt, beforeEpoch, latest}, TIMESTAMP_UTC()),
+      makeFlatVector<int64_t>({2, 2, 2, 1}),
+      makeFlatVector<Timestamp>(
+          {earliest, earliest, repeatedMillis, skipped}, TIMESTAMP_UTC()),
+      makeFlatVector<Timestamp>(
+          {repeatedMillis, earliest, latestMillis, skipped}, TIMESTAMP_UTC()),
+  });
+  const auto expectedDistinct = makeRowVector({
+      makeNullableFlatVector<Timestamp>(
+          {skipped, std::nullopt, beforeEpoch, latest}, TIMESTAMP_UTC()),
+  });
+
+  struct {
+    std::string name;
+    core::PlanNodePtr plan;
+    RowVectorPtr expected;
+  } testSettings[] = {
+      {"single",
+       PlanBuilder()
+           .values({data})
+           .singleAggregation({"ts"}, aggregates)
+           .planNode(),
+       expectedGroups},
+      {"partial and final",
+       PlanBuilder()
+           .values({data})
+           .partialAggregation({"ts"}, aggregates)
+           .finalAggregation()
+           .planNode(),
+       expectedGroups},
+      {"distinct",
+       PlanBuilder().values({data}).singleAggregation({"ts"}, {}).planNode(),
+       expectedDistinct},
+  };
+
+  for (const auto& testData : testSettings) {
+    SCOPED_TRACE(testData.name);
+    for (const auto* timeZone : {"UTC", "America/Los_Angeles"}) {
+      SCOPED_TRACE(timeZone);
+      for (bool spill : {false, true}) {
+        SCOPED_TRACE(fmt::format("spill {}", spill));
+        auto spillDirectory = TempDirectoryPath::create();
+        TestScopedSpillInjection scopedSpillInjection(spill ? 100 : 0);
+        const auto task =
+            AssertQueryBuilder(testData.plan)
+                .config(QueryConfig::kSessionTimezone, timeZone)
+                .config(QueryConfig::kAdjustTimestampToTimezone, true)
+                .config(QueryConfig::kSpillEnabled, spill)
+                .config(QueryConfig::kAggregationSpillEnabled, spill)
+                .spillDirectory(spillDirectory->getPath())
+                .assertResults(testData.expected);
+
+        const auto planStats =
+            PlanNodeStats::extract(task->taskStats(), testData.plan->id());
+        if (spill) {
+          ASSERT_GT(planStats.spilledRows, 0);
+        } else {
+          ASSERT_EQ(planStats.spilledRows, 0);
+        }
+      }
+    }
+  }
+}
+
 TEST_F(AggregationTest, multiKey) {
   auto vectors = makeVectors(rowType_, 10, 100);
   createDuckDbTable(vectors);

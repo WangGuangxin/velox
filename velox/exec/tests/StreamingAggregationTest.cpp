@@ -702,6 +702,75 @@ TEST_P(StreamingAggregationTest, smallInputBatches) {
   testAggregation(keys, 3);
 }
 
+TEST_P(StreamingAggregationTest, timestampUtcKey) {
+  // 2024-03-10 02:30:00 does not exist and 2024-11-03 01:30:00.123456 is
+  // ambiguous in America/Los_Angeles.
+  const Timestamp earliest{-62'135'596'800, 0};
+  const Timestamp beforeEpoch{-1, 999'999'000};
+  const Timestamp skipped{1'710'037'800, 0};
+  const Timestamp repeated{1'730'597'400, 123'456'000};
+  const Timestamp latest{253'402'300'799, 999'999'000};
+
+  // Presto min and max truncate timestamps to milliseconds, so the aggregated
+  // values have millisecond precision.
+  const Timestamp repeatedMillis{1'730'597'400, 123'000'000};
+  const Timestamp latestMillis{253'402'300'799, 999'000'000};
+
+  // The group of 'skipped' spans both batches.
+  const std::vector<RowVectorPtr> data{
+      makeRowVector(
+          {"ts", "v"},
+          {
+              makeFlatVector<Timestamp>(
+                  {beforeEpoch, beforeEpoch, skipped}, TIMESTAMP_UTC()),
+              makeFlatVector<Timestamp>(
+                  {latestMillis, repeatedMillis, repeatedMillis},
+                  TIMESTAMP_UTC()),
+          }),
+      makeRowVector(
+          {"ts", "v"},
+          {
+              makeNullableFlatVector<Timestamp>(
+                  {skipped, latest, std::nullopt, std::nullopt},
+                  TIMESTAMP_UTC()),
+              makeNullableFlatVector<Timestamp>(
+                  {earliest, skipped, earliest, std::nullopt}, TIMESTAMP_UTC()),
+          }),
+  };
+
+  const auto plan = PlanBuilder()
+                        .values(data)
+                        .streamingAggregation(
+                            {"ts"},
+                            {"count(1)", "min(v)", "max(v)"},
+                            {},
+                            core::AggregationNode::Step::kSingle,
+                            /*ignoreNullKeys=*/false)
+                        .planNode();
+  const auto expected = makeRowVector({
+      makeNullableFlatVector<Timestamp>(
+          {beforeEpoch, skipped, latest, std::nullopt}, TIMESTAMP_UTC()),
+      makeFlatVector<int64_t>({2, 2, 1, 2}),
+      makeFlatVector<Timestamp>(
+          {repeatedMillis, earliest, skipped, earliest}, TIMESTAMP_UTC()),
+      makeFlatVector<Timestamp>(
+          {latestMillis, repeatedMillis, skipped, earliest}, TIMESTAMP_UTC()),
+  });
+
+  for (const auto* timeZone : {"UTC", "America/Los_Angeles"}) {
+    SCOPED_TRACE(timeZone);
+    for (uint32_t outputBatchSize : {1, 1024}) {
+      SCOPED_TRACE(fmt::format("outputBatchSize {}", outputBatchSize));
+      const auto actual =
+          config(AssertQueryBuilder(plan), outputBatchSize)
+              .config(core::QueryConfig::kSessionTimezone, timeZone)
+              .config(core::QueryConfig::kAdjustTimestampToTimezone, true)
+              .copyResults(pool());
+      facebook::velox::test::assertEqualVectors(expected, actual);
+    }
+  }
+}
+
 TEST_P(StreamingAggregationTest, multipleKeys) {
   std::vector<RowVectorPtr> keys = {
       makeRowVector({
