@@ -24,6 +24,8 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <limits>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -118,6 +120,32 @@ TEST(GreaterThanBitmap, generatesExpectedBitmasks) {
   EXPECT_EQ(
       GreaterThanBitmap(levels.data(), /*num_levels=*/64, /*rhs*/ 6),
       0x8080808080808080);
+}
+
+TEST(GreaterThanBitmap, fullBatchMatchesPerLevelComparison) {
+  std::mt19937 rng(1);
+  std::uniform_int_distribution<int16_t> smallLevels(-2, 8);
+  std::uniform_int_distribution<int16_t> anyLevels(
+      std::numeric_limits<int16_t>::min(), std::numeric_limits<int16_t>::max());
+  std::vector<int16_t> levels(64);
+  for (int iteration = 0; iteration < 100; ++iteration) {
+    auto& distribution = iteration % 2 == 0 ? smallLevels : anyLevels;
+    for (auto& level : levels) {
+      level = distribution(rng);
+    }
+    for (int i = 0; i < 16; ++i) {
+      const int16_t rhs =
+          i == 0 ? std::numeric_limits<int16_t>::min() : distribution(rng);
+      uint64_t expected{0};
+      for (int j = 0; j < 64; ++j) {
+        if (levels[j] > rhs) {
+          expected |= 1ULL << j;
+        }
+      }
+      EXPECT_EQ(GreaterThanBitmap(levels.data(), 64, rhs), expected)
+          << "rhs: " << rhs;
+    }
+  }
 }
 #endif
 
