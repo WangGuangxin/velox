@@ -31,6 +31,16 @@ target_link_libraries(
   Folly::follybenchmark
 )
 
+add_executable(velox_unnest_benchmark UnnestBenchmark.cpp)
+
+target_link_libraries(
+  velox_unnest_benchmark
+  velox_exec
+  velox_exec_test_lib
+  velox_vector_test_lib
+  Folly::follybenchmark
+)
+
 add_executable(velox_filter_project_benchmark FilterProjectBenchmark.cpp)
 
 target_link_libraries(
