@@ -1643,6 +1643,130 @@ TEST_F(WindowTest, aggregateReceivesConstantInputs) {
   AssertQueryBuilder(plan).assertResults(expected);
 }
 
+TEST_F(WindowTest, timestampUtc) {
+  // 2024-03-10 02:30:00 does not exist and 2024-11-03 01:30:00.123456 is
+  // ambiguous in America/Los_Angeles.
+  const Timestamp earliest{-62'135'596'800, 0};
+  const Timestamp beforeEpoch{-1, 999'999'000};
+  const Timestamp skipped{1'710'037'800, 0};
+  const Timestamp repeated{1'730'597'400, 123'456'000};
+  const Timestamp latest{253'402'300'799, 999'999'000};
+
+  const auto data = makeRowVector(
+      {"id", "p", "ts"},
+      {
+          makeFlatVector<int32_t>({0, 1, 2, 3, 4, 5, 6}),
+          makeFlatVector<int32_t>({0, 0, 0, 0, 0, 1, 1}),
+          makeNullableFlatVector<Timestamp>(
+              {skipped,
+               beforeEpoch,
+               std::nullopt,
+               skipped,
+               latest,
+               earliest,
+               repeated},
+              TIMESTAMP_UTC()),
+      });
+
+  // Results of row_number and lag ordered by (ts, id).
+  const auto rowNumbers = makeFlatVector<int64_t>({2, 1, 5, 3, 4, 1, 2});
+  const auto lags = makeNullableFlatVector<Timestamp>(
+      {beforeEpoch,
+       std::nullopt,
+       latest,
+       skipped,
+       skipped,
+       std::nullopt,
+       earliest},
+      TIMESTAMP_UTC());
+
+  {
+    SCOPED_TRACE("Sort-based window");
+    core::PlanNodeId windowId;
+    const auto plan =
+        PlanBuilder()
+            .values({data})
+            .window(
+                {"row_number() over (partition by p order by ts, id) AS rn",
+                 "lag(ts) over (partition by p order by ts, id) AS prev"})
+            .capturePlanNodeId(windowId)
+            // Rows with equal ts are peers.
+            .window(
+                {"rank() over (partition by p order by ts) AS rnk",
+                 "dense_rank() over (partition by p order by ts) AS drnk",
+                 "count(ts) over (partition by p order by ts) AS cnt"})
+            .window({"count(1) over (partition by ts) AS ts_cnt"})
+            .planNode();
+    const auto expected = makeRowVector(
+        {"id", "p", "ts", "rn", "prev", "rnk", "drnk", "cnt", "ts_cnt"},
+        {
+            data->childAt(0),
+            data->childAt(1),
+            data->childAt(2),
+            rowNumbers,
+            lags,
+            makeFlatVector<int64_t>({2, 1, 5, 2, 4, 1, 2}),
+            makeFlatVector<int64_t>({2, 1, 4, 2, 3, 1, 2}),
+            makeFlatVector<int64_t>({3, 1, 4, 3, 4, 1, 2}),
+            makeFlatVector<int64_t>({2, 1, 1, 2, 1, 1, 1}),
+        });
+
+    for (const auto* timeZone : {"UTC", "America/Los_Angeles"}) {
+      SCOPED_TRACE(timeZone);
+      for (bool spill : {false, true}) {
+        SCOPED_TRACE(fmt::format("spill {}", spill));
+        auto spillDirectory = TempDirectoryPath::create();
+        TestScopedSpillInjection scopedSpillInjection(spill ? 100 : 0);
+        const auto task =
+            AssertQueryBuilder(plan)
+                .config(core::QueryConfig::kSessionTimezone, timeZone)
+                .config(core::QueryConfig::kAdjustTimestampToTimezone, true)
+                .config(core::QueryConfig::kSpillEnabled, spill)
+                .config(core::QueryConfig::kWindowSpillEnabled, spill)
+                .spillDirectory(spillDirectory->getPath())
+                .assertResults(expected);
+
+        const auto stats =
+            exec::PlanNodeStats::extract(task->taskStats(), windowId);
+        if (spill) {
+          ASSERT_GT(stats.spilledRows, 0);
+        } else {
+          ASSERT_EQ(stats.spilledRows, 0);
+        }
+      }
+    }
+  }
+
+  {
+    SCOPED_TRACE("Streaming window");
+    const auto plan =
+        PlanBuilder()
+            .values({data})
+            .orderBy({"p", "ts", "id"}, false)
+            .streamingWindow(
+                {"row_number() over (partition by p order by ts, id) AS rn",
+                 "lag(ts) over (partition by p order by ts, id) AS prev"})
+            .planNode();
+    const auto expected = makeRowVector(
+        {"id", "p", "ts", "rn", "prev"},
+        {
+            data->childAt(0),
+            data->childAt(1),
+            data->childAt(2),
+            rowNumbers,
+            lags,
+        });
+
+    for (const auto* timeZone : {"UTC", "America/Los_Angeles"}) {
+      SCOPED_TRACE(timeZone);
+      AssertQueryBuilder(plan)
+          .config(core::QueryConfig::kSessionTimezone, timeZone)
+          .config(core::QueryConfig::kAdjustTimestampToTimezone, true)
+          .assertResults(expected);
+    }
+  }
+}
+
 TEST_F(WindowTest, missingFunctionSignature) {
   auto input = {makeRowVector({
       makeFlatVector<int64_t>({1, 2, 3}),
