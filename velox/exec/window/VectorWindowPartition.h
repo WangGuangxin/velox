@@ -19,6 +19,7 @@
 #include "velox/exec/window/RowRange.h"
 #include "velox/exec/window/SingleRowValues.h"
 
+#include <algorithm>
 #include <deque>
 #include <utility>
 #include <vector>
@@ -29,11 +30,15 @@ namespace facebook::velox::exec::window {
 class VectorWindowPartition : public WindowPartition {
  public:
   /// Constructs a partial window partition over retained input vector ranges.
+  /// The window functions read up to 'numPrecedingRows' rows before and
+  /// 'numFollowingRows' rows after the current row, like lag and lead.
   VectorWindowPartition(
       const std::vector<column_index_t>& inputChannels,
       const std::vector<column_index_t>& inputMapping,
       const std::vector<std::pair<column_index_t, core::SortOrder>>&
           sortKeyInfo,
+      vector_size_t numPrecedingRows,
+      vector_size_t numFollowingRows,
       memory::MemoryPool* pool);
 
   /// Returns the number of retained rows in this partition.
@@ -41,10 +46,17 @@ class VectorWindowPartition : public WindowPartition {
     return totalRows_;
   }
 
-  /// Returns the number of retained rows available for processing.
+  /// Returns the number of retained rows available for processing. Until the
+  /// partition is complete, the last 'numFollowingRows' rows wait for the
+  /// rows after them.
   vector_size_t numRowsForProcessing(
       vector_size_t /*partitionOffset*/) const override {
-    return totalRows_;
+    return complete() ? totalRows_
+                      : std::max(totalRows_ - numFollowingRows_, 0);
+  }
+
+  vector_size_t endRow() const override {
+    return startRow_ + totalRows_;
   }
 
   /// Rejects RowContainer rows because this partition stores vector ranges.
@@ -56,7 +68,8 @@ class VectorWindowPartition : public WindowPartition {
       vector_size_t startRow,
       vector_size_t endRow);
 
-  /// Removes processed rows from the front of this partition.
+  /// Removes processed rows from the front of this partition. Keeps the last
+  /// 'numPrecedingRows' of them for extractColumn() with row numbers.
   void removeProcessedRows(vector_size_t numRows) override;
 
   /// Extracts a contiguous row range from retained input vectors.
@@ -122,6 +135,23 @@ class VectorWindowPartition : public WindowPartition {
 
   // Rebuilds range prefix sums after processed rows are removed.
   void rebuildPrefixSums();
+
+  // Keeps 'range' of removed rows as the newest preceding rows and drops
+  // older ones beyond 'numPrecedingRows_'.
+  void addPrecedingRows(const RowRange& range);
+
+  // Finds the preceding range and local row for a row before 'startRow_'.
+  std::pair<size_t, vector_size_t> findPrecedingRow(vector_size_t row) const;
+
+  const vector_size_t numPrecedingRows_;
+
+  const vector_size_t numFollowingRows_;
+
+  // Removed rows right before 'startRow_', oldest first, at most
+  // 'numPrecedingRows_' in total.
+  std::deque<RowRange> precedingRanges_;
+
+  vector_size_t numPrecedingRowsKept_{0};
 
   // Retained input vector row ranges.
   std::deque<RowRange> ranges_;

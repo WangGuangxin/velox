@@ -19,6 +19,7 @@
 #include "velox/exec/RowContainer.h"
 #include "velox/exec/WindowFunction.h"
 #include "velox/exec/WindowPartition.h"
+#include "velox/exec/window/RowsStreamingWindowBuild.h"
 #include "velox/exec/window/WholePartitionAggregation.h"
 #include "velox/exec/window/WindowBuild.h"
 
@@ -102,10 +103,12 @@ class Window : public Operator {
     const std::optional<FrameChannelArg> end;
   };
 
-  // Returns if a window operator support rows-wise streaming processing or not.
-  // Currently we supports 'rank', 'dense_rank' and 'row_number' functions with
-  // any frame type. Also supports the agg window function with default frame.
-  bool supportRowsStreaming();
+  // Returns the rows before and after the current row that the window
+  // functions read if they support row-wise streaming processing, nullopt
+  // otherwise. Supports 'rank', 'dense_rank' and 'row_number' functions with
+  // any frame type, aggregate window functions with the default frame, and
+  // functions like 'lag' and 'lead' with a constant offset.
+  std::optional<window::RowOffsets> supportRowsStreaming();
 
   // Creates WindowFunction and frame objects for this operator.
   void createWindowFunctions();

@@ -74,13 +74,14 @@ Window::Window(
             driverCtx->queryConfig());
   } else if (windowNode->inputsSorted()) {
     spillSupported_ = false;
-    if (supportRowsStreaming()) {
+    if (const auto rowOffsets = supportRowsStreaming()) {
       windowBuild_ = std::make_unique<window::RowsStreamingWindowBuild>(
           windowNode_,
           pool(),
           spillConfig,
           &nonReclaimableSection_,
-          driverCtx->queryConfig().preferredOutputBatchBytes());
+          driverCtx->queryConfig().preferredOutputBatchBytes(),
+          rowOffsets.value());
     } else {
       windowBuild_ = std::make_unique<window::PartitionStreamingWindowBuild>(
           windowNode, pool(), spillConfig, &nonReclaimableSection_);
@@ -259,7 +260,35 @@ void Window::createWindowFunctions() {
   }
 }
 
-bool Window::supportRowsStreaming() {
+namespace {
+// Larger offsets of functions like lag and lead keep too many rows for
+// row-wise streaming to save memory.
+constexpr int64_t kMaxStreamingRowOffset{1'000};
+
+// Returns the constant offset of a function like lag or lead, nullopt if it is
+// not constant. A null offset reads no other row.
+std::optional<int64_t> constantRowOffset(
+    const core::CallTypedExprPtr& call,
+    memory::MemoryPool* pool) {
+  const auto& inputs = call->inputs();
+  if (inputs.size() < 2) {
+    return 1;
+  }
+  if (!core::TypedExprs::isConstant(inputs[1]) ||
+      inputs[1]->type()->kind() != TypeKind::BIGINT) {
+    return std::nullopt;
+  }
+  const auto offset =
+      core::TypedExprs::asConstant(inputs[1])->toConstantVector(pool);
+  if (offset->isNullAt(0)) {
+    return 0;
+  }
+  return offset->as<SimpleVector<int64_t>>()->valueAt(0);
+}
+} // namespace
+
+std::optional<window::RowOffsets> Window::supportRowsStreaming() {
+  window::RowOffsets rowOffsets;
   for (const auto& windowFunction : windowNode_->windowFunctions()) {
     const auto& functionName = windowFunction.functionCall->name();
     const auto windowFunctionMetadata =
@@ -267,7 +296,23 @@ bool Window::supportRowsStreaming() {
 
     if (windowFunctionMetadata.processMode !=
         exec::WindowFunction::ProcessMode::kRows) {
-      return false;
+      const auto rowAccess = windowFunctionMetadata.rowAccess;
+      if (rowAccess == exec::WindowFunction::RowAccess::kPartition ||
+          windowFunction.ignoreNulls) {
+        return std::nullopt;
+      }
+      const auto offset =
+          constantRowOffset(windowFunction.functionCall, pool());
+      if (!offset.has_value() || offset.value() < 0 ||
+          offset.value() > kMaxStreamingRowOffset) {
+        return std::nullopt;
+      }
+      auto& numRows =
+          rowAccess == exec::WindowFunction::RowAccess::kPrecedingOffset
+          ? rowOffsets.numPrecedingRows
+          : rowOffsets.numFollowingRows;
+      numRows = std::max<vector_size_t>(numRows, offset.value());
+      continue;
     }
 
     const auto& frame = windowFunction.frame;
@@ -277,11 +322,11 @@ bool Window::supportRowsStreaming() {
          frame.endType == core::WindowNode::BoundType::kCurrentRow);
 
     if (windowFunctionMetadata.isAggregate && !isDefaultFrame) {
-      return false;
+      return std::nullopt;
     }
   }
 
-  return true;
+  return rowOffsets;
 }
 
 void Window::addInput(RowVectorPtr input) {
@@ -738,6 +783,10 @@ vector_size_t Window::callApplyLoop(
   while (numOutputRowsLeft > 0) {
     const auto numPartitionRows =
         currentPartition_->numRowsForProcessing(partitionOffset_);
+    if (numPartitionRows == 0 && !currentPartition_->complete()) {
+      // The rows of a partial partition wait for the rows after them.
+      break;
+    }
     if (numPartitionRows <= numOutputRowsLeft) {
       // Current partition can fit completely in the output buffer.
       // So output all its rows.

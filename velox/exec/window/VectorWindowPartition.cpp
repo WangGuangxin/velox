@@ -62,8 +62,12 @@ VectorWindowPartition::VectorWindowPartition(
     const std::vector<column_index_t>& inputChannels,
     const std::vector<column_index_t>& inputMapping,
     const std::vector<std::pair<column_index_t, core::SortOrder>>& sortKeyInfo,
+    vector_size_t numPrecedingRows,
+    vector_size_t numFollowingRows,
     memory::MemoryPool* pool)
     : WindowPartition(inputMapping, sortKeyInfo, true),
+      numPrecedingRows_(numPrecedingRows),
+      numFollowingRows_(numFollowingRows),
       previousRow_(keyChannels(sortKeyInfo, inputChannels), pool),
       inputChannels_(inputChannels) {}
 
@@ -103,9 +107,12 @@ void VectorWindowPartition::removeProcessedRows(vector_size_t numRows) {
     auto& range = ranges_.front();
     const auto rangeSize = range.size();
     if (remaining >= rangeSize) {
+      addPrecedingRows(range);
       ranges_.pop_front();
       remaining -= rangeSize;
     } else {
+      addPrecedingRows(
+          {range.input, range.startRow, range.startRow + remaining});
       range.startRow += remaining;
       remaining = 0;
     }
@@ -113,6 +120,45 @@ void VectorWindowPartition::removeProcessedRows(vector_size_t numRows) {
 
   startRow_ += numRows;
   rebuildPrefixSums();
+}
+
+void VectorWindowPartition::addPrecedingRows(const RowRange& range) {
+  if (numPrecedingRows_ == 0) {
+    return;
+  }
+  precedingRanges_.push_back(range);
+  numPrecedingRowsKept_ += range.size();
+  while (numPrecedingRowsKept_ > numPrecedingRows_) {
+    auto& oldest = precedingRanges_.front();
+    const auto excess = numPrecedingRowsKept_ - numPrecedingRows_;
+    if (excess >= oldest.size()) {
+      numPrecedingRowsKept_ -= oldest.size();
+      precedingRanges_.pop_front();
+    } else {
+      oldest.startRow += excess;
+      numPrecedingRowsKept_ -= excess;
+    }
+  }
+}
+
+std::pair<size_t, vector_size_t> VectorWindowPartition::findPrecedingRow(
+    vector_size_t row) const {
+  VELOX_CHECK_LT(row, startRow_);
+  // Rows back from 'startRow_', 1 for the row right before it.
+  auto distance = startRow_ - row;
+  VELOX_CHECK_LE(
+      distance,
+      numPrecedingRowsKept_,
+      "Row before the rows kept for window functions: {}",
+      row);
+  for (auto i = precedingRanges_.size(); i-- > 0;) {
+    const auto& range = precedingRanges_[i];
+    if (distance <= range.size()) {
+      return {i, range.endRow - distance};
+    }
+    distance -= range.size();
+  }
+  VELOX_UNREACHABLE();
 }
 
 void VectorWindowPartition::extractColumn(
@@ -167,7 +213,15 @@ void VectorWindowPartition::extractColumn(
       continue;
     }
 
-    VELOX_CHECK_GE(rowNumber, startRow_);
+    if (rowNumber < startRow_) {
+      const auto [rangeIndex, localRow] = findPrecedingRow(rowNumber);
+      result->copy(
+          precedingRanges_[rangeIndex].input->childAt(columnIndex).get(),
+          resultOffset + i,
+          localRow,
+          1);
+      continue;
+    }
     const auto [rangeIndex, localRow] = findRange(rowNumber - startRow_);
     result->copy(
         ranges_[rangeIndex].input->childAt(columnIndex).get(),

@@ -78,7 +78,8 @@ RowsStreamingWindowBuild::RowsStreamingWindowBuild(
     velox::memory::MemoryPool* pool,
     const common::SpillConfig* spillConfig,
     tsan_atomic<bool>* nonReclaimableSection,
-    uint64_t maxRetainedBytes)
+    uint64_t maxRetainedBytes,
+    RowOffsets rowOffsets)
     : WindowBuild(windowNode, pool, spillConfig, nonReclaimableSection),
       hasRangeFrame_(hasRangeFrame(windowNode)),
       maxRetainedBytes_(std::max<uint64_t>(maxRetainedBytes, 1)),
@@ -86,7 +87,8 @@ RowsStreamingWindowBuild::RowsStreamingWindowBuild(
       peerKeyValues_(keyChannels(sortKeyInfo_, inputChannels_), pool),
       boundaryKeyChannels_(
           keyChannels(partitionKeyInfo_, sortKeyInfo_, inputChannels_)),
-      pool_(pool) {
+      pool_(pool),
+      rowOffsets_(rowOffsets) {
   VELOX_CHECK_NOT_NULL(pool_);
   velox::common::testutil::TestValue::adjust(
       "facebook::velox::exec::window::RowsStreamingWindowBuild::RowsStreamingWindowBuild",
@@ -124,7 +126,7 @@ void RowsStreamingWindowBuild::updatePendingRowBudget() {
 
 bool RowsStreamingWindowBuild::hasRowsToDrain() const {
   for (const auto& windowPartition : windowPartitions_) {
-    if (windowPartition->numRows() > 0) {
+    if (windowPartition->numRowsForProcessing(0) > 0) {
       return true;
     }
   }
@@ -162,7 +164,12 @@ void RowsStreamingWindowBuild::ensureInputPartition() {
   if (windowPartitions_.empty() || windowPartitions_.back()->complete()) {
     windowPartitions_.emplace_back(
         std::make_shared<VectorWindowPartition>(
-            inputChannels_, inversedInputChannels_, sortKeyInfo_, pool_));
+            inputChannels_,
+            inversedInputChannels_,
+            sortKeyInfo_,
+            rowOffsets_.numPrecedingRows,
+            rowOffsets_.numFollowingRows,
+            pool_));
   }
 }
 

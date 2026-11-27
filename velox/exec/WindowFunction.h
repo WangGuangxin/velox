@@ -44,11 +44,26 @@ class WindowFunction {
     kRows,
   };
 
+  /// The rows a function with ProcessMode::kPartition reads besides the
+  /// current row.
+  enum class RowAccess {
+    /// Any row of the partition.
+    kPartition,
+    /// Only the row at an offset before the current row. The offset is the
+    /// second argument, 1 if there is none. With a constant offset such a
+    /// function can process rows as they arrive, like ProcessMode::kRows.
+    kPrecedingOffset,
+    /// Only the row at an offset after the current row, given like for
+    /// kPrecedingOffset.
+    kFollowingOffset,
+  };
+
   /// Indicates whether this is an aggregate window function and its process
   /// unit.
   struct Metadata {
     ProcessMode processMode;
     bool isAggregate;
+    RowAccess rowAccess{RowAccess::kPartition};
 
     static Metadata defaultMetadata() {
       static Metadata defaultValue{ProcessMode::kPartition, false};

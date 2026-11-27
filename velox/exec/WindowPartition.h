@@ -70,6 +70,13 @@ class WindowPartition {
     return partition_.size();
   }
 
+  /// Returns the partition row number after the last row added so far. For a
+  /// partial partition this includes the rows removed by
+  /// removeProcessedRows(), so it is not numRows().
+  virtual vector_size_t endRow() const {
+    return startRow_ + numRows();
+  }
+
   /// Returns the number of rows in a window partition remaining for data
   /// processing.
   virtual vector_size_t numRowsForProcessing(
