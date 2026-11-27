@@ -67,10 +67,6 @@ VectorWindowPartition::VectorWindowPartition(
       previousRow_(keyChannels(sortKeyInfo, inputChannels), pool),
       inputChannels_(inputChannels) {}
 
-void VectorWindowPartition::addRows(const std::vector<char*>& /*rows*/) {
-  VELOX_FAIL("VectorWindowPartition does not support RowContainer rows");
-}
-
 void VectorWindowPartition::addRows(
     const RowVectorPtr& input,
     vector_size_t startRow,

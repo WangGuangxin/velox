@@ -47,9 +47,6 @@ class VectorWindowPartition : public WindowPartition {
     return totalRows_;
   }
 
-  /// Rejects RowContainer rows because this partition stores vector ranges.
-  void addRows(const std::vector<char*>& rows) override;
-
   /// Adds a retained input vector row range to this partition.
   void addRows(
       const RowVectorPtr& input,

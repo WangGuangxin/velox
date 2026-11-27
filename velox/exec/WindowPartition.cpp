@@ -25,35 +25,19 @@ WindowPartition::WindowPartition(
     RowContainer* data,
     const folly::Range<char**>& rows,
     const std::vector<column_index_t>& inputMapping,
-    const std::vector<std::pair<column_index_t, core::SortOrder>>& sortKeyInfo,
-    bool partial,
-    bool complete)
-    : partial_(partial),
+    const std::vector<std::pair<column_index_t, core::SortOrder>>& sortKeyInfo)
+    : partial_(false),
       data_(data),
       partition_(rows),
-      complete_(complete),
+      complete_(true),
       inputMapping_(inputMapping),
       sortKeyInfo_(sortKeyInfo) {
-  VELOX_CHECK_NE(partial_, complete_);
-  VELOX_CHECK_NE(complete_, partition_.empty());
+  VELOX_CHECK(!partition_.empty());
 
   for (auto index : inputMapping_) {
     columns_.emplace_back(data_->columnAt(index));
   }
 }
-
-WindowPartition::WindowPartition(
-    RowContainer* data,
-    const folly::Range<char**>& rows,
-    const std::vector<column_index_t>& inputMapping,
-    const std::vector<std::pair<column_index_t, core::SortOrder>>& sortKeyInfo)
-    : WindowPartition(data, rows, inputMapping, sortKeyInfo, false, true) {}
-
-WindowPartition::WindowPartition(
-    RowContainer* data,
-    const std::vector<column_index_t>& inputMapping,
-    const std::vector<std::pair<column_index_t, core::SortOrder>>& sortKeyInfo)
-    : WindowPartition(data, {}, inputMapping, sortKeyInfo, true, false) {}
 
 WindowPartition::WindowPartition(
     const std::vector<column_index_t>& inputMapping,
@@ -66,41 +50,13 @@ WindowPartition::WindowPartition(
       inputMapping_(inputMapping),
       sortKeyInfo_(sortKeyInfo) {}
 
-void WindowPartition::addRows(const std::vector<char*>& rows) {
-  checkPartial();
-  rows_.insert(rows_.end(), rows.begin(), rows.end());
-  partition_ = folly::Range(rows_.data(), rows_.size());
-}
-
-void WindowPartition::eraseRows(vector_size_t numRows) {
-  checkPartial();
-  VELOX_CHECK_GE(data_->numRows(), numRows);
-  data_->eraseRows(folly::Range<char**>(rows_.data(), numRows));
-}
-
-void WindowPartition::removeProcessedRows(vector_size_t numRows) {
-  checkPartial();
-
-  VELOX_CHECK_NULL(previousRow_);
-  if (complete_ && rows_.size() == numRows) {
-    eraseRows(numRows);
-  } else {
-    eraseRows(numRows - 1);
-    previousRow_ = rows_[numRows - 1];
-  }
-
-  rows_.erase(rows_.cbegin(), rows_.cbegin() + numRows);
-  partition_ = folly::Range(rows_.data(), rows_.size());
-  startRow_ += numRows;
+void WindowPartition::removeProcessedRows(vector_size_t /*numRows*/) {
+  VELOX_FAIL("Only a partial WindowPartition can remove processed rows");
 }
 
 vector_size_t WindowPartition::numRowsForProcessing(
     vector_size_t partitionOffset) const {
-  if (partial_) {
-    return partition_.size();
-  } else {
-    return partition_.size() - partitionOffset;
-  }
+  return partition_.size() - partitionOffset;
 }
 
 void WindowPartition::extractColumn(
@@ -122,9 +78,8 @@ void WindowPartition::extractColumn(
     vector_size_t numRows,
     vector_size_t resultOffset,
     const VectorPtr& result) const {
-  VELOX_CHECK_GE(partitionOffset, startRow_);
   data_->extractColumn(
-      partition_.data() + partitionOffset - startRow_,
+      partition_.data() + partitionOffset,
       numRows,
       inputMapping_[columnIndex],
       result,
@@ -136,9 +91,8 @@ vector_size_t WindowPartition::extractNulls(
     vector_size_t partitionOffset,
     vector_size_t numRows,
     const BufferPtr& nullsBuffer) const {
-  VELOX_CHECK_GE(partitionOffset, startRow_);
   return data_->extractNulls(
-      partition_.data() + partitionOffset - startRow_,
+      partition_.data() + partitionOffset,
       numRows,
       inputMapping_[columnIndex],
       nullsBuffer);
@@ -203,32 +157,27 @@ bool WindowPartition::compareRowsWithSortKeys(const char* lhs, const char* rhs)
   return false;
 }
 
-void WindowPartition::removePreviousRow() {
-  VELOX_CHECK_NOT_NULL(previousRow_);
-  data_->eraseRows(folly::Range<char**>(&previousRow_, 1));
-  previousRow_ = nullptr;
-}
-
 class WindowPartition::RowContainerAccessor {
  public:
   explicit RowContainerAccessor(const WindowPartition& partition)
       : partition_(partition) {}
 
   vector_size_t startRow() const {
-    return partition_.startRow_;
+    return 0;
   }
 
   vector_size_t partitionEnd() const {
-    return partition_.startRow_ + partition_.partition_.size();
+    return partition_.partition_.size();
   }
 
+  // A complete partition holds all its rows, so no row from an earlier batch
+  // is ever needed for peer comparison.
   bool hasPreviousRow() const {
-    return partition_.previousRow_ != nullptr;
+    return false;
   }
 
-  bool previousRowEquals(vector_size_t row) const {
-    return !partition_.compareRowsWithSortKeys(
-        partition_.previousRow_, rowAt(row));
+  bool previousRowEquals(vector_size_t /*row*/) const {
+    VELOX_UNREACHABLE();
   }
 
   bool rowsEqual(vector_size_t lhs, vector_size_t rhs) const {
@@ -277,7 +226,7 @@ class WindowPartition::RowContainerAccessor {
   }
 
   char* rowAt(vector_size_t row) const {
-    return partition_.partition_[row - partition_.startRow_];
+    return partition_.partition_[row];
   }
 
   static bool isNullAt(const char* row, RowColumn column) {
@@ -295,11 +244,8 @@ std::pair<vector_size_t, vector_size_t> WindowPartition::computePeerBuffers(
     vector_size_t* rawPeerStarts,
     vector_size_t* rawPeerEnds) {
   RowContainerAccessor rows{*this};
-  auto result = window::PeerGroupComputation::compute(
+  const auto result = window::PeerGroupComputation::compute(
       rows, start, end, prevPeerStart, prevPeerEnd, rawPeerStarts, rawPeerEnds);
-  if (result.previousRowConsumed) {
-    removePreviousRow();
-  }
   return {result.peerStart, result.peerEnd};
 }
 
