@@ -41,6 +41,15 @@ struct SparkComparator {
       } else {
         return newComparisons.valueAt<T>(index) <= *accumulator;
       }
+    } else if constexpr (std::is_same_v<TAccumulator, StringValueAccumulator>) {
+      if (isFirstValue) {
+        return true;
+      }
+      if constexpr (sparkGreaterThan) {
+        return newComparisons.valueAt<StringView>(index) >= accumulator->value;
+      } else {
+        return newComparisons.valueAt<StringView>(index) <= accumulator->value;
+      }
     } else {
       if constexpr (sparkGreaterThan) {
         return !accumulator->hasValue() ||

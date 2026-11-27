@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <cstring>
 #include <optional>
 
 #include "velox/exec/Aggregate.h"
@@ -47,6 +48,51 @@ void extract(
   }
 }
 
+struct StringValueAccumulator {
+  StringView value;
+  HashStringAllocator::Header* buffer{nullptr};
+
+  void write(StringView newValue, HashStringAllocator* allocator) {
+    if (newValue.isInline()) {
+      value = newValue;
+      return;
+    }
+    const auto size = newValue.size();
+    if (buffer != nullptr && buffer->size() < size) {
+      allocator->free(buffer);
+      buffer = nullptr;
+    }
+    if (buffer == nullptr) {
+      buffer = allocator->allocate(size);
+    }
+    std::memcpy(buffer->begin(), newValue.data(), size);
+    value = StringView(buffer->begin(), size);
+  }
+
+  void destroy(HashStringAllocator* allocator) {
+    if (buffer != nullptr) {
+      allocator->free(buffer);
+      buffer = nullptr;
+    }
+  }
+};
+
+template <typename T>
+constexpr bool isVariableWidthAccumulator() {
+  return std::is_same_v<T, SingleValueAccumulator> ||
+      std::is_same_v<T, StringValueAccumulator>;
+}
+
+template <typename T>
+void extract(
+    StringValueAccumulator* accumulator,
+    const VectorPtr& vector,
+    vector_size_t index,
+    T* /* rawValues */,
+    uint64_t* /* rawBoolValues */) {
+  vector->as<FlatVector<StringView>>()->set(index, accumulator->value);
+}
+
 template <typename T>
 void extract(
     SingleValueAccumulator* accumulator,
@@ -64,6 +110,15 @@ void store(
     vector_size_t index,
     HashStringAllocator* allocator) {
   *accumulator = decodedVector.valueAt<T>(index);
+}
+
+template <typename T>
+void store(
+    StringValueAccumulator* accumulator,
+    const DecodedVector& decodedVector,
+    vector_size_t index,
+    HashStringAllocator* allocator) {
+  accumulator->write(decodedVector.valueAt<StringView>(index), allocator);
 }
 
 template <typename T>
@@ -91,7 +146,20 @@ template <typename T, bool useCustomComparison>
 struct AccumulatorTypeTraits<
     T,
     useCustomComparison,
-    std::enable_if_t<!isNumeric<T>() || useCustomComparison, void>> {
+    std::enable_if_t<
+        std::is_same_v<T, StringView> && !useCustomComparison,
+        void>> {
+  using AccumulatorType = StringValueAccumulator;
+};
+
+template <typename T, bool useCustomComparison>
+struct AccumulatorTypeTraits<
+    T,
+    useCustomComparison,
+    std::enable_if_t<
+        (!isNumeric<T>() && !std::is_same_v<T, StringView>) ||
+            useCustomComparison,
+        void>> {
   using AccumulatorType = SingleValueAccumulator;
 };
 
@@ -125,8 +193,8 @@ class MinMaxByAggregateBase : public exec::Aggregate {
   /// numeric. Such a group can hold arbitrarily more than
   /// accumulatorFixedWidthSize().
   static constexpr bool kUsesVariableWidthAccumulator =
-      std::is_same_v<ValueAccumulatorType, SingleValueAccumulator> ||
-      std::is_same_v<ComparisonAccumulatorType, SingleValueAccumulator>;
+      isVariableWidthAccumulator<ValueAccumulatorType>() ||
+      isVariableWidthAccumulator<ComparisonAccumulatorType>();
 
   int32_t accumulatorFixedWidthSize() const override {
     return sizeof(ValueAccumulatorType) + sizeof(ComparisonAccumulatorType) +
@@ -221,8 +289,7 @@ class MinMaxByAggregateBase : public exec::Aggregate {
 
     T* rawValues = nullptr;
     uint64_t* rawBoolValues = nullptr;
-    if constexpr (!std::
-                      is_same_v<ValueAccumulatorType, SingleValueAccumulator>) {
+    if constexpr (!isVariableWidthAccumulator<ValueAccumulatorType>()) {
       auto vector = (*result)->as<FlatVector<T>>();
       VELOX_CHECK(vector != nullptr);
       if constexpr (std::is_same_v<T, bool>) {
@@ -254,8 +321,7 @@ class MinMaxByAggregateBase : public exec::Aggregate {
 
     T* rawValues = nullptr;
     uint64_t* rawBoolValues = nullptr;
-    if constexpr (!std::
-                      is_same_v<ValueAccumulatorType, SingleValueAccumulator>) {
+    if constexpr (!isVariableWidthAccumulator<ValueAccumulatorType>()) {
       auto flatValueVector = valueVector->as<FlatVector<T>>();
       VELOX_CHECK(flatValueVector != nullptr);
       if constexpr (std::is_same_v<T, bool>) {
@@ -266,9 +332,7 @@ class MinMaxByAggregateBase : public exec::Aggregate {
     }
     U* rawComparisonValues = nullptr;
     uint64_t* rawBoolComparisonValues = nullptr;
-    if constexpr (!std::is_same_v<
-                      ComparisonAccumulatorType,
-                      SingleValueAccumulator>) {
+    if constexpr (!isVariableWidthAccumulator<ComparisonAccumulatorType>()) {
       auto flatComparisonVector = comparisonVector->as<FlatVector<U>>();
       VELOX_CHECK(flatComparisonVector != nullptr);
       if constexpr (std::is_same_v<U, bool>) {
@@ -515,21 +579,17 @@ class MinMaxByAggregateBase : public exec::Aggregate {
       auto group = groups[i];
       valueIsNull(group) = true;
 
-      if constexpr (std::is_same_v<
-                        ValueAccumulatorType,
-                        SingleValueAccumulator>) {
-        new (group + offset_) SingleValueAccumulator();
+      if constexpr (isVariableWidthAccumulator<ValueAccumulatorType>()) {
+        new (group + offset_) ValueAccumulatorType();
       } else {
         *value(group) = ValueAccumulatorType();
       }
 
-      if constexpr (!std::is_same_v<
-                        ComparisonAccumulatorType,
-                        SingleValueAccumulator>) {
+      if constexpr (!isVariableWidthAccumulator<ComparisonAccumulatorType>()) {
         *comparisonValue(group) = ComparisonAccumulatorType();
       } else {
         new (group + offset_ + sizeof(ValueAccumulatorType))
-            SingleValueAccumulator();
+            ComparisonAccumulatorType();
       }
     }
   }
@@ -537,14 +597,10 @@ class MinMaxByAggregateBase : public exec::Aggregate {
   void destroyInternal(folly::Range<char**> groups) override {
     for (auto group : groups) {
       if (isInitialized(group)) {
-        if constexpr (std::is_same_v<
-                          ValueAccumulatorType,
-                          SingleValueAccumulator>) {
+        if constexpr (isVariableWidthAccumulator<ValueAccumulatorType>()) {
           value(group)->destroy(allocator_);
         }
-        if constexpr (std::is_same_v<
-                          ComparisonAccumulatorType,
-                          SingleValueAccumulator>) {
+        if constexpr (isVariableWidthAccumulator<ComparisonAccumulatorType>()) {
           comparisonValue(group)->destroy(allocator_);
         }
       }
