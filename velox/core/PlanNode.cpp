@@ -2479,6 +2479,16 @@ WindowNode::WindowNode(
   }
 }
 
+bool WindowNode::allFramesSpanPartition() const {
+  return std::all_of(
+      windowFunctions_.begin(),
+      windowFunctions_.end(),
+      [](const Function& function) {
+        return function.frame.startType == BoundType::kUnboundedPreceding &&
+            function.frame.endType == BoundType::kUnboundedFollowing;
+      });
+}
+
 void WindowNode::addDetails(std::stringstream& stream) const {
   if (inputsSorted_) {
     stream << "STREAMING ";

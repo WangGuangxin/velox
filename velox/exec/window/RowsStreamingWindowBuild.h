@@ -27,6 +27,13 @@
 
 namespace facebook::velox::exec::window {
 
+/// The rows before and after the current row that window functions like lag
+/// and lead read.
+struct RowOffsets {
+  vector_size_t numPrecedingRows{0};
+  vector_size_t numFollowingRows{0};
+};
+
 /// Unlike PartitionStreamingWindowBuild, RowsStreamingWindowBuild is capable of
 /// processing window functions as rows arrive within a single partition,
 /// without the need to wait for the entire window partition to be ready. This
@@ -44,7 +51,8 @@ class RowsStreamingWindowBuild : public WindowBuild {
       // Byte budget for input retained within a single not-yet-complete
       // partition before 'needsInput()' asks the driver to drain. The Window
       // operator passes 'preferredOutputBatchBytes'.
-      uint64_t maxRetainedBytes);
+      uint64_t maxRetainedBytes,
+      RowOffsets rowOffsets);
 
   void addInput(RowVectorPtr input) override;
 
@@ -152,15 +160,18 @@ class RowsStreamingWindowBuild : public WindowBuild {
   // Pool used to create window partitions.
   memory::MemoryPool* const pool_;
 
+  const RowOffsets rowOffsets_;
+
   // Number of rows accumulated since the last partial flush.
   vector_size_t pendingRowCount_{0};
 
   // 'maxRetainedBytes_' expressed in rows at the current 'estimatedRowSize_',
   // so the per-row check in 'addInput()' is an integer compare rather than a
   // walk of 'windowPartitions_'. Valid there only because that flush also
-  // requires '!hasRowsToDrain()', i.e. every partition holds zero rows, which
-  // makes 'pendingRowCount_' the whole retained-row count. Left at the maximum
-  // for RANGE frames, which are never throttled on bytes.
+  // requires '!hasRowsToDrain()', i.e. no partition holds rows to process,
+  // which makes 'pendingRowCount_' the whole retained-row count, apart from the
+  // rows that wait for the rows after them. Left at the maximum for RANGE
+  // frames, which are never throttled on bytes.
   vector_size_t maxPendingRows_{std::numeric_limits<vector_size_t>::max()};
 
   // The output gets next partition from the head of 'windowPartitions_' and

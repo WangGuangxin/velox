@@ -189,7 +189,7 @@ class LeadLagFunction : public exec::WindowFunction {
 
     auto constantOffsetValue = constantOffset_.value();
     // Set row number to kDefaultValueRow for out of range offset.
-    if (constantOffsetValue > partition_->numRows()) {
+    if (constantOffsetValue > partition_->endRow()) {
       std::fill(rowNumbers_.begin(), rowNumbers_.end(), kDefaultValueRow);
       return;
     }
@@ -203,7 +203,7 @@ class LeadLagFunction : public exec::WindowFunction {
     partition_->extractColumn(
         offsetIndex_, partitionOffset_, numRows, 0, offsets_);
 
-    const auto maxRowNumber = partition_->numRows() - 1;
+    const auto maxRowNumber = partition_->endRow() - 1;
     auto* rawNulls = nulls_->as<uint64_t>();
     for (auto i = 0; i < numRows; ++i) {
       // Set row number to kNullRow for NULL offset.
@@ -213,7 +213,7 @@ class LeadLagFunction : public exec::WindowFunction {
         auto offset = offsets_->valueAt(i);
         VELOX_USER_CHECK_GE(offset, 0, "Offset must be at least 0");
         // Set rowNumber to kDefaultValueRow for out of range offset.
-        if (offset > partition_->numRows()) {
+        if (offset > partition_->endRow()) {
           rowNumbers_[i] = kDefaultValueRow;
           continue;
         }
@@ -238,7 +238,7 @@ class LeadLagFunction : public exec::WindowFunction {
                 rawNulls,
                 offset,
                 partitionOffset_ + i + 1,
-                partition_->numRows(),
+                partition_->endRow(),
                 1);
           } else {
             // Set rowNumber to kDefaultValueRow for out of range offset.
@@ -402,7 +402,7 @@ void LeadLagFunction<false>::setRowNumbersForConstantOffset(
       0,
       std::min<vector_size_t>(
           rowNumbers_.size(),
-          partition_->numRows() - partitionOffset_ - offset));
+          partition_->endRow() - partitionOffset_ - offset));
   if (nonNullCnt < rowNumbers_.size()) {
     std::fill(
         rowNumbers_.begin() + nonNullCnt, rowNumbers_.end(), kDefaultValueRow);
@@ -417,7 +417,7 @@ void LeadLagFunction<false>::setRowNumbersForConstantOffset(
             rawNulls,
             offset,
             partitionOffset_ + i + 1,
-            partition_->numRows(),
+            partition_->endRow(),
             1);
       }
     } else {
@@ -461,7 +461,9 @@ void registerLag(const std::string& name) {
   exec::registerWindowFunction(
       name,
       signatures(),
-      exec::WindowFunction::Metadata::defaultMetadata(),
+      {exec::WindowFunction::ProcessMode::kPartition,
+       false,
+       exec::WindowFunction::RowAccess::kPrecedingOffset},
       [name](
           const std::vector<exec::WindowFunctionArg>& args,
           const TypePtr& resultType,
@@ -479,7 +481,9 @@ void registerLead(const std::string& name) {
   exec::registerWindowFunction(
       name,
       signatures(),
-      exec::WindowFunction::Metadata::defaultMetadata(),
+      {exec::WindowFunction::ProcessMode::kPartition,
+       false,
+       exec::WindowFunction::RowAccess::kFollowingOffset},
       [name](
           const std::vector<exec::WindowFunctionArg>& args,
           const TypePtr& resultType,

@@ -132,6 +132,28 @@ class WindowTest : public OperatorTestBase {
     return rowSize * numRows;
   }
 
+  // Returns data sorted by 'p' for aggregates over whole partitions, which use
+  // WholePartitionAggregation. Partitions of 3 and 1'500 rows span input
+  // batches. The first partition has a NULL key.
+  RowVectorPtr makeWholePartitionData(vector_size_t size) {
+    return makeRowVector(
+        {"p", "d", "s"},
+        {
+            makeFlatVector<int32_t>(
+                size,
+                [](auto row) { return row < 6'100 ? row / 1'500 : row / 3; },
+                [](auto row) { return row < 100; }),
+            makeFlatVector<int64_t>(
+                size, [](auto row) { return row; }, nullEvery(5)),
+            makeFlatVector<std::string>(
+                size,
+                [](auto row) {
+                  return fmt::format("value-{}", row * 37 % 1'000);
+                },
+                nullEvery(3)),
+        });
+  }
+
   tsan_atomic<bool> nonReclaimableSection_{false};
 };
 
@@ -345,6 +367,195 @@ TEST_F(WindowTest, spillUnsupported) {
   ASSERT_EQ(stats.spilledFiles, 0);
   ASSERT_EQ(stats.spilledPartitions, 0);
   ASSERT_GT(stats.customSum(Operator::kSpillNotSupported), 1);
+}
+
+const std::vector<std::string> kWholePartitionFunctions = {
+    "count(d) over (partition by p rows between unbounded preceding and unbounded following)",
+    "sum(d) over (partition by p range between unbounded preceding and unbounded following)",
+    "max(s) over (partition by p rows between unbounded preceding and unbounded following)",
+    "count(1) over (partition by p rows between unbounded preceding and unbounded following)",
+};
+
+// Returns the results of 'functions' over 'data' computed by the sort based
+// window build, which does not use WholePartitionAggregation.
+RowVectorPtr sortWindowResults(
+    const std::vector<RowVectorPtr>& data,
+    const std::vector<std::string>& functions,
+    memory::MemoryPool* pool) {
+  return AssertQueryBuilder(
+             PlanBuilder().values(data).window(functions).planNode())
+      .copyResults(pool);
+}
+
+TEST_F(WindowTest, wholePartitionAggregation) {
+  const auto data = split(makeWholePartitionData(10'000), 30);
+  const auto expected =
+      sortWindowResults(data, kWholePartitionFunctions, pool());
+
+  auto plan = PlanBuilder()
+                  .values(data)
+                  .streamingWindow(kWholePartitionFunctions)
+                  .planNode();
+  AssertQueryBuilder(plan)
+      .config(core::QueryConfig::kPreferredOutputBatchRows, "100")
+      .assertResults(expected);
+}
+
+TEST_F(WindowTest, wholePartitionAggregationSpill) {
+  const auto data = split(makeWholePartitionData(10'000), 30);
+  const auto expected =
+      sortWindowResults(data, kWholePartitionFunctions, pool());
+
+  core::PlanNodeId windowId;
+  auto plan = PlanBuilder()
+                  .values(data)
+                  .streamingWindow(kWholePartitionFunctions)
+                  .capturePlanNodeId(windowId)
+                  .planNode();
+  auto spillDirectory = TempDirectoryPath::create();
+  TestScopedSpillInjection scopedSpillInjection(100);
+  auto task = AssertQueryBuilder(plan)
+                  .config(core::QueryConfig::kPreferredOutputBatchRows, "100")
+                  .config(core::QueryConfig::kSpillEnabled, "true")
+                  .config(core::QueryConfig::kWindowSpillEnabled, "true")
+                  .spillDirectory(spillDirectory->getPath())
+                  .assertResults(expected);
+
+  const auto planStats = exec::toPlanStats(task->taskStats());
+  const auto& stats = planStats.at(windowId);
+  ASSERT_GT(stats.spilledBytes, 0);
+  ASSERT_GT(stats.spilledRows, 0);
+  ASSERT_GT(stats.spilledFiles, 0);
+}
+
+TEST_F(WindowTest, wholePartitionAggregationSpillUnderMemoryPressure) {
+  // One partition of 1M rows, larger than the 16MB query memory, with a
+  // window function over the whole partition.
+  const vector_size_t size = 1'000'000;
+  auto data = makeRowVector(
+      {"p", "d", "s"},
+      {
+          makeFlatVector<int16_t>(size, [](auto /*row*/) { return 1; }),
+          makeFlatVector<int64_t>(size, [](auto row) { return row; }),
+          makeFlatVector<std::string>(
+              size, [](auto row) { return fmt::format("{:032}", row); }),
+      });
+
+  auto queryCtx = core::QueryCtx::create(executor_.get());
+  queryCtx->testingOverrideMemoryPool(
+      memory::memoryManager()->addRootPool(
+          queryCtx->queryId(), 16 << 20, exec::MemoryReclaimer::create()));
+
+  // The input is sorted already. The projection allocates new vectors from the
+  // query memory, which the window holds until the partition is complete.
+  core::PlanNodeId windowId;
+  auto plan = PlanBuilder()
+                  .values(split(data, 100))
+                  .project({"p", "d", "concat(s, 'x') AS s"})
+                  .streamingWindow(
+                      {"count(1) over (partition by p rows between unbounded "
+                       "preceding and unbounded following)"})
+                  .capturePlanNodeId(windowId)
+                  .project({"d + w0 AS x"})
+                  .singleAggregation({}, {"sum(x)", "count(1)"})
+                  .planNode();
+  auto spillDirectory = TempDirectoryPath::create();
+  auto task =
+      AssertQueryBuilder(plan)
+          .queryCtx(queryCtx)
+          .config(core::QueryConfig::kSpillEnabled, "true")
+          .config(core::QueryConfig::kWindowSpillEnabled, "true")
+          .spillDirectory(spillDirectory->getPath())
+          .assertResults(makeRowVector({
+              makeConstant<int64_t>(
+                  int64_t{size} * (size - 1) / 2 + int64_t{size} * size, 1),
+              makeConstant<int64_t>(size, 1),
+          }));
+
+  const auto planStats = exec::toPlanStats(task->taskStats());
+  const auto& stats = planStats.at(windowId);
+  ASSERT_GT(stats.spilledBytes, 0);
+}
+
+TEST_F(WindowTest, rowsStreamingLeadLag) {
+  // Sorted by 'p' and 's'. Partitions of 3 and 1'500 rows span input batches
+  // and the first partition has a NULL key.
+  const vector_size_t size = 10'000;
+  auto data = makeRowVector(
+      {"p", "s", "d", "t"},
+      {
+          makeFlatVector<int32_t>(
+              size,
+              [](auto row) { return row < 6'100 ? row / 1'500 : row / 3; },
+              [](auto row) { return row < 100; }),
+          makeFlatVector<int64_t>(size, [](auto row) { return row; }),
+          makeFlatVector<int64_t>(
+              size, [](auto row) { return row * 7 % 1'000; }, nullEvery(5)),
+          makeFlatVector<std::string>(
+              size,
+              [](auto row) { return fmt::format("t-{}", row % 113); },
+              nullEvery(7)),
+      });
+  const auto batches = split(data, 30);
+  const std::vector<std::string> functions = {
+      rowsFrameFunction("row_number()"),
+      rowsFrameFunction("lag(d)"),
+      rowsFrameFunction("lead(d, 3)"),
+      rowsFrameFunction("lag(t, 2, 'none')"),
+      rowsFrameFunction("lead(t, 1, t)"),
+      rowsFrameFunction("lag(d, 0)"),
+      rowsFrameFunction("lead(d, 1000)"),
+      rowsFrameFunction("sum(d)"),
+  };
+  const auto expected =
+      AssertQueryBuilder(
+          PlanBuilder().values(batches).window(functions).planNode())
+          .copyResults(pool());
+
+  for (const auto batchRows : {"1", "7", "100", "1000"}) {
+    SCOPED_TRACE(fmt::format("preferred output batch rows {}", batchRows));
+    AssertQueryBuilder(
+        PlanBuilder().values(batches).streamingWindow(functions).planNode())
+        .config(core::QueryConfig::kPreferredOutputBatchRows, batchRows)
+        .assertResults(expected);
+  }
+}
+
+TEST_F(WindowTest, rowsStreamingLeadLagUnderMemoryPressure) {
+  // One partition of 1M rows, larger than the 16MB query memory.
+  const int64_t size = 1'000'000;
+  auto data = makeRowVector(
+      {"p", "s", "d", "t"},
+      {
+          makeFlatVector<int16_t>(size, [](auto /*row*/) { return 1; }),
+          makeFlatVector<int64_t>(size, [](auto row) { return row; }),
+          makeFlatVector<int64_t>(size, [](auto row) { return row; }),
+          makeFlatVector<std::string>(
+              size, [](auto row) { return fmt::format("{:032}", row); }),
+      });
+
+  auto queryCtx = core::QueryCtx::create(executor_.get());
+  queryCtx->testingOverrideMemoryPool(
+      memory::memoryManager()->addRootPool(
+          queryCtx->queryId(), 16 << 20, exec::MemoryReclaimer::create()));
+
+  // The projection allocates the window input from the query memory.
+  auto plan = PlanBuilder()
+                  .values(split(data, 100))
+                  .project({"p", "s", "d", "concat(t, 'x') AS t"})
+                  .streamingWindow(
+                      {rowsFrameFunction("lag(d)"),
+                       rowsFrameFunction("lead(d)"),
+                       rowsFrameFunction("row_number()")})
+                  .project({"coalesce(w0, 0) + coalesce(w1, 0) + w2 AS x"})
+                  .singleAggregation({}, {"sum(x)"})
+                  .planNode();
+  // Sum of lag (0 to size - 2), lead (1 to size - 1) and row_number (1 to
+  // size).
+  const int64_t expected = (size - 1) * (size - 2) / 2 + size * (size - 1) / 2 +
+      size * (size + 1) / 2;
+  AssertQueryBuilder(plan).queryCtx(queryCtx).assertResults(
+      makeRowVector({makeConstant<int64_t>(expected, 1)}));
 }
 
 TEST_F(WindowTest, rowBasedStreamingWindowOOM) {
@@ -680,7 +891,8 @@ TEST_F(WindowTest, rowsStreamingWindowBuildDoesNotMaterializeRows) {
       pool(),
       nullptr,
       &nonReclaimableSection_,
-      kUnboundedRetainedBytes);
+      kUnboundedRetainedBytes,
+      window::RowOffsets{});
   windowBuild.setNumRowsPerOutput(2);
   windowBuild.addInput(data);
   windowBuild.noMoreInput();
@@ -704,7 +916,12 @@ TEST_F(WindowTest, rowsStreamingWindowBuildThrottlesLargePartition) {
 
   {
     TestingRowsStreamingWindowBuild windowBuild(
-        windowNode, pool(), nullptr, &nonReclaimableSection_, budget);
+        windowNode,
+        pool(),
+        nullptr,
+        &nonReclaimableSection_,
+        budget,
+        window::RowOffsets{});
     windowBuild.setNumRowsPerOutput(4);
 
     // No input yet (no row-size estimate): needs input.
@@ -724,7 +941,8 @@ TEST_F(WindowTest, rowsStreamingWindowBuildThrottlesLargePartition) {
         pool(),
         nullptr,
         &nonReclaimableSection_,
-        kUnboundedRetainedBytes);
+        kUnboundedRetainedBytes,
+        window::RowOffsets{});
     windowBuild.setNumRowsPerOutput(4);
     windowBuild.addInput(data);
     EXPECT_TRUE(windowBuild.needsInput());
@@ -748,7 +966,12 @@ TEST_F(WindowTest, rowsStreamingWindowBuildThrottleStaysDrainable) {
   const uint64_t budget = budgetForRows(data, 8);
 
   TestingRowsStreamingWindowBuild windowBuild(
-      windowNode, pool(), nullptr, &nonReclaimableSection_, budget);
+      windowNode,
+      pool(),
+      nullptr,
+      &nonReclaimableSection_,
+      budget,
+      window::RowOffsets{});
   // Mimic the Window operator, which fixes 'numRowsPerOutput_' at initialize()
   // from a nullopt row-size estimate; for wide rows this default is far larger
   // than the byte budget in rows, so the row-count flush never fires within the
@@ -783,7 +1006,12 @@ TEST_F(WindowTest, rowsStreamingWindowBuildBudgetTracksGrowingRowSize) {
       << "the wide payload must dominate the row-size estimate";
 
   TestingRowsStreamingWindowBuild windowBuild(
-      windowNode, pool(), nullptr, &nonReclaimableSection_, budget);
+      windowNode,
+      pool(),
+      nullptr,
+      &nonReclaimableSection_,
+      budget,
+      window::RowOffsets{});
   // Keeps the row-count flush from firing, so throttling is driven by bytes.
   windowBuild.setNumRowsPerOutput(10 * batchSize);
 
@@ -815,7 +1043,12 @@ TEST_F(WindowTest, rowsStreamingWindowBuildBudgetFlushesOnce) {
   const uint64_t budget = budgetForRows(data, 8);
 
   TestingRowsStreamingWindowBuild windowBuild(
-      windowNode, pool(), nullptr, &nonReclaimableSection_, budget);
+      windowNode,
+      pool(),
+      nullptr,
+      &nonReclaimableSection_,
+      budget,
+      window::RowOffsets{});
   // Keeps the row-count flush from firing, so every flush comes from the
   // budget.
   windowBuild.setNumRowsPerOutput(size * 2);
@@ -998,7 +1231,8 @@ TEST_F(WindowTest, rowsStreamingWindowBuildLoadsOnlyBoundaryColumns) {
       pool(),
       nullptr,
       &nonReclaimableSection_,
-      kUnboundedRetainedBytes);
+      kUnboundedRetainedBytes,
+      window::RowOffsets{});
   windowBuild.setNumRowsPerOutput(2);
   windowBuild.addInput(data);
 
@@ -1039,7 +1273,8 @@ TEST_F(
       pool(),
       nullptr,
       &nonReclaimableSection_,
-      kUnboundedRetainedBytes);
+      kUnboundedRetainedBytes,
+      window::RowOffsets{});
   windowBuild.setNumRowsPerOutput(10);
   windowBuild.addInput(data);
   EXPECT_FALSE(payload->isLoaded());
@@ -1126,7 +1361,8 @@ TEST_F(WindowTest, rowsStreamingWindowBuildRetainsEncodedRows) {
       pool(),
       nullptr,
       &nonReclaimableSection_,
-      kUnboundedRetainedBytes);
+      kUnboundedRetainedBytes,
+      window::RowOffsets{});
   windowBuild.setNumRowsPerOutput(4);
   for (const auto& input : inputs) {
     windowBuild.addInput(input);
@@ -1169,7 +1405,8 @@ TEST_F(WindowTest, rowsStreamingWindowBuildExtractsNegativeRowsAsNull) {
       pool(),
       nullptr,
       &nonReclaimableSection_,
-      kUnboundedRetainedBytes);
+      kUnboundedRetainedBytes,
+      window::RowOffsets{});
   windowBuild.setNumRowsPerOutput(10);
   windowBuild.addInput(data);
   windowBuild.noMoreInput();
@@ -1209,7 +1446,8 @@ TEST_F(WindowTest, rowsStreamingWindowBuildKRangeFrameNanBounds) {
       pool(),
       nullptr,
       &nonReclaimableSection_,
-      kUnboundedRetainedBytes);
+      kUnboundedRetainedBytes,
+      window::RowOffsets{});
   windowBuild.setNumRowsPerOutput(10);
   windowBuild.addInput(data);
   windowBuild.noMoreInput();
@@ -1263,7 +1501,8 @@ TEST_F(WindowTest, rowsStreamingWindowBuildKRangeFramePeerBounds) {
       pool(),
       nullptr,
       &nonReclaimableSection_,
-      kUnboundedRetainedBytes);
+      kUnboundedRetainedBytes,
+      window::RowOffsets{});
   windowBuild.setNumRowsPerOutput(10);
   windowBuild.addInput(data);
   windowBuild.noMoreInput();
@@ -1322,7 +1561,8 @@ TEST_F(WindowTest, rowsStreamingWindowBuildPeerContinuesAcrossInputBatches) {
       pool(),
       nullptr,
       &nonReclaimableSection_,
-      kUnboundedRetainedBytes);
+      kUnboundedRetainedBytes,
+      window::RowOffsets{});
   windowBuild.setNumRowsPerOutput(2);
   windowBuild.addInput(firstBatch);
   windowBuild.addInput(secondBatch);
@@ -1370,7 +1610,8 @@ TEST_F(WindowTest, rowsStreamingWindowBuildKRangeFrameSearchBounds) {
         pool(),
         nullptr,
         &nonReclaimableSection_,
-        kUnboundedRetainedBytes);
+        kUnboundedRetainedBytes,
+        window::RowOffsets{});
     windowBuild.setNumRowsPerOutput(10);
     auto splitData = split(data, 4);
     for (const auto& input : splitData) {

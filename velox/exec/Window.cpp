@@ -64,14 +64,24 @@ Window::Window(
     lockedStats->runtimeStats.emplace(
         std::string(kSpillNotSupported), RuntimeMetric(1));
   }
-  if (windowNode->inputsSorted()) {
-    if (supportRowsStreaming()) {
+  if (window::WholePartitionAggregation::supports(*windowNode)) {
+    wholePartitionAggregation_ =
+        std::make_unique<window::WholePartitionAggregation>(
+            windowNode,
+            pool(),
+            spillConfig,
+            spillStats_.get(),
+            driverCtx->queryConfig());
+  } else if (windowNode->inputsSorted()) {
+    spillSupported_ = false;
+    if (const auto rowOffsets = supportRowsStreaming()) {
       windowBuild_ = std::make_unique<window::RowsStreamingWindowBuild>(
           windowNode_,
           pool(),
           spillConfig,
           &nonReclaimableSection_,
-          driverCtx->queryConfig().preferredOutputBatchBytes());
+          driverCtx->queryConfig().preferredOutputBatchBytes(),
+          rowOffsets.value());
     } else {
       windowBuild_ = std::make_unique<window::PartitionStreamingWindowBuild>(
           windowNode, pool(), spillConfig, &nonReclaimableSection_);
@@ -105,6 +115,10 @@ Window::Window(
 void Window::initialize() {
   Operator::initialize();
   VELOX_CHECK_NOT_NULL(windowNode_);
+  if (wholePartitionAggregation_ != nullptr) {
+    windowNode_.reset();
+    return;
+  }
   createWindowFunctions();
   createPeerAndFrameBuffers();
   windowBuild_->setNumRowsPerOutput(numRowsPerOutput_);
@@ -246,7 +260,35 @@ void Window::createWindowFunctions() {
   }
 }
 
-bool Window::supportRowsStreaming() {
+namespace {
+// Larger offsets of functions like lag and lead keep too many rows for
+// row-wise streaming to save memory.
+constexpr int64_t kMaxStreamingRowOffset{1'000};
+
+// Returns the constant offset of a function like lag or lead, nullopt if it is
+// not constant. A null offset reads no other row.
+std::optional<int64_t> constantRowOffset(
+    const core::CallTypedExprPtr& call,
+    memory::MemoryPool* pool) {
+  const auto& inputs = call->inputs();
+  if (inputs.size() < 2) {
+    return 1;
+  }
+  if (!core::TypedExprs::isConstant(inputs[1]) ||
+      inputs[1]->type()->kind() != TypeKind::BIGINT) {
+    return std::nullopt;
+  }
+  const auto offset =
+      core::TypedExprs::asConstant(inputs[1])->toConstantVector(pool);
+  if (offset->isNullAt(0)) {
+    return 0;
+  }
+  return offset->as<SimpleVector<int64_t>>()->valueAt(0);
+}
+} // namespace
+
+std::optional<window::RowOffsets> Window::supportRowsStreaming() {
+  window::RowOffsets rowOffsets;
   for (const auto& windowFunction : windowNode_->windowFunctions()) {
     const auto& functionName = windowFunction.functionCall->name();
     const auto windowFunctionMetadata =
@@ -254,7 +296,23 @@ bool Window::supportRowsStreaming() {
 
     if (windowFunctionMetadata.processMode !=
         exec::WindowFunction::ProcessMode::kRows) {
-      return false;
+      const auto rowAccess = windowFunctionMetadata.rowAccess;
+      if (rowAccess == exec::WindowFunction::RowAccess::kPartition ||
+          windowFunction.ignoreNulls) {
+        return std::nullopt;
+      }
+      const auto offset =
+          constantRowOffset(windowFunction.functionCall, pool());
+      if (!offset.has_value() || offset.value() < 0 ||
+          offset.value() > kMaxStreamingRowOffset) {
+        return std::nullopt;
+      }
+      auto& numRows =
+          rowAccess == exec::WindowFunction::RowAccess::kPrecedingOffset
+          ? rowOffsets.numPrecedingRows
+          : rowOffsets.numFollowingRows;
+      numRows = std::max<vector_size_t>(numRows, offset.value());
+      continue;
     }
 
     const auto& frame = windowFunction.frame;
@@ -264,11 +322,11 @@ bool Window::supportRowsStreaming() {
          frame.endType == core::WindowNode::BoundType::kCurrentRow);
 
     if (windowFunctionMetadata.isAggregate && !isDefaultFrame) {
-      return false;
+      return std::nullopt;
     }
   }
 
-  return true;
+  return rowOffsets;
 }
 
 void Window::addInput(RowVectorPtr input) {
@@ -288,8 +346,30 @@ void Window::addInput(RowVectorPtr input) {
       "Window operator cannot process more than {} rows",
       std::numeric_limits<vector_size_t>::max());
 
-  windowBuild_->addInput(input);
+  if (wholePartitionAggregation_ != nullptr) {
+    {
+      NonReclaimableSectionGuard guard(this);
+      wholePartitionAggregation_->addInput(input);
+    }
+    if (canReclaim() && testingTriggerSpill(pool()->name())) {
+      wholePartitionAggregation_->spill();
+    }
+  } else {
+    windowBuild_->addInput(input);
+  }
   numRows_ += input->size();
+}
+
+bool Window::reclaimableBytes(uint64_t& reclaimableBytes) const {
+  if (wholePartitionAggregation_ == nullptr) {
+    return Operator::reclaimableBytes(reclaimableBytes);
+  }
+  // The buffered input batches are allocated from the pools of upstream
+  // operators, so the reservation of this pool does not include them.
+  const bool reclaimable = canReclaim();
+  reclaimableBytes =
+      reclaimable ? wholePartitionAggregation_->spillableBytes() : 0;
+  return reclaimable;
 }
 
 void Window::reclaim(
@@ -297,6 +377,12 @@ void Window::reclaim(
     memory::MemoryReclaimer::Stats& stats) {
   VELOX_CHECK(canReclaim());
   VELOX_CHECK(!nonReclaimableSection_);
+
+  if (wholePartitionAggregation_ != nullptr) {
+    // Buffered input batches can be spilled after noMoreInput() too.
+    wholePartitionAggregation_->spill();
+    return;
+  }
 
   if (noMoreInput_) {
     ++stats.numNonReclaimableAttempts;
@@ -342,7 +428,11 @@ void Window::createPeerAndFrameBuffers() {
 
 void Window::noMoreInput() {
   Operator::noMoreInput();
-  windowBuild_->noMoreInput();
+  if (wholePartitionAggregation_ != nullptr) {
+    wholePartitionAggregation_->noMoreInput();
+  } else {
+    windowBuild_->noMoreInput();
+  }
 }
 
 void Window::callResetPartition() {
@@ -693,6 +783,10 @@ vector_size_t Window::callApplyLoop(
   while (numOutputRowsLeft > 0) {
     const auto numPartitionRows =
         currentPartition_->numRowsForProcessing(partitionOffset_);
+    if (numPartitionRows == 0 && !currentPartition_->complete()) {
+      // The rows of a partial partition wait for the rows after them.
+      break;
+    }
     if (numPartitionRows <= numOutputRowsLeft) {
       // Current partition can fit completely in the output buffer.
       // So output all its rows.
@@ -737,6 +831,21 @@ vector_size_t Window::callApplyLoop(
 RowVectorPtr Window::getOutput() {
   if (numRows_ == 0) {
     return nullptr;
+  }
+
+  if (wholePartitionAggregation_ != nullptr) {
+    // Reserves the memory to read a spilled batch while the input batches still
+    // in memory can be spilled to make room.
+    if (const auto bytes = wholePartitionAggregation_->spillReadBytes();
+        bytes > 0 && canReclaim() && pool()->availableReservation() < bytes) {
+      ReclaimableSectionGuard guard(this);
+      pool()->maybeReserve(bytes);
+    }
+    auto output = wholePartitionAggregation_->getOutput();
+    if (output != nullptr) {
+      numProcessedRows_ += output->size();
+    }
+    return output;
   }
 
   const auto numRowsLeft = numRows_ - numProcessedRows_;
