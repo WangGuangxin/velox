@@ -60,7 +60,35 @@ struct Comparator {
       bool greaterThan,
       typename T,
       typename TAccumulator,
-      typename std::enable_if_t<!std::is_same_v<T, TAccumulator>, int32_t> = 0>
+      typename std::enable_if_t<
+          std::is_same_v<
+              TAccumulator,
+              functions::aggregate::StringValueAccumulator>,
+          int32_t> = 0>
+  static bool compare(
+      TAccumulator* accumulator,
+      const DecodedVector& newComparisons,
+      vector_size_t index,
+      bool isFirstValue) {
+    if (isFirstValue) {
+      return true;
+    }
+    if constexpr (greaterThan) {
+      return newComparisons.valueAt<StringView>(index) > accumulator->value;
+    } else {
+      return newComparisons.valueAt<StringView>(index) < accumulator->value;
+    }
+  }
+
+  template <
+      bool greaterThan,
+      typename T,
+      typename TAccumulator,
+      typename std::enable_if_t<
+          std::is_same_v<
+              TAccumulator,
+              functions::aggregate::SingleValueAccumulator>,
+          int32_t> = 0>
   static bool compare(
       TAccumulator* accumulator,
       const DecodedVector& newComparisons,
