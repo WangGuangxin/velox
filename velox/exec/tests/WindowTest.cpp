@@ -132,6 +132,28 @@ class WindowTest : public OperatorTestBase {
     return rowSize * numRows;
   }
 
+  // Returns data sorted by 'p' for aggregates over whole partitions, which use
+  // WholePartitionAggregation. Partitions of 3 and 1'500 rows span input
+  // batches. The first partition has a NULL key.
+  RowVectorPtr makeWholePartitionData(vector_size_t size) {
+    return makeRowVector(
+        {"p", "d", "s"},
+        {
+            makeFlatVector<int32_t>(
+                size,
+                [](auto row) { return row < 6'100 ? row / 1'500 : row / 3; },
+                [](auto row) { return row < 100; }),
+            makeFlatVector<int64_t>(
+                size, [](auto row) { return row; }, nullEvery(5)),
+            makeFlatVector<std::string>(
+                size,
+                [](auto row) {
+                  return fmt::format("value-{}", row * 37 % 1'000);
+                },
+                nullEvery(3)),
+        });
+  }
+
   tsan_atomic<bool> nonReclaimableSection_{false};
 };
 
@@ -345,6 +367,114 @@ TEST_F(WindowTest, spillUnsupported) {
   ASSERT_EQ(stats.spilledFiles, 0);
   ASSERT_EQ(stats.spilledPartitions, 0);
   ASSERT_GT(stats.customSum(Operator::kSpillNotSupported), 1);
+}
+
+const std::vector<std::string> kWholePartitionFunctions = {
+    "count(d) over (partition by p rows between unbounded preceding and unbounded following)",
+    "sum(d) over (partition by p range between unbounded preceding and unbounded following)",
+    "max(s) over (partition by p rows between unbounded preceding and unbounded following)",
+    "count(1) over (partition by p rows between unbounded preceding and unbounded following)",
+};
+
+// Returns the results of 'functions' over 'data' computed by the sort based
+// window build, which does not use WholePartitionAggregation.
+RowVectorPtr sortWindowResults(
+    const std::vector<RowVectorPtr>& data,
+    const std::vector<std::string>& functions,
+    memory::MemoryPool* pool) {
+  return AssertQueryBuilder(
+             PlanBuilder().values(data).window(functions).planNode())
+      .copyResults(pool);
+}
+
+TEST_F(WindowTest, wholePartitionAggregation) {
+  const auto data = split(makeWholePartitionData(10'000), 30);
+  const auto expected =
+      sortWindowResults(data, kWholePartitionFunctions, pool());
+
+  auto plan = PlanBuilder()
+                  .values(data)
+                  .streamingWindow(kWholePartitionFunctions)
+                  .planNode();
+  AssertQueryBuilder(plan)
+      .config(core::QueryConfig::kPreferredOutputBatchRows, "100")
+      .assertResults(expected);
+}
+
+TEST_F(WindowTest, wholePartitionAggregationSpill) {
+  const auto data = split(makeWholePartitionData(10'000), 30);
+  const auto expected =
+      sortWindowResults(data, kWholePartitionFunctions, pool());
+
+  core::PlanNodeId windowId;
+  auto plan = PlanBuilder()
+                  .values(data)
+                  .streamingWindow(kWholePartitionFunctions)
+                  .capturePlanNodeId(windowId)
+                  .planNode();
+  auto spillDirectory = TempDirectoryPath::create();
+  TestScopedSpillInjection scopedSpillInjection(100);
+  auto task = AssertQueryBuilder(plan)
+                  .config(core::QueryConfig::kPreferredOutputBatchRows, "100")
+                  .config(core::QueryConfig::kSpillEnabled, "true")
+                  .config(core::QueryConfig::kWindowSpillEnabled, "true")
+                  .spillDirectory(spillDirectory->getPath())
+                  .assertResults(expected);
+
+  const auto planStats = exec::toPlanStats(task->taskStats());
+  const auto& stats = planStats.at(windowId);
+  ASSERT_GT(stats.spilledBytes, 0);
+  ASSERT_GT(stats.spilledRows, 0);
+  ASSERT_GT(stats.spilledFiles, 0);
+}
+
+TEST_F(WindowTest, wholePartitionAggregationSpillUnderMemoryPressure) {
+  // One partition of 1M rows, larger than the 16MB query memory, with a
+  // window function over the whole partition.
+  const vector_size_t size = 1'000'000;
+  auto data = makeRowVector(
+      {"p", "d", "s"},
+      {
+          makeFlatVector<int16_t>(size, [](auto /*row*/) { return 1; }),
+          makeFlatVector<int64_t>(size, [](auto row) { return row; }),
+          makeFlatVector<std::string>(
+              size, [](auto row) { return fmt::format("{:032}", row); }),
+      });
+
+  auto queryCtx = core::QueryCtx::create(executor_.get());
+  queryCtx->testingOverrideMemoryPool(
+      memory::memoryManager()->addRootPool(
+          queryCtx->queryId(), 16 << 20, exec::MemoryReclaimer::create()));
+
+  // The input is sorted already. The projection allocates new vectors from the
+  // query memory, which the window holds until the partition is complete.
+  core::PlanNodeId windowId;
+  auto plan = PlanBuilder()
+                  .values(split(data, 100))
+                  .project({"p", "d", "concat(s, 'x') AS s"})
+                  .streamingWindow(
+                      {"count(1) over (partition by p rows between unbounded "
+                       "preceding and unbounded following)"})
+                  .capturePlanNodeId(windowId)
+                  .project({"d + w0 AS x"})
+                  .singleAggregation({}, {"sum(x)", "count(1)"})
+                  .planNode();
+  auto spillDirectory = TempDirectoryPath::create();
+  auto task =
+      AssertQueryBuilder(plan)
+          .queryCtx(queryCtx)
+          .config(core::QueryConfig::kSpillEnabled, "true")
+          .config(core::QueryConfig::kWindowSpillEnabled, "true")
+          .spillDirectory(spillDirectory->getPath())
+          .assertResults(makeRowVector({
+              makeConstant<int64_t>(
+                  int64_t{size} * (size - 1) / 2 + int64_t{size} * size, 1),
+              makeConstant<int64_t>(size, 1),
+          }));
+
+  const auto planStats = exec::toPlanStats(task->taskStats());
+  const auto& stats = planStats.at(windowId);
+  ASSERT_GT(stats.spilledBytes, 0);
 }
 
 TEST_F(WindowTest, rowBasedStreamingWindowOOM) {

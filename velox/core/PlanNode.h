@@ -5800,8 +5800,10 @@ class WindowNode : public PlanNode {
   bool canSpill(const QueryConfig& queryConfig) const override {
     // No partitioning keys means the whole input is one big partition. In
     // this case, spilling is not helpful because we need to have a full
-    // partition in memory to produce results.
-    return !partitionKeys_.empty() && !inputsSorted_ &&
+    // partition in memory to produce results. Sorted input can spill only when
+    // every frame spans the whole partition, see WholePartitionAggregation.
+    return !partitionKeys_.empty() &&
+        (!inputsSorted_ || allFramesSpanPartition()) &&
         queryConfig.windowSpillEnabled();
   }
 
@@ -5843,6 +5845,10 @@ class WindowNode : public PlanNode {
 
  private:
   void addDetails(std::stringstream& stream) const override;
+
+  // Returns true if every function frame is UNBOUNDED PRECEDING to UNBOUNDED
+  // FOLLOWING.
+  bool allFramesSpanPartition() const;
 
   const std::vector<FieldAccessTypedExprPtr> partitionKeys_;
 

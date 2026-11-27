@@ -19,6 +19,7 @@
 #include "velox/exec/RowContainer.h"
 #include "velox/exec/WindowFunction.h"
 #include "velox/exec/WindowPartition.h"
+#include "velox/exec/window/WholePartitionAggregation.h"
 #include "velox/exec/window/WindowBuild.h"
 
 namespace facebook::velox::exec {
@@ -51,7 +52,12 @@ class Window : public Operator {
   RowVectorPtr getOutput() override;
 
   bool needsInput() const override {
-    return !noMoreInput_ && windowBuild_->needsInput();
+    if (noMoreInput_) {
+      return false;
+    }
+    return wholePartitionAggregation_ != nullptr
+        ? wholePartitionAggregation_->needsInput()
+        : windowBuild_->needsInput();
   }
 
   void noMoreInput() override;
@@ -63,6 +69,14 @@ class Window : public Operator {
   bool isFinished() override {
     return noMoreInput_ && numRows_ == numProcessedRows_;
   }
+
+  /// The window builds for sorted input cannot spill, except for windows
+  /// computed by WholePartitionAggregation.
+  bool canReclaim() const override {
+    return Operator::canReclaim() && spillSupported_;
+  }
+
+  bool reclaimableBytes(uint64_t& reclaimableBytes) const override;
 
   void reclaim(uint64_t targetBytes, memory::MemoryReclaimer::Stats& stats)
       override;
@@ -167,6 +181,14 @@ class Window : public Operator {
   // WindowBuild is used to store input rows and return WindowPartitions
   // for the processing.
   std::unique_ptr<window::WindowBuild> windowBuild_;
+
+  // Computes the window functions instead of 'windowBuild_' and the window
+  // functions when they are all aggregates over the whole partition of sorted
+  // input. Only one of the two is set.
+  std::unique_ptr<window::WholePartitionAggregation> wholePartitionAggregation_;
+
+  // False for sorted input not computed by 'wholePartitionAggregation_'.
+  bool spillSupported_{true};
 
   // The cached window plan node used for window function initialization. It is
   // reset after the initialization.
